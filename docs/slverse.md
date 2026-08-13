@@ -39,7 +39,7 @@ Make the script executable:
 chmod +x slverse
 ```
 
-Run the interactive setup — it installs `ffmpeg`, asks which sign languages you watch, how much disk space to cache, which 60fps engine to use, and offers to add `slverse` to your `PATH`:
+Run the interactive setup — it installs `ffmpeg`, asks which sign languages you watch, how much disk space to cache, which 60fps engine to use, whether to add `slverse` to your `PATH`, and whether to keep jwkit itself updated automatically (on by default; every jwkit tool checks for updates at most once a day, only when you actually run one, never in the background):
 
 ```bash
 ./slverse setup
@@ -126,7 +126,8 @@ Same, but sped up 2.5x instead, with an explicit `--speed` (accepts a decimal, a
 
 ## Important Behavior / Defaults
 
-- Global configuration is saved in `~/.config/maj-scripts/slverse/config.toml`. Sync state is split into a small `state.json` (sync timestamps, cached book-name lookups) plus one index file per synced language under `~/.config/maj-scripts/slverse/index/`, so it stays fast to load as you sync more languages.
+- Global configuration is saved in `~/.config/jwkit/slverse/config.toml`. Sync state is split into a small `state.json` (sync timestamps, cached book-name lookups) plus one index file per synced language under `~/.config/jwkit/slverse/index/`, so it stays fast to load as you sync more languages.
+- jwkit itself checks for updates automatically at most once a day, only when you run a real command (never `--help`, never in the background) — see [Quick Install](../README.md#quick-install). Controlled by the shared `auto_update` setting in `~/.config/jwkit/config.toml`, not this tool's own config.
 - Extraction streams directly from the source URL by default (`extract_mode = onthefly`) and never touches the cache; pass `--cache` (or set `extract_mode = cache`) to download the full chapter instead. Cached chapters live in `~/.cache/slverse/`, capped at `cache_max_gb` (default 5 GB) with least-recently-used chapters removed first once the cap is hit.
 - The tool uses lazy loading: it only downloads or streams a chapter when a specific verse extraction is requested, and only syncs metadata for the languages you've configured (default `ASL,FSL,BVL,INI,SPE`) unless you name others.
 - Verse start/end times come from JW.org's own API metadata (backfilled into the local index on first use), not from probing a downloaded video file. Book-name lookups are cached per `api_language` too, instead of hitting jw.org on every extract.

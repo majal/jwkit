@@ -67,7 +67,7 @@ Half-speed AI slow-motion, single pass:
 
 ## Important Behavior / Defaults
 
-- Global configuration is saved in `~/.config/maj-scripts/ffrife/config.toml` (separate from `jwsl`'s own config - `jwsl` bridges its own `hardware_encoder`/`video_crf`/etc. into a call to `ffrife` rather than needing them kept in sync across two files by hand).
+- Global configuration is saved in `~/.config/jwkit/ffrife/config.toml` (separate from `slverse`'s own config - `slverse` bridges its own `hardware_encoder`/`video_crf`/etc. into a call to `ffrife` rather than needing them kept in sync across two files by hand).
 - `hardware_encoder` defaults to `cpu` (`libx264`). Measured directly on Apple Silicon: `videotoolbox` at a quality setting matching `crf 20` produced a file ~2.6x larger than `libx264 crf 20 preset slow` for immeasurably different quality (SSIM within 0.0003), with no meaningful speed advantage at short clip lengths.
 - `ffrife <input> -o <output> ...` works without typing the `run` subcommand explicitly; `ffrife run <input> -o <output> ...` is equivalent.
 - `--speed` under 1 slows down, over 1 speeds up. RIFE always exactly doubles frame count, so `--fps` should be set to 2x the source's actual frame rate when combining it with `--speed` (this is what `jwsl`'s `--slow` and `ffslow`'s `--rife` do automatically) - any other `--fps` value changes the output's actual duration, not just its smoothness.

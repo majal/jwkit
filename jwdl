@@ -14,6 +14,9 @@ import urllib.request
 from datetime import date
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _jwkit_common
+
 CONFIG_DIR = Path.home() / ".config" / "jwkit" / "jwdl"
 _LEGACY_CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "jwdl"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -357,6 +360,7 @@ def run_periodicals(argv, config):
     parser.add_argument("--base-dir", type=Path, help="override the base periodicals directory")
     parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
     args = parser.parse_args(argv)
+    _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
 
     base_dir = args.base_dir or Path(config.get("periodicals_base_dir", str(DEFAULT_PERIODICALS_BASE_DIR)))
 
@@ -411,6 +415,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
     parser.add_argument("--workers", type=int, help="parallel downloads per pub (default: 4)")
     args = parser.parse_args()
+    _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
 
     pubs = resolve_pubs(config)
     base_dir = args.base_dir or Path(config["base_dir"])
