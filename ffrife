@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""
+ffrife - standalone rife-ncnn-vulkan (AI frame interpolation) wrapper.
+
+Not JW/Bible-specific: takes any local file or remote URL, an optional
+time window and ffmpeg -vf filter chain, and produces a real-AI-interpolated
+(not motion-blended) output at a target frame rate in a single lossy
+re-encode generation. `jwsl` uses this as a library (see its import of
+ffrife via importlib) instead of carrying its own copy of this logic;
+other tools (e.g. `ffslow`'s --rife flag) can shell out to this CLI directly.
+
+  ffrife setup                          interactive: download/configure the
+                                         rife-ncnn-vulkan binary
+  ffrife <input> -o <output> [options]  interpolate
+
+Options:
+  --start SS --end SS   trim window (seconds); omit to process the whole input
+  --fps N                target frame rate (default 60)
+  --speed N               retime the output (0.5 = half-speed slow-motion,
+                          3 = 3x fast-forward), folded into the same merge/
+                          fallback encode via setpts+atempo - no extra pass
+  --vf FILTER             extra ffmpeg -vf filter chain, applied in the SAME
+                          pass that extracts frames (no extra re-encode)
+  --fallback E            none|framerate|minterpolate - what to do if RIFE
+                          isn't installed/configured (default: none)
+"""
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "ffrife"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+BIN_DIR = CONFIG_DIR / "bin"
+
+FFMPEG_FULL_KEG_PATHS = [
+    "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg-full",
+    "/usr/local/opt/ffmpeg-full/bin/ffmpeg-full",
+]
+FFPROBE_FULL_KEG_PATHS = [
+    "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe-full",
+    "/usr/local/opt/ffmpeg-full/bin/ffprobe-full",
+]
+
+RIFE_RELEASES_API = "https://api.github.com/repos/nihui/rife-ncnn-vulkan/releases/latest"
+RIFE_ASSET_SUFFIX = {"Darwin": "-macos.zip", "Linux": "-ubuntu.zip", "Windows": "-windows.zip"}
+
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF = 2
+
+FFMPEG_BIN = "ffmpeg"
+FFPROBE_BIN = "ffprobe"
+
+DEFAULT_CONFIG = {
+    "rife_binary_path": "",
+    "rife_fallback_engine": "none",  # none, framerate, minterpolate
+    "hardware_encoder": "cpu",  # cpu, videotoolbox, nvenc, qsv - see jwsl's detect_hardware_encoder for why cpu is the default
+    "video_codec": "h264",
+    "video_crf": "20",
+    "video_preset": "slow",
+    "ffmpeg_binary": "",
+    "ffprobe_binary": "",
+}
+
+# --- Config ---
+def load_config():
+    config = DEFAULT_CONFIG.copy()
+    if not CONFIG_FILE.exists():
+        return config
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                config[k.strip()] = v.strip().strip("'").strip('"')
+    except Exception as e:
+        print(f"Warning: could not parse config: {e}")
+    return config
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        for k, v in config.items():
+            f.write(f'{k} = "{v}"\n')
+
+# --- System / binaries ---
+def command_exists(cmd):
+    return shutil.which(cmd) is not None
+
+def ffmpeg_has_filter(ffmpeg_bin, filter_name):
+    try:
+        result = subprocess.run([ffmpeg_bin, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=10)
+        return filter_name in result.stdout
+    except Exception:
+        return False
+
+def resolve_ffmpeg_binary(config):
+    override = config.get("ffmpeg_binary")
+    if override and command_exists(override):
+        return override
+    candidates = [c for c in [
+        shutil.which("ffmpeg-full"),
+        *[p for p in FFMPEG_FULL_KEG_PATHS if os.path.exists(p)],
+        shutil.which("ffmpeg"),
+    ] if c]
+    for c in candidates:
+        if ffmpeg_has_filter(c, "drawtext"):
+            return c
+    return candidates[0] if candidates else "ffmpeg"
+
+def resolve_ffprobe_binary(config):
+    override = config.get("ffprobe_binary")
+    if override and command_exists(override):
+        return override
+    candidates = [c for c in [
+        shutil.which("ffprobe-full"),
+        *[p for p in FFPROBE_FULL_KEG_PATHS if os.path.exists(p)],
+        shutil.which("ffprobe"),
+    ] if c]
+    return candidates[0] if candidates else "ffprobe"
+
+# --- Progress (mirrors jwsl's print_progress/print_time_progress/print_count_progress) ---
+def _progress_bar(frac, width=30):
+    filled = int(width * max(0.0, min(1.0, frac)))
+    return "#" * filled + "-" * (width - filled)
+
+def print_progress(downloaded, total, width=30):
+    if total:
+        frac = downloaded / total
+        sys.stdout.write(f"\r[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({downloaded/1e6:.1f}/{total/1e6:.1f} MB)")
+    else:
+        sys.stdout.write(f"\r{downloaded/1e6:.1f} MB downloaded")
+    sys.stdout.flush()
+
+def print_time_progress(current_s, total_s, label="", width=30):
+    frac = (current_s / total_s) if total_s else 0.0
+    prefix = f"{label} " if label else ""
+    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current_s:.1f}/{total_s:.1f}s)")
+    sys.stdout.flush()
+
+def print_count_progress(current, total, label="", width=30):
+    frac = (current / total) if total else 0.0
+    prefix = f"{label} " if label else ""
+    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current}/{total} frames)")
+    sys.stdout.flush()
+
+def parse_hms(ts):
+    parts = ts.split(":")
+    h, m, s = (["0", "0"] + parts)[-3:]
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+def download_file(url, output_path, expected_checksum=None):
+    tmp_path = Path(str(output_path) + ".part")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            print(f"Downloading {url}...")
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_path, "wb") as f:
+                total = int(resp.headers.get("Content-Length") or 0)
+                downloaded = 0
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    print_progress(downloaded, total)
+                print()
+            os.replace(tmp_path, output_path)
+            print("Download complete.")
+            return True
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            print(f"Download attempt {attempt} failed: {e}")
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+    return False
+
+def fetch_json(url):
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return None
+
+# --- Encode settings (same logic/defaults as jwsl's build_encode_args - see
+# jwsl's detect_hardware_encoder for the benchmark behind defaulting to cpu) ---
+def nvenc_quality_from_crf(crf):
+    return crf
+
+def videotoolbox_quality_from_crf(crf):
+    try:
+        crf_val = float(crf)
+    except ValueError:
+        crf_val = 20
+    return max(1, min(100, round(100 - crf_val)))
+
+def build_encode_args(config):
+    hw = config.get("hardware_encoder", "cpu")
+    codec = config.get("video_codec", "h264")
+    crf = config.get("video_crf", "20")
+    preset = config.get("video_preset", "slow")
+
+    if hw == "nvenc":
+        vcodec = {"hevc": "hevc_nvenc", "av1": "av1_nvenc"}.get(codec, "h264_nvenc")
+        args = ["-c:v", vcodec, "-preset", preset, "-cq", str(nvenc_quality_from_crf(crf))]
+    elif hw == "videotoolbox":
+        vcodec = "hevc_videotoolbox" if codec == "hevc" else "h264_videotoolbox"
+        args = ["-c:v", vcodec, "-q:v", str(videotoolbox_quality_from_crf(crf))]
+    elif hw == "qsv":
+        vcodec = "hevc_qsv" if codec == "hevc" else "h264_qsv"
+        args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
+    else:
+        vcodec = {"hevc": "libx265", "av1": "libsvtav1"}.get(codec, "libx264")
+        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", preset]
+
+    return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+
+def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
+    base = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y"]
+    print()
+    print(f"Running: {' '.join(base + args)}")
+
+    if not duration:
+        subprocess.run(base + args, check=True)
+        return
+
+    cmd = base + ["-progress", "pipe:1", "-nostats"] + args
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    start = time.time()
+    shown = False
+    for line in proc.stdout:
+        line = line.strip()
+        if not line.startswith("out_time="):
+            continue
+        try:
+            current = parse_hms(line.split("=", 1)[1])
+        except ValueError:
+            continue
+        if not shown and time.time() - start > slow_after:
+            shown = True
+        if shown:
+            print_time_progress(current, duration, label=label)
+    proc.stdout.close()
+    proc.wait()
+    if shown:
+        print()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+# --- RIFE install ---
+def rife_release_hint():
+    system = platform.system()
+    if system == "Darwin":
+        return "rife-ncnn-vulkan-*-macos.zip (macOS, works on both Intel and Apple Silicon)"
+    if system == "Linux":
+        return "rife-ncnn-vulkan-*-ubuntu.zip (Linux)"
+    return "rife-ncnn-vulkan-*-windows.zip (Windows)"
+
+def install_rife(config):
+    """Download the platform-matching rife-ncnn-vulkan release, unzip it
+    into BIN_DIR, and point rife_binary_path at the extracted executable.
+    Returns the resolved binary path on success, None on failure."""
+    system = platform.system()
+    suffix = RIFE_ASSET_SUFFIX.get(system)
+    if not suffix:
+        print(f"No known rife-ncnn-vulkan release for platform '{system}'; install manually.")
+        return None
+
+    release = fetch_json(RIFE_RELEASES_API)
+    if not release:
+        return None
+    asset = next((a for a in release.get("assets", []) if a.get("name", "").endswith(suffix)), None)
+    if not asset:
+        print(f"No release asset ending in '{suffix}' found in the latest rife-ncnn-vulkan release.")
+        return None
+
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    zip_path = BIN_DIR / asset["name"]
+    if not download_file(asset["browser_download_url"], zip_path):
+        return None
+
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(BIN_DIR)
+    finally:
+        zip_path.unlink(missing_ok=True)
+
+    exe_name = "rife-ncnn-vulkan.exe" if system == "Windows" else "rife-ncnn-vulkan"
+    match = next((p for p in BIN_DIR.rglob(exe_name)), None)
+    if not match:
+        print(f"Downloaded the RIFE release but couldn't find '{exe_name}' inside it.")
+        return None
+
+    if system != "Windows":
+        match.chmod(match.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    config["rife_binary_path"] = str(match)
+    save_config(config)
+    print(f"RIFE installed: {match}")
+    return match
+
+def run_rife(rife_path, in_frames, out_frames, target_count, slow_after=4.0):
+    """rife-ncnn-vulkan has no built-in progress output, so this polls the
+    output directory's file count against `target_count` (rife's own
+    default is 2x the input frame count). By far the slowest step in the
+    whole pipeline - measured ~125-130s for a 31s/936-frame clip on an
+    Apple Silicon GPU."""
+    proc = subprocess.Popen([rife_path, "-i", str(in_frames), "-o", str(out_frames)])
+    start = time.time()
+    shown = False
+    while proc.poll() is None:
+        time.sleep(0.5)
+        if not shown and time.time() - start > slow_after:
+            shown = True
+        if shown:
+            current = len(list(Path(out_frames).glob("*.png")))
+            print_count_progress(current, target_count, label="RIFE")
+    if shown:
+        print()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, [rife_path])
+
+# --- Retiming (slow-motion/fast-forward) ---
+def parse_speed(value):
+    """Accepts whatever notation is most natural to type: a plain decimal
+    (0.5, 2.5), a fraction (1/3), or a percentage (40%, 150%) - all resolve
+    to the same internal multiplier passed to interpolate()'s `speed`."""
+    s = str(value).strip()
+    if s.endswith("%"):
+        return float(s[:-1]) / 100
+    if "/" in s:
+        num, den = s.split("/", 1)
+        return float(num) / float(den)
+    return float(s)
+
+def atempo_chain(speed):
+    """ffmpeg's atempo filter only accepts a single factor in [0.5, 2.0];
+    chain multiple instances to cover any speed value so audio stays in
+    sync with a setpts-retimed video track. Returns None for speed 1/None
+    (no retiming needed)."""
+    if not speed or speed == 1:
+        return None
+    filters = []
+    remaining = speed
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    filters.append(f"atempo={remaining:.6g}")
+    return ",".join(filters)
+
+# --- Core: single-pass interpolation ---
+def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=60, speed=None):
+    """Interpolate `source` (local path or remote URL) to `fps`, optionally
+    trimmed to [start, end] and with an extra ffmpeg -vf filter chain
+    applied - in ONE pass that extracts frames directly from the source
+    (trim + filter baked in), so there's no intermediate lossy re-encode
+    generation before RIFE ever sees the footage. The only lossy encode is
+    the final merge. Falls back to a plain ffmpeg filter (or no
+    interpolation at all) per config's rife_fallback_engine if RIFE isn't
+    installed/configured.
+
+    `speed` (e.g. 0.5 for half-speed slow-motion, 3 for 3x fast-forward)
+    retimes the output via setpts/atempo folded into that same merge (or
+    fallback) ffmpeg command - no separate retiming pass, and thus no extra
+    lossy generation beyond the merge/fallback encode this function already
+    does. Returns True on success."""
+    duration = (end - start) if (start is not None and end is not None) else None
+    trim_args = []
+    if start is not None:
+        trim_args += ["-ss", str(start)]
+    if end is not None:
+        trim_args += ["-to", str(end)]
+    speed_vf = f"setpts=PTS/{speed:.6g}" if speed and speed != 1 else None
+    speed_af = atempo_chain(speed)
+
+    rife_path = config.get("rife_binary_path")
+    if not rife_path or not command_exists(rife_path):
+        fallback = config.get("rife_fallback_engine", DEFAULT_CONFIG["rife_fallback_engine"])
+        print()
+        print("RIFE binary not found. (Run 'ffrife setup' to download and configure it.)")
+        vf_chain = list(filter(None, [vf]))
+        if fallback in ("framerate", "minterpolate"):
+            print(f"Falling back to ffmpeg's {fallback} filter for {fps}fps - note this can make motion look")
+            print("artificially smooth/slow-motion-ish (frame blending, not real interpolation).")
+            print("Set rife_fallback_engine=none to just keep native fps with no artifact instead.")
+            interp_filter = (f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+                              if fallback == "minterpolate" else f"framerate=fps={fps}")
+            vf_chain.append(interp_filter)
+        else:
+            print("rife_fallback_engine=none: keeping native frame rate, no interpolation applied.")
+        if speed_vf:
+            vf_chain.append(speed_vf)
+        cmd = trim_args + ["-i", str(source)]
+        if vf_chain:
+            cmd += ["-vf", ",".join(vf_chain)]
+        cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"]) + build_encode_args(config) + [str(output_file)]
+        run_ffmpeg(cmd, duration=duration)
+        return True
+
+    print()
+    print("Interpolating using rife-ncnn-vulkan...")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        in_frames = temp_dir_path / "in"
+        out_frames = temp_dir_path / "out"
+        in_frames.mkdir()
+        out_frames.mkdir()
+
+        # Single pass: trim + filter + frame extraction together, straight
+        # from the source - no intermediate re-encoded mp4 generation.
+        extract_cmd = trim_args + ["-i", str(source)]
+        if vf:
+            extract_cmd += ["-vf", vf]
+        extract_cmd += [f"{in_frames}/%08d.png"]
+        run_ffmpeg(extract_cmd, duration=duration, label="Extracting")
+
+        input_frame_count = len(list(in_frames.glob("*.png")))
+        if input_frame_count == 0:
+            print("No frames extracted - nothing to interpolate.")
+            return False
+        run_rife(rife_path, in_frames, out_frames, target_count=input_frame_count * 2)
+
+        audio_path = temp_dir_path / "audio.aac"
+        audio_cmd = [FFMPEG_BIN, "-y"] + trim_args + ["-i", str(source), "-vn", "-c:a", "copy", str(audio_path)]
+        subprocess.run(audio_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        merge_cmd = ["-r", str(fps), "-i", f"{out_frames}/%08d.png"]
+        has_audio = audio_path.exists() and audio_path.stat().st_size > 0
+        if has_audio:
+            merge_cmd += ["-i", str(audio_path)]
+        if speed_vf:
+            merge_cmd += ["-vf", speed_vf]
+        if has_audio:
+            merge_cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"])
+        merge_cmd += build_encode_args(config) + [str(output_file)]
+        run_ffmpeg(merge_cmd, duration=duration)
+    return True
+
+# --- CLI ---
+def cmd_setup(config):
+    hw = config.get("hardware_encoder", "cpu")
+    print(f"Video encoder: {hw}")
+    ffmpeg_bin = resolve_ffmpeg_binary(config)
+    if not ffmpeg_has_filter(ffmpeg_bin, "delogo") and not ffmpeg_has_filter(ffmpeg_bin, "drawtext"):
+        print(f"Note: {ffmpeg_bin} may be missing some filters callers pass via --vf.")
+
+    if config.get("rife_binary_path") and command_exists(config["rife_binary_path"]):
+        print(f"RIFE already configured: {config['rife_binary_path']}")
+        return
+
+    print(f"\nRIFE isn't installed yet ({rife_release_hint()}).")
+    ans = input("Download and install it now? [Y/n]: ").strip().lower()
+    if ans in ("", "y", "yes"):
+        if not install_rife(config):
+            print("Automatic install failed. Download it yourself from")
+            print("https://github.com/nihui/rife-ncnn-vulkan/releases, unzip it, then run:")
+            print("  ffrife config set rife_binary_path /path/to/rife-ncnn-vulkan")
+    else:
+        print("Skipping - run 'ffrife setup' again anytime.")
+
+def cmd_config(args, config):
+    if args.action == "set" and args.key and args.value:
+        config[args.key] = args.value
+        save_config(config)
+        print(f"Set {args.key} = {args.value}")
+    elif args.action == "get" and args.key:
+        print(f"{args.key} = {config.get(args.key)}")
+    else:
+        for k, v in config.items():
+            print(f"{k} = {v}")
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="ffrife - AI frame interpolation (rife-ncnn-vulkan) for any video")
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("setup", help="Interactive: download/configure the rife-ncnn-vulkan binary")
+
+    p_config = subparsers.add_parser("config", help="Manage configuration")
+    p_config.add_argument("action", choices=["set", "get", "list"], nargs="?", default="list")
+    p_config.add_argument("key", nargs="?")
+    p_config.add_argument("value", nargs="?")
+
+    p_run = subparsers.add_parser("run", help="Interpolate a file (also the default when no subcommand is given)")
+    p_run.add_argument("input", help="Local path or remote URL")
+    p_run.add_argument("-o", "--output", required=True)
+    p_run.add_argument("--start", type=float, help="Trim start (seconds)")
+    p_run.add_argument("--end", type=float, help="Trim end (seconds)")
+    p_run.add_argument("--fps", type=float, default=60, help="Target frame rate (default: 60)")
+    p_run.add_argument("--speed", type=parse_speed, help="Retime the output - decimal (0.5), fraction (1/3), or percent (150%%) - folded into the merge/fallback encode, no extra pass")
+    p_run.add_argument("--vf", help="Extra ffmpeg -vf filter chain, applied in the same pass as frame extraction")
+    p_run.add_argument("--fallback", choices=["none", "framerate", "minterpolate"], help="Override rife_fallback_engine for this run")
+    return parser
+
+def normalize_argv(argv):
+    """`ffrife <input> -o <output> ...` works without typing the 'run'
+    subcommand explicitly - only dispatch to it when the first arg isn't
+    already a known subcommand name."""
+    if argv and argv[0] not in ("setup", "config", "run", "-h", "--help"):
+        return ["run"] + argv
+    return argv
+
+def main():
+    args = build_parser().parse_args(normalize_argv(sys.argv[1:]))
+    config = load_config()
+
+    global FFMPEG_BIN, FFPROBE_BIN
+    FFMPEG_BIN = resolve_ffmpeg_binary(config)
+    FFPROBE_BIN = resolve_ffprobe_binary(config)
+
+    if args.command == "setup":
+        cmd_setup(config)
+    elif args.command == "config":
+        cmd_config(args, config)
+    elif args.command == "run":
+        if args.fallback:
+            config["rife_fallback_engine"] = args.fallback
+        ok = interpolate(args.input, args.output, config, start=args.start, end=args.end, vf=args.vf, fps=args.fps, speed=args.speed)
+        sys.exit(0 if ok else 1)
+    else:
+        build_parser().print_help()
+
+if __name__ == "__main__":
+    main()

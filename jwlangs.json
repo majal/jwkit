@@ -1,0 +1,4382 @@
+{
+    "ABN": [
+        "abx",
+        "Abaknon"
+    ],
+    "ABB": [
+        "aba",
+        "Abbey"
+    ],
+    "ABK": [
+        "ab",
+        "Abkhaz"
+    ],
+    "AU": [
+        "abn",
+        "Abua"
+    ],
+    "ABU": [
+        "abz",
+        "Abui"
+    ],
+    "ACD": [
+        "fr_x_acd",
+        "Acadian"
+    ],
+    "ACH": [
+        "acr",
+        "Achi"
+    ],
+    "ACC": [
+        "acr_x_acc",
+        "Achi (Cubulco)"
+    ],
+    "ACR": [
+        "acr_x_acr",
+        "Achi (Rabinal)"
+    ],
+    "AC": [
+        "ach",
+        "Acholi"
+    ],
+    "AHW": [
+        "acu",
+        "Achuar-Shiwiar"
+    ],
+    "ADH": [
+        "adh",
+        "Adhola"
+    ],
+    "AD": [
+        "ady",
+        "Adyghe"
+    ],
+    "AF": [
+        "af",
+        "Afrikaans"
+    ],
+    "AHN": [
+        "aha",
+        "Ahanta"
+    ],
+    "AJG": [
+        "ajg",
+        "Aja"
+    ],
+    "HO": [
+        "aji",
+        "Aji\u00eb"
+    ],
+    "KAN": [
+        "knj",
+        "Akateko"
+    ],
+    "AKA": [
+        "ahk",
+        "Akha"
+    ],
+    "AL": [
+        "sq",
+        "Albanian"
+    ],
+    "ALG": [
+        "aln",
+        "Albanian (Gheg)"
+    ],
+    "ALS": [
+        "sqk",
+        "Albanian Sign Language"
+    ],
+    "ALQ": [
+        "alq",
+        "Algonquin"
+    ],
+    "LTN": [
+        "gsw_x_ltn",
+        "Alsatian"
+    ],
+    "ALT": [
+        "alt",
+        "Altai"
+    ],
+    "ALU": [
+        "alz",
+        "Alur"
+    ],
+    "ABE": [
+        "omb",
+        "Ambae (East)"
+    ],
+    "ASL": [
+        "ase",
+        "American Sign Language"
+    ],
+    "AM": [
+        "am",
+        "Amharic"
+    ],
+    "AI": [
+        "ami",
+        "Amis"
+    ],
+    "AMG": [
+        "amu",
+        "Amuzgo (Guerrero)"
+    ],
+    "ANM": [
+        "anm",
+        "Anal"
+    ],
+    "LAS": [
+        "sgn_ao",
+        "Angolan Sign Language"
+    ],
+    "AYI": [
+        "any_ci",
+        "Anyin (Indenie)"
+    ],
+    "APM": [
+        "app",
+        "Apma"
+    ],
+    "A": [
+        "ar",
+        "Arabic"
+    ],
+    "ADZ": [
+        "arq",
+        "Arabic (Algeria)"
+    ],
+    "AEY": [
+        "arz",
+        "Arabic (Egypt)"
+    ],
+    "ARQ": [
+        "acm",
+        "Arabic (Iraq)"
+    ],
+    "AJD": [
+        "ajp",
+        "Arabic (Jordan)"
+    ],
+    "ALN": [
+        "apc",
+        "Arabic (Lebanon)"
+    ],
+    "AMO": [
+        "ary",
+        "Arabic (Morocco)"
+    ],
+    "JU": [
+        "pga",
+        "Arabic (Sudanese Creole)"
+    ],
+    "ASN": [
+        "apd",
+        "Arabic (Sudanese)"
+    ],
+    "ASR": [
+        "apc_sy",
+        "Arabic (Syria)"
+    ],
+    "ATN": [
+        "aeb",
+        "Arabic (Tunisia)"
+    ],
+    "LSA": [
+        "aed",
+        "Argentinean Sign Language"
+    ],
+    "ARH": [
+        "arh",
+        "Arhuaco"
+    ],
+    "REA": [
+        "hy",
+        "Armenian"
+    ],
+    "KRB": [
+        "hy_x_krb",
+        "Armenian (Eastern dialect)"
+    ],
+    "R": [
+        "hyw",
+        "Armenian (West)"
+    ],
+    "ARS": [
+        "aen",
+        "Armenian Sign Language"
+    ],
+    "AHK": [
+        "cni",
+        "Ashaninka"
+    ],
+    "AE": [
+        "as",
+        "Assamese"
+    ],
+    "AS": [
+        "aii",
+        "Assyrian"
+    ],
+    "ACS": [
+        "cld",
+        "Assyro-Chaldean (Silopi)"
+    ],
+    "ATY": [
+        "tay",
+        "Atayal"
+    ],
+    "IE": [
+        "teo",
+        "Ateso"
+    ],
+    "ATI": [
+        "ati",
+        "Atti\u00e9"
+    ],
+    "AKN": [
+        "djk",
+        "Aukan"
+    ],
+    "AUS": [
+        "asf",
+        "Australian Sign Language"
+    ],
+    "OGS": [
+        "asq",
+        "Austrian Sign Language"
+    ],
+    "AV": [
+        "av",
+        "Avar"
+    ],
+    "AWA": [
+        "kwi",
+        "Awa (Cuaiquer)"
+    ],
+    "AWD": [
+        "awa",
+        "Awadhi"
+    ],
+    "AGR": [
+        "agr",
+        "Awajun"
+    ],
+    "AWN": [
+        "azo",
+        "Awing"
+    ],
+    "AP": [
+        "ay",
+        "Aymara"
+    ],
+    "AJR": [
+        "az",
+        "Azerbaijani"
+    ],
+    "AJA": [
+        "azb",
+        "Azerbaijani (Arabic)"
+    ],
+    "AJ": [
+        "az_cyrl",
+        "Azerbaijani (Cyrillic)"
+    ],
+    "FNB": [
+        "wyy_x_fnb",
+        "Ba"
+    ],
+    "BCM": [
+        "bcy",
+        "Bacama"
+    ],
+    "BDG": [
+        "bfq",
+        "Badaga"
+    ],
+    "BFI": [
+        "ksf",
+        "Bafia"
+    ],
+    "BNR": [
+        "bdq",
+        "Bahnar"
+    ],
+    "BKK": [
+        "bkh",
+        "Bakoko"
+    ],
+    "BLN": [
+        "ban",
+        "Balinese"
+    ],
+    "AR": [
+        "bm",
+        "Bambara"
+    ],
+    "BMN": [
+        "bax",
+        "Bamun"
+    ],
+    "BNM": [
+        "bjo",
+        "Banda (Mid-Southern)"
+    ],
+    "BNW": [
+        "bwi",
+        "Baniwa"
+    ],
+    "BNJ": [
+        "bjn",
+        "Banjar"
+    ],
+    "AO": [
+        "bci",
+        "Baoule"
+    ],
+    "BH": [
+        "bfa",
+        "Bari"
+    ],
+    "BB": [
+        "bba",
+        "Bariba"
+    ],
+    "BRW": [
+        "bwg",
+        "Barwe"
+    ],
+    "BSA": [
+        "mot",
+        "Bar\u00ed (South America)"
+    ],
+    "BAK": [
+        "ba",
+        "Bashkir"
+    ],
+    "BQ": [
+        "eu",
+        "Basque"
+    ],
+    "BS": [
+        "bas",
+        "Bassa (Cameroon)"
+    ],
+    "BA": [
+        "bsq",
+        "Bassa (Liberia)"
+    ],
+    "BTD": [
+        "btd",
+        "Batak (Dairi)"
+    ],
+    "AK": [
+        "btx",
+        "Batak (Karo)"
+    ],
+    "BTK": [
+        "bts",
+        "Batak (Simalungun)"
+    ],
+    "BT": [
+        "bbc",
+        "Batak (Toba)"
+    ],
+    "BEA": [
+        "ron_x_bea",
+        "Beas"
+    ],
+    "SBF": [
+        "sfb",
+        "Belgian French Sign Language"
+    ],
+    "BZK": [
+        "bzj",
+        "Belize Kriol"
+    ],
+    "BEL": [
+        "be",
+        "Belorussian"
+    ],
+    "BMB": [
+        "bmb",
+        "Bembe"
+    ],
+    "EN": [
+        "bez",
+        "Bena"
+    ],
+    "BE": [
+        "bn",
+        "Bengali"
+    ],
+    "BNL": [
+        "sgn_bj",
+        "Benin Sign Language"
+    ],
+    "BRM": [
+        "bom",
+        "Berom"
+    ],
+    "BTO": [
+        "plt_x_bto",
+        "Betsileo"
+    ],
+    "BTS": [
+        "bmm",
+        "Betsimisaraka (Northern)"
+    ],
+    "BTA": [
+        "bzc",
+        "Betsimisaraka (Southern)"
+    ],
+    "BHJ": [
+        "bho",
+        "Bhojpuri"
+    ],
+    "BHM": [
+        "bho_mu",
+        "Bhojpuri (Mauritius)"
+    ],
+    "IK": [
+        "bhw",
+        "Biak"
+    ],
+    "BI": [
+        "bcl",
+        "Bicol"
+    ],
+    "BDY": [
+        "sdo",
+        "Bidayuh (Bukar)"
+    ],
+    "BLB": [
+        "bib",
+        "Bisa (Lebir)"
+    ],
+    "LM": [
+        "bi",
+        "Bislama"
+    ],
+    "TCR": [
+        "pov",
+        "Bissau Guinean Creole"
+    ],
+    "BNS": [
+        "bps",
+        "Blaan (Sarangani)"
+    ],
+    "BLF": [
+        "bla",
+        "Blackfoot"
+    ],
+    "BVL": [
+        "bvl",
+        "Bolivian Sign Language"
+    ],
+    "BMU": [
+        "bmq",
+        "Bomu"
+    ],
+    "BSN": [
+        "bs",
+        "Bosnian"
+    ],
+    "WSL": [
+        "sgn_bw",
+        "Botswana Sign Language"
+    ],
+    "BO": [
+        "bum",
+        "Boulou"
+    ],
+    "LSB": [
+        "bzs",
+        "Brazilian Sign Language"
+    ],
+    "BRI": [
+        "bzd",
+        "Bribri"
+    ],
+    "BSL": [
+        "bfi",
+        "British Sign Language"
+    ],
+    "BDZ": [
+        "bja",
+        "Budza"
+    ],
+    "LK": [
+        "bxk",
+        "Bukusu"
+    ],
+    "BL": [
+        "bg",
+        "Bulgarian"
+    ],
+    "BLS": [
+        "bqn",
+        "Bulgarian Sign Language"
+    ],
+    "BNN": [
+        "bnn",
+        "Bunun (South)"
+    ],
+    "BUR": [
+        "bwr",
+        "Bura"
+    ],
+    "BFL": [
+        "sgn_bf",
+        "Burkina Faso Sign Language"
+    ],
+    "BRS": [
+        "sgn_bi",
+        "Burundi Sign Language"
+    ],
+    "BY": [
+        "bxr",
+        "Buryat"
+    ],
+    "BSH": [
+        "buc",
+        "Bushi"
+    ],
+    "BHL": [
+        "lel",
+        "Bushilele"
+    ],
+    "BSG": [
+        "buf",
+        "Bushoong"
+    ],
+    "ET": [
+        "btg",
+        "B\u00e9t\u00e9"
+    ],
+    "CAB": [
+        "cjp",
+        "Cab\u00e9car (Tayn\u00ed)"
+    ],
+    "CQC": [
+        "cak_x_cqc",
+        "Cakchiquel (Central)"
+    ],
+    "CQE": [
+        "cak_x_cqe",
+        "Cakchiquel (Eastern)"
+    ],
+    "CQ": [
+        "cak",
+        "Cakchiquel (Western)"
+    ],
+    "CB": [
+        "km",
+        "Cambodian"
+    ],
+    "CBL": [
+        "sgn_kh",
+        "Cambodian Sign Language"
+    ],
+    "CRB": [
+        "car_x_crb",
+        "Carib"
+    ],
+    "AN": [
+        "cat",
+        "Catalan"
+    ],
+    "CV": [
+        "ceb",
+        "Cebuano"
+    ],
+    "CRS": [
+        "sgn_cf",
+        "Central African Republic Sign Language"
+    ],
+    "YU": [
+        "esu",
+        "Central Alaskan Yupik"
+    ],
+    "CM": [
+        "ch",
+        "Chamorro"
+    ],
+    "CGM": [
+        "tso_mz",
+        "Changana (Mozambique)"
+    ],
+    "CGA": [
+        "tso_zw",
+        "Changana (Zimbabwe)"
+    ],
+    "CC": [
+        "cbk",
+        "Chavacano"
+    ],
+    "CPL": [
+        "cbi",
+        "Cha\u2019palaa"
+    ],
+    "HE": [
+        "ce",
+        "Chechen"
+    ],
+    "CDG": [
+        "arn_x_cdg",
+        "Chedungun (Coast)"
+    ],
+    "CKE": [
+        "chr",
+        "Cherokee"
+    ],
+    "CGD": [
+        "hne_deva",
+        "Chhattisgarhi (Devanagari)"
+    ],
+    "CN": [
+        "ny",
+        "Chichewa"
+    ],
+    "CGG": [
+        "cgg",
+        "Chiga"
+    ],
+    "SCH": [
+        "csg",
+        "Chilean Sign Language"
+    ],
+    "FLM": [
+        "cfm",
+        "Chin (Falam)"
+    ],
+    "HK": [
+        "cnh",
+        "Chin (Hakha)"
+    ],
+    "KUK": [
+        "tcz",
+        "Chin (Kuki)"
+    ],
+    "MAA": [
+        "mrh",
+        "Chin (Mara)"
+    ],
+    "CI": [
+        "ctd",
+        "Chin (Tiddim)"
+    ],
+    "ZO": [
+        "czt",
+        "Chin (Zotung)"
+    ],
+    "CNO": [
+        "chj",
+        "Chinantec (Ojitlan)"
+    ],
+    "CHF": [
+        "cdo",
+        "Chinese (Fuzhounese)"
+    ],
+    "CHG": [
+        "wuu_x_chg",
+        "Chinese (Shanghainese)"
+    ],
+    "CSN": [
+        "cmn_x_csn",
+        "Chinese (Sichuanese)"
+    ],
+    "WNZ": [
+        "wuu_x_wnz",
+        "Chinese (Wenzhounese)"
+    ],
+    "CHK": [
+        "cmn_x_chk",
+        "Chinese (Yunnanese)"
+    ],
+    "CNS": [
+        "yue_hans",
+        "Chinese Cantonese (Simplified)"
+    ],
+    "CHC": [
+        "yue_hant",
+        "Chinese Cantonese (Traditional)"
+    ],
+    "CHS": [
+        "cmn_hans",
+        "Chinese Mandarin (Simplified)"
+    ],
+    "CH": [
+        "cmn_hant",
+        "Chinese Mandarin (Traditional)"
+    ],
+    "CSL": [
+        "csl",
+        "Chinese Sign Language"
+    ],
+    "CHQ": [
+        "cax",
+        "Chiquitano"
+    ],
+    "CG": [
+        "toi",
+        "Chitonga"
+    ],
+    "CT": [
+        "tog",
+        "Chitonga (Malawi)"
+    ],
+    "CGW": [
+        "toi_zw",
+        "Chitonga (Zimbabwe)"
+    ],
+    "TB": [
+        "tum",
+        "Chitumbuka"
+    ],
+    "YA": [
+        "yao",
+        "Chiyao"
+    ],
+    "CTW": [
+        "cho",
+        "Choctaw"
+    ],
+    "CK": [
+        "cjk",
+        "Chokwe"
+    ],
+    "CHL": [
+        "ctu",
+        "Chol"
+    ],
+    "CLX": [
+        "chd",
+        "Chontal (Oaxaca)"
+    ],
+    "CLT": [
+        "chf",
+        "Chontal (Tabasco)"
+    ],
+    "CPI": [
+        "cce",
+        "Chopi"
+    ],
+    "CTI": [
+        "crt",
+        "Chorote (Iyojwa'ja)"
+    ],
+    "CO": [
+        "chw",
+        "Chuabo"
+    ],
+    "CHJ": [
+        "cac",
+        "Chuj"
+    ],
+    "TE": [
+        "chk",
+        "Chuukese"
+    ],
+    "CU": [
+        "cv",
+        "Chuvash"
+    ],
+    "CW": [
+        "bem",
+        "Cibemba"
+    ],
+    "NM": [
+        "mwn",
+        "Cinamwanga"
+    ],
+    "CIN": [
+        "nya",
+        "Cinyanja"
+    ],
+    "LSC": [
+        "csn",
+        "Colombian Sign Language"
+    ],
+    "CMK": [
+        "cfg",
+        "Como Karim"
+    ],
+    "CMG": [
+        "zdj",
+        "Comorian (Ngazidja)"
+    ],
+    "CGS": [
+        "sgn_cd",
+        "Congolese Sign Language"
+    ],
+    "COR": [
+        "crn",
+        "Cora (El Nayar)"
+    ],
+    "CSC": [
+        "co",
+        "Corsican"
+    ],
+    "SCR": [
+        "csr",
+        "Costa Rican Sign Language"
+    ],
+    "CY": [
+        "crk_latn",
+        "Cree Plains (Roman)"
+    ],
+    "CYS": [
+        "crk_x_cys",
+        "Cree Plains (Syllabics)"
+    ],
+    "CSR": [
+        "crj_latn",
+        "Cree Southern East (Roman)"
+    ],
+    "YC": [
+        "csw_x_yc",
+        "Cree West Swampy (Roman)"
+    ],
+    "YCS": [
+        "csw_x_ycs",
+        "Cree West Swampy (Syllabics)"
+    ],
+    "CTR": [
+        "crh_x_ctr",
+        "Crimean Tatar"
+    ],
+    "CTC": [
+        "crh_x_ctc",
+        "Crimean Tatar (Cyrillic)"
+    ],
+    "C": [
+        "hr",
+        "Croatian"
+    ],
+    "HZJ": [
+        "csq",
+        "Croatian Sign Language"
+    ],
+    "CBS": [
+        "csf",
+        "Cuban Sign Language"
+    ],
+    "CBE": [
+        "cub",
+        "Cubeo"
+    ],
+    "CPC": [
+        "kpc",
+        "Curripaco"
+    ],
+    "B": [
+        "cs",
+        "Czech"
+    ],
+    "CSE": [
+        "cse",
+        "Czech Sign Language"
+    ],
+    "DGA": [
+        "dga",
+        "Dagaare"
+    ],
+    "DGB": [
+        "dag",
+        "Dagbani"
+    ],
+    "DT": [
+        "dak",
+        "Dakota"
+    ],
+    "DMR": [
+        "naq_x_dmr",
+        "Damara"
+    ],
+    "DG": [
+        "ada",
+        "Dangme"
+    ],
+    "D": [
+        "da",
+        "Danish"
+    ],
+    "DSL": [
+        "dsl",
+        "Danish Sign Language"
+    ],
+    "DRG": [
+        "dar",
+        "Dargwa"
+    ],
+    "DAR": [
+        "prs",
+        "Dari"
+    ],
+    "DKA": [
+        "knx",
+        "Dayak Ahe"
+    ],
+    "DK": [
+        "nij",
+        "Dayak Ngaju"
+    ],
+    "DKS": [
+        "sya",
+        "Dayak Siang"
+    ],
+    "DYT": [
+        "xdy",
+        "Dayak Tomun"
+    ],
+    "DND": [
+        "ddn",
+        "Dendi"
+    ],
+    "DNS": [
+        "dez",
+        "Dengese"
+    ],
+    "DDL": [
+        "dic",
+        "Dida (Lakota)"
+    ],
+    "DGR": [
+        "os_x_dgr",
+        "Digor"
+    ],
+    "DI": [
+        "din",
+        "Dinka"
+    ],
+    "DO": [
+        "dyo",
+        "Diola"
+    ],
+    "DTM": [
+        "tbz",
+        "Ditammari"
+    ],
+    "DTS": [
+        "dts",
+        "Dogon (Toro So)"
+    ],
+    "DA": [
+        "dua",
+        "Douala"
+    ],
+    "LF": [
+        "dhv",
+        "Drehu"
+    ],
+    "DGN": [
+        "dng",
+        "Dungan"
+    ],
+    "KAD": [
+        "dtp",
+        "Dusun"
+    ],
+    "O": [
+        "nl",
+        "Dutch"
+    ],
+    "OBG": [
+        "nl_be",
+        "Dutch (Belgium)"
+    ],
+    "OSR": [
+        "nl_sr",
+        "Dutch (Suriname)"
+    ],
+    "NGT": [
+        "dse",
+        "Dutch Sign Language"
+    ],
+    "DZR": [
+        "dzo_latn",
+        "Dzongkha (Roman)"
+    ],
+    "DZ": [
+        "dzo_tibt",
+        "Dzongkha (Tibetan)"
+    ],
+    "EBA": [
+        "igb",
+        "Ebira"
+    ],
+    "SEC": [
+        "ecs",
+        "Ecuadorian Sign Language"
+    ],
+    "ED": [
+        "bin",
+        "Edo"
+    ],
+    "EFN": [
+        "llp",
+        "Efate (North)"
+    ],
+    "EFS": [
+        "erk",
+        "Efate (South)"
+    ],
+    "EF": [
+        "efi",
+        "Efik"
+    ],
+    "EMB": [
+        "cto",
+        "Ember\u00e1 (Cat\u00edo)"
+    ],
+    "EMC": [
+        "cmi",
+        "Ember\u00e1 (Cham\u00ed)"
+    ],
+    "EMP": [
+        "emp",
+        "Ember\u00e1 (Northern)"
+    ],
+    "E": [
+        "en",
+        "English"
+    ],
+    "ENG": [
+        "en_ng",
+        "English (Nigeria)"
+    ],
+    "EZ": [
+        "myv",
+        "Erzya"
+    ],
+    "IH": [
+        "ish",
+        "Esan"
+    ],
+    "ST": [
+        "et",
+        "Estonian"
+    ],
+    "STD": [
+        "eso",
+        "Estonian Sign Language"
+    ],
+    "ESL": [
+        "eth",
+        "Ethiopian Sign Language"
+    ],
+    "ETN": [
+        "eto",
+        "Eton"
+    ],
+    "EW": [
+        "ee",
+        "Ewe"
+    ],
+    "EWN": [
+        "ewo",
+        "Ewondo"
+    ],
+    "FGN": [
+        "fan",
+        "Fang"
+    ],
+    "FA": [
+        "fat",
+        "Fante"
+    ],
+    "FR": [
+        "fo",
+        "Faroese"
+    ],
+    "FTL": [
+        "ddg",
+        "Fataluku"
+    ],
+    "FFE": [
+        "fmp",
+        "Fe'fe'"
+    ],
+    "FJS": [
+        "sgn_fj",
+        "Fiji Sign Language"
+    ],
+    "FN": [
+        "fj",
+        "Fijian"
+    ],
+    "FSL": [
+        "psp",
+        "Filipino Sign Language"
+    ],
+    "FI": [
+        "fi",
+        "Finnish"
+    ],
+    "FID": [
+        "fse",
+        "Finnish Sign Language"
+    ],
+    "VGT": [
+        "vgt",
+        "Flemish Sign Language"
+    ],
+    "FO": [
+        "fon",
+        "Fon"
+    ],
+    "FF": [
+        "gur",
+        "Frafra"
+    ],
+    "FCD": [
+        "fr_cl",
+        "Fran\u00e7ais Ivoirien"
+    ],
+    "F": [
+        "fr",
+        "French"
+    ],
+    "FBN": [
+        "fr_bj",
+        "French (Benin)"
+    ],
+    "FCA": [
+        "fr_ca",
+        "French (Canada)"
+    ],
+    "LSF": [
+        "fsl",
+        "French Sign Language"
+    ],
+    "FS": [
+        "fy",
+        "Frisian"
+    ],
+    "FD": [
+        "fub",
+        "Fulfulde (Cameroon)"
+    ],
+    "FLN": [
+        "fuv",
+        "Fulfulde (Nigerian)"
+    ],
+    "FT": [
+        "fud",
+        "Futuna (East)"
+    ],
+    "FW": [
+        "fwa",
+        "Fw\u00e2i"
+    ],
+    "GA": [
+        "gaa",
+        "Ga"
+    ],
+    "GZ": [
+        "gag_x_gz",
+        "Gagauz"
+    ],
+    "GZR": [
+        "gag_x_gzr",
+        "Gagauz (Roman)"
+    ],
+    "GLC": [
+        "gl",
+        "Galician"
+    ],
+    "GRW": [
+        "gbm",
+        "Garhwali"
+    ],
+    "GRF": [
+        "cab",
+        "Garifuna"
+    ],
+    "GAR": [
+        "grt_x_gar",
+        "Garo (Abeng)"
+    ],
+    "GBA": [
+        "gba",
+        "Gbaya"
+    ],
+    "GDE": [
+        "jw_gde",
+        "Gedeo"
+    ],
+    "GE": [
+        "ka",
+        "Georgian"
+    ],
+    "GGS": [
+        "sgn_ge",
+        "Georgian Sign Language"
+    ],
+    "X": [
+        "de",
+        "German"
+    ],
+    "DGS": [
+        "gsg",
+        "German Sign Language"
+    ],
+    "GHS": [
+        "gse",
+        "Ghanaian Sign Language"
+    ],
+    "GHM": [
+        "bbj",
+        "Ghom\u00e1l\u00e1\u2019"
+    ],
+    "GY": [
+        "nyf",
+        "Giryama"
+    ],
+    "GTN": [
+        "toh",
+        "Gitonga"
+    ],
+    "GG": [
+        "gog",
+        "Gogo"
+    ],
+    "GN": [
+        "gkn",
+        "Gokana"
+    ],
+    "GRC": [
+        "gux",
+        "Gourmanch\u00e9ma"
+    ],
+    "GO": [
+        "goa",
+        "Gouro"
+    ],
+    "GRB": [
+        "grb",
+        "Grebo"
+    ],
+    "G": [
+        "el",
+        "Greek"
+    ],
+    "GSL": [
+        "gss",
+        "Greek Sign Language"
+    ],
+    "GL": [
+        "kl",
+        "Greenlandic"
+    ],
+    "GLE": [
+        "kl_x_gle",
+        "Greenlandic (East)"
+    ],
+    "GCR": [
+        "gcf",
+        "Guadeloupean Creole"
+    ],
+    "GHB": [
+        "guh",
+        "Guahibo"
+    ],
+    "GBM": [
+        "gum",
+        "Guambiano"
+    ],
+    "GI": [
+        "gug",
+        "Guarani"
+    ],
+    "GIB": [
+        "gui",
+        "Guarani (Bolivia)"
+    ],
+    "GIM": [
+        "gun",
+        "Guaran\u00ed (Mby\u00e1)"
+    ],
+    "GRY": [
+        "gyr",
+        "Guarayu"
+    ],
+    "LSG": [
+        "gsm",
+        "Guatemalan Sign Language"
+    ],
+    "GBR": [
+        "guo",
+        "Guayabero"
+    ],
+    "GRZ": [
+        "gkp",
+        "Guerze"
+    ],
+    "GNC": [
+        "gcr",
+        "Guianese Creole"
+    ],
+    "GU": [
+        "gu",
+        "Gujarati"
+    ],
+    "EG": [
+        "guw",
+        "Gun"
+    ],
+    "UN": [
+        "cuk",
+        "Guna"
+    ],
+    "GCE": [
+        "gyn",
+        "Guyanese Creole English"
+    ],
+    "GUR": [
+        "gxx",
+        "Gu\u00e9r\u00e9"
+    ],
+    "HDY": [
+        "hdy",
+        "Hadiyya"
+    ],
+    "CR": [
+        "ht",
+        "Haitian Creole"
+    ],
+    "HKI": [
+        "hak_id",
+        "Hakka (Indonesia)"
+    ],
+    "CHH": [
+        "hak",
+        "Hakka (Taiwan)"
+    ],
+    "HLA": [
+        "hla",
+        "Halia"
+    ],
+    "HMA": [
+        "hyw_x_hma",
+        "Hamshen (Armenian)"
+    ],
+    "HMS": [
+        "hyw_x_hms",
+        "Hamshen (Cyrillic)"
+    ],
+    "HNO": [
+        "lml",
+        "Hano"
+    ],
+    "HRV": [
+        "bgc",
+        "Haryanvi"
+    ],
+    "HA": [
+        "ha",
+        "Hausa"
+    ],
+    "HVU": [
+        "hav",
+        "Havu"
+    ],
+    "HW": [
+        "haw",
+        "Hawaiian"
+    ],
+    "HWP": [
+        "hwc",
+        "Hawai\u2019i Pidgin"
+    ],
+    "HWU": [
+        "hvn",
+        "Hawu"
+    ],
+    "HY": [
+        "hay",
+        "Haya"
+    ],
+    "Q": [
+        "he",
+        "Hebrew"
+    ],
+    "HH": [
+        "heh",
+        "Hehe"
+    ],
+    "HR": [
+        "hz",
+        "Herero"
+    ],
+    "HV": [
+        "hil",
+        "Hiligaynon"
+    ],
+    "HI": [
+        "hi",
+        "Hindi"
+    ],
+    "HFJ": [
+        "hif",
+        "Hindi (Fiji)"
+    ],
+    "HRM": [
+        "hi_latn",
+        "Hindi (Roman)"
+    ],
+    "MO": [
+        "ho",
+        "Hiri Motu"
+    ],
+    "MCG": [
+        "mbn",
+        "Hitnu"
+    ],
+    "HMN": [
+        "hnj",
+        "Hmong (Green)"
+    ],
+    "HM": [
+        "hmn",
+        "Hmong (White)"
+    ],
+    "SHO": [
+        "hds",
+        "Honduras Sign Language"
+    ],
+    "HSL": [
+        "hks",
+        "Hong Kong Sign Language"
+    ],
+    "HPI": [
+        "hop",
+        "Hopi"
+    ],
+    "HST": [
+        "hus",
+        "Huastec (San Luis Potosi)"
+    ],
+    "HSV": [
+        "hus_x_hsv",
+        "Huastec (Veracruz)"
+    ],
+    "HUV": [
+        "huv",
+        "Huave (San Mateo del Mar)"
+    ],
+    "HU": [
+        "hul",
+        "Hula"
+    ],
+    "H": [
+        "hu",
+        "Hungarian"
+    ],
+    "HDF": [
+        "hsh",
+        "Hungarian Sign Language"
+    ],
+    "HSK": [
+        "hrx",
+        "Hunsrik"
+    ],
+    "HTX": [
+        "geh",
+        "Hutterite German"
+    ],
+    "IAA": [
+        "iai",
+        "Iaai"
+    ],
+    "IBL": [
+        "ibl",
+        "Ibaloi"
+    ],
+    "IA": [
+        "iba",
+        "Iban"
+    ],
+    "IG": [
+        "ibg",
+        "Ibanag"
+    ],
+    "IBI": [
+        "yom_x_ibi",
+        "Ibinda"
+    ],
+    "IC": [
+        "is",
+        "Icelandic"
+    ],
+    "ID": [
+        "idu",
+        "Idoma"
+    ],
+    "AA": [
+        "igl",
+        "Igala"
+    ],
+    "IB": [
+        "ig",
+        "Igbo"
+    ],
+    "IGE": [
+        "ige",
+        "Igede"
+    ],
+    "IGN": [
+        "ign",
+        "Ignaciano"
+    ],
+    "IJ": [
+        "ijc",
+        "Ijaw"
+    ],
+    "IL": [
+        "ilo",
+        "Iloko"
+    ],
+    "IKN": [
+        "akl",
+        "Inakeanon"
+    ],
+    "INS": [
+        "ins",
+        "Indian Sign Language"
+    ],
+    "IN": [
+        "id",
+        "Indonesian"
+    ],
+    "INI": [
+        "inl",
+        "Indonesian Sign Language"
+    ],
+    "INB": [
+        "inb",
+        "Inga"
+    ],
+    "IUR": [
+        "iu_latn",
+        "Inuktitut (Roman)"
+    ],
+    "IU": [
+        "iu",
+        "Inuktitut (Syllabics)"
+    ],
+    "GC": [
+        "ga",
+        "Irish"
+    ],
+    "ISG": [
+        "isg",
+        "Irish Sign Language"
+    ],
+    "CRE": [
+        "icr",
+        "Islander Creole English"
+    ],
+    "IS": [
+        "iso",
+        "Isoko"
+    ],
+    "QSL": [
+        "isr",
+        "Israeli Sign Language"
+    ],
+    "I": [
+        "it",
+        "Italian"
+    ],
+    "ISL": [
+        "ise",
+        "Italian Sign Language"
+    ],
+    "ITW": [
+        "itv",
+        "Itawit"
+    ],
+    "IT": [
+        "its",
+        "Itsekiri"
+    ],
+    "IMN": [
+        "ium",
+        "Iu Mien"
+    ],
+    "LSI": [
+        "sgn_ci",
+        "Ivorian Sign Language"
+    ],
+    "IXL": [
+        "ixl",
+        "Ixil"
+    ],
+    "JCR": [
+        "jam_x_jcr",
+        "Jamaican Creole"
+    ],
+    "JML": [
+        "jls",
+        "Jamaican Sign Language"
+    ],
+    "J": [
+        "ja",
+        "Japanese"
+    ],
+    "JSL": [
+        "jsl",
+        "Japanese Sign Language"
+    ],
+    "JAR": [
+        "jra",
+        "Jarai"
+    ],
+    "JA": [
+        "jv",
+        "Javanese"
+    ],
+    "JVN": [
+        "jav",
+        "Javanese (Eastern)"
+    ],
+    "JJU": [
+        "jje",
+        "Jejueo"
+    ],
+    "JWK": [
+        "whg",
+        "Jiwaka"
+    ],
+    "JL": [
+        "dyu",
+        "Jula"
+    ],
+    "KBR": [
+        "kbd",
+        "Kabardin-Cherkess"
+    ],
+    "KAB": [
+        "kbp",
+        "Kabiye"
+    ],
+    "KBV": [
+        "kea",
+        "Kabuverdianu"
+    ],
+    "KBT": [
+        "kea_x_kbt",
+        "Kabuverdianu (Barlaventu)"
+    ],
+    "KBY": [
+        "kab",
+        "Kabyle"
+    ],
+    "AH": [
+        "kac",
+        "Kachin"
+    ],
+    "KDV": [
+        "fij_x_kdv",
+        "Kadavu"
+    ],
+    "KAZ": [
+        "kzj",
+        "Kadazan"
+    ],
+    "KGG": [
+        "kgp",
+        "Kaingang"
+    ],
+    "KAA": [
+        "kgk",
+        "Kaiw\u00e1"
+    ],
+    "KL": [
+        "kck_x_kl",
+        "Kalanga (Botswana)"
+    ],
+    "KLZ": [
+        "kck_x_klz",
+        "Kalanga (Zimbabwe)"
+    ],
+    "KJ": [
+        "kln",
+        "Kalenjin"
+    ],
+    "KLK": [
+        "xal",
+        "Kalmyk"
+    ],
+    "KMY": [
+        "kyk",
+        "Kamayo"
+    ],
+    "KB": [
+        "kam",
+        "Kamba"
+    ],
+    "KMB": [
+        "xbr",
+        "Kambera"
+    ],
+    "KMW": [
+        "hig",
+        "Kamwe"
+    ],
+    "KGH": [
+        "xnr",
+        "Kangri (Hamirpuri)"
+    ],
+    "KNY": [
+        "kne",
+        "Kankanaey"
+    ],
+    "KA": [
+        "kn",
+        "Kannada"
+    ],
+    "KYK": [
+        "kny",
+        "Kanyok"
+    ],
+    "BAL": [
+        "krc",
+        "Karachay-Balkar"
+    ],
+    "KRK": [
+        "kaa",
+        "Karakalpak"
+    ],
+    "KPN": [
+        "pww",
+        "Karen (Pwo Northern)"
+    ],
+    "PK": [
+        "pwo",
+        "Karen (Pwo Western)"
+    ],
+    "KR": [
+        "ksw",
+        "Karen (S'gaw)"
+    ],
+    "KSM": [
+        "xsm",
+        "Kasem"
+    ],
+    "KSH": [
+        "csb",
+        "Kashubian"
+    ],
+    "AZ": [
+        "kk",
+        "Kazakh"
+    ],
+    "AZA": [
+        "kk_arab",
+        "Kazakh (Arabic)"
+    ],
+    "KEI": [
+        "kei",
+        "Kei"
+    ],
+    "GK": [
+        "kek",
+        "Kekchi"
+    ],
+    "KSI": [
+        "xki",
+        "Kenyan Sign Language"
+    ],
+    "KHK": [
+        "kjh",
+        "Khakass"
+    ],
+    "OG": [
+        "ogo",
+        "Khana"
+    ],
+    "KHL": [
+        "hin_x_khl",
+        "Khari Boli"
+    ],
+    "KS": [
+        "kha",
+        "Khasi"
+    ],
+    "KMN": [
+        "kxm",
+        "Khmer (Northern)"
+    ],
+    "KBL": [
+        "blv",
+        "Kibala"
+    ],
+    "KFL": [
+        "flr",
+        "Kifuliiru"
+    ],
+    "KHB": [
+        "hem",
+        "Kihemba"
+    ],
+    "KD": [
+        "kqn",
+        "Kikaonde"
+    ],
+    "KG": [
+        "kwy",
+        "Kikongo"
+    ],
+    "KGL": [
+        "ktu_x_kgl",
+        "Kikongo ya Leta"
+    ],
+    "KQ": [
+        "ki",
+        "Kikuyu"
+    ],
+    "KU": [
+        "lu",
+        "Kiluba"
+    ],
+    "MNN": [
+        "kg_x_mnn",
+        "Kimanyanga"
+    ],
+    "KIM": [
+        "kmb",
+        "Kimbundu"
+    ],
+    "KIN": [
+        "nnb",
+        "Kinande"
+    ],
+    "KNR": [
+        "krj",
+        "Kinaray-a"
+    ],
+    "KK": [
+        "nyy_x_kk",
+        "Kinyakyusa"
+    ],
+    "YW": [
+        "rw",
+        "Kinyarwanda"
+    ],
+    "KIP": [
+        "pem",
+        "Kipende"
+    ],
+    "KZ": [
+        "ky",
+        "Kirghiz"
+    ],
+    "GB": [
+        "gil",
+        "Kiribati"
+    ],
+    "RU": [
+        "run",
+        "Kirundi"
+    ],
+    "KI": [
+        "kss",
+        "Kisi"
+    ],
+    "II": [
+        "guz",
+        "Kisii"
+    ],
+    "KSN": [
+        "sop",
+        "Kisonge"
+    ],
+    "KIT": [
+        "ktu_x_kit",
+        "Kituba"
+    ],
+    "KBK": [
+        "trp",
+        "Kokborok"
+    ],
+    "KKL": [
+        "kzn",
+        "Kokola"
+    ],
+    "KM": [
+        "kpv",
+        "Komi"
+    ],
+    "KMP": [
+        "koi",
+        "Komi-Permyak"
+    ],
+    "MK": [
+        "kg",
+        "Kongo"
+    ],
+    "KND": [
+        "kex",
+        "Konkani (Devanagari)"
+    ],
+    "KN": [
+        "knn",
+        "Konkani (Kannada)"
+    ],
+    "KT": [
+        "gom",
+        "Konkani (Roman)"
+    ],
+    "KKB": [
+        "xon",
+        "Konkomba"
+    ],
+    "KNO": [
+        "kno",
+        "Kono"
+    ],
+    "KO": [
+        "ko",
+        "Korean"
+    ],
+    "KOC": [
+        "ko_cn",
+        "Korean (China)"
+    ],
+    "KSL": [
+        "kvk",
+        "Korean Sign Language"
+    ],
+    "OS": [
+        "kos",
+        "Kosraean"
+    ],
+    "KTI": [
+        "eko",
+        "Koti"
+    ],
+    "KP": [
+        "xpe",
+        "Kpelle"
+    ],
+    "KRI": [
+        "kri",
+        "Krio"
+    ],
+    "KRY": [
+        "tt_x_kry",
+        "Kryashen"
+    ],
+    "KUA": [
+        "ksd",
+        "Kuanua"
+    ],
+    "KHN": [
+        "sbs",
+        "Kuhane (Subiya)"
+    ],
+    "KUI": [
+        "uki",
+        "Kui"
+    ],
+    "KNM": [
+        "kun",
+        "Kunama"
+    ],
+    "KDA": [
+        "kdn",
+        "Kunda"
+    ],
+    "RD": [
+        "kmr_x_rd",
+        "Kurdish Kurmanji"
+    ],
+    "RDU": [
+        "kmr_x_rdu",
+        "Kurdish Kurmanji (Caucasus)"
+    ],
+    "RDC": [
+        "kmr_cyrl",
+        "Kurdish Kurmanji (Cyrillic)"
+    ],
+    "RDA": [
+        "ckb",
+        "Kurdish Sorani"
+    ],
+    "KUR": [
+        "kuj",
+        "Kuria"
+    ],
+    "KRH": [
+        "kru",
+        "Kurukh"
+    ],
+    "KUS": [
+        "kus",
+        "Kusaal"
+    ],
+    "KCC": [
+        "kfr",
+        "Kutchi"
+    ],
+    "KVM": [
+        "olu",
+        "Kuvale (Mucubal)"
+    ],
+    "KUY": [
+        "kdt",
+        "Kuy"
+    ],
+    "WG": [
+        "kwn",
+        "Kwangali"
+    ],
+    "KY": [
+        "kj",
+        "Kwanyama"
+    ],
+    "KW": [
+        "kwf",
+        "Kwara'ae"
+    ],
+    "KWS": [
+        "nmg",
+        "Kwasio"
+    ],
+    "NKN": [
+        "nyy_x_nkn",
+        "Kyangonde"
+    ],
+    "LAD": [
+        "lld_x_lad",
+        "Ladin (Gardenese)"
+    ],
+    "LAH": [
+        "lhu",
+        "Lahu"
+    ],
+    "LKT": [
+        "lkt",
+        "Lakota"
+    ],
+    "AB": [
+        "lam",
+        "Lamba"
+    ],
+    "LMD": [
+        "lmn",
+        "Lambadi"
+    ],
+    "LMB": [
+        "lai",
+        "Lambya"
+    ],
+    "LN": [
+        "laj",
+        "Lango"
+    ],
+    "CML": [
+        "sgn_cm",
+        "Langue des signes camerounaise"
+    ],
+    "LA": [
+        "lo",
+        "Laotian"
+    ],
+    "LR": [
+        "ldi",
+        "Lari"
+    ],
+    "LTG": [
+        "ltg",
+        "Latgalian"
+    ],
+    "LT": [
+        "lv",
+        "Latvian"
+    ],
+    "LSL": [
+        "lsl",
+        "Latvian Sign Language"
+    ],
+    "LNN": [
+        "llx",
+        "Lauan"
+    ],
+    "LBS": [
+        "sgn_lb",
+        "Lebanese Sign Language"
+    ],
+    "LGA": [
+        "lea",
+        "Lega"
+    ],
+    "LL": [
+        "lln",
+        "Lele"
+    ],
+    "LNK": [
+        "tnl",
+        "Lenakel"
+    ],
+    "LND": [
+        "led",
+        "Lendu"
+    ],
+    "LJ": [
+        "leh",
+        "Lenje"
+    ],
+    "LZ": [
+        "lez",
+        "Lezgian"
+    ],
+    "LHK": [
+        "koo",
+        "Lhukonzo"
+    ],
+    "ELI": [
+        "lir",
+        "Liberian English"
+    ],
+    "LWC": [
+        "lia",
+        "Limba (West-Central)"
+    ],
+    "LBM": [
+        "lmp",
+        "Limbum"
+    ],
+    "LI": [
+        "ln",
+        "Lingala"
+    ],
+    "LIS": [
+        "lis",
+        "Lisu"
+    ],
+    "L": [
+        "lt",
+        "Lithuanian"
+    ],
+    "LTS": [
+        "lls",
+        "Lithuanian Sign Language"
+    ],
+    "LKA": [
+        "yaz",
+        "Lokaa"
+    ],
+    "LLO": [
+        "llb",
+        "Lolo"
+    ],
+    "OM": [
+        "lom",
+        "Loma"
+    ],
+    "LOM": [
+        "lol",
+        "Lomongo"
+    ],
+    "LE": [
+        "ngl",
+        "Lomwe"
+    ],
+    "LGD": [
+        "lnu",
+        "Longuda"
+    ],
+    "LWX": [
+        "pdt",
+        "Low German"
+    ],
+    "LC": [
+        "lch",
+        "Luchazi"
+    ],
+    "LU": [
+        "lg",
+        "Luganda"
+    ],
+    "LG": [
+        "lgg",
+        "Lugbara"
+    ],
+    "LD": [
+        "lun",
+        "Lunda"
+    ],
+    "LO": [
+        "luo",
+        "Luo"
+    ],
+    "LV": [
+        "lue",
+        "Luvale"
+    ],
+    "LX": [
+        "lb",
+        "Luxembourgish"
+    ],
+    "MS": [
+        "mas",
+        "Maasai"
+    ],
+    "MC": [
+        "mk",
+        "Macedonian"
+    ],
+    "MAC": [
+        "vmw",
+        "Macua"
+    ],
+    "MCT": [
+        "fij_x_mct",
+        "Macuata"
+    ],
+    "MCS": [
+        "mbc",
+        "Macushi"
+    ],
+    "TTM": [
+        "mzc",
+        "Madagascar Sign Language"
+    ],
+    "MDI": [
+        "mhi",
+        "Madi"
+    ],
+    "MDR": [
+        "mad",
+        "Madura"
+    ],
+    "MAF": [
+        "maf",
+        "Mafa"
+    ],
+    "MU": [
+        "mdh",
+        "Maguindanao"
+    ],
+    "ORR": [
+        "swb_x_orr",
+        "Mahorian (Roman)"
+    ],
+    "MHL": [
+        "mai",
+        "Maithili"
+    ],
+    "MKA": [
+        "mcp",
+        "Makaa"
+    ],
+    "MKS": [
+        "mkz_x_mks",
+        "Makasae"
+    ],
+    "MHM": [
+        "xmc",
+        "Makhuwa-Marrevone"
+    ],
+    "MWM": [
+        "mgh",
+        "Makhuwa-Meetto"
+    ],
+    "MKM": [
+        "mhm",
+        "Makhuwa-Moniga"
+    ],
+    "MHS": [
+        "vmk",
+        "Makhuwa-Shirima"
+    ],
+    "MKD": [
+        "kde",
+        "Makonde"
+    ],
+    "MG": [
+        "mg",
+        "Malagasy"
+    ],
+    "MSL": [
+        "sgn_mw",
+        "Malawi Sign Language"
+    ],
+    "ML": [
+        "ms",
+        "Malay"
+    ],
+    "MPN": [
+        "pmy",
+        "Malay (Papuan)"
+    ],
+    "MY": [
+        "ml",
+        "Malayalam"
+    ],
+    "MLY": [
+        "mbp",
+        "Malayo"
+    ],
+    "BIM": [
+        "xml",
+        "Malaysian Sign Language"
+    ],
+    "MT": [
+        "mt",
+        "Maltese"
+    ],
+    "MLS": [
+        "mdl",
+        "Maltese Sign Language"
+    ],
+    "MZ": [
+        "mam",
+        "Mam"
+    ],
+    "AMA": [
+        "mqj",
+        "Mamasa"
+    ],
+    "MME": [
+        "mgm_x_mme",
+        "Mambae (Ermera)"
+    ],
+    "MWL": [
+        "mgr",
+        "Mambwe-Lungu"
+    ],
+    "MNM": [
+        "xmm",
+        "Manado Malay"
+    ],
+    "MDL": [
+        "mjl",
+        "Mandeali"
+    ],
+    "MNK": [
+        "mnk",
+        "Mandinka"
+    ],
+    "MNJ": [
+        "mzv",
+        "Mandja"
+    ],
+    "MJK": [
+        "mfv",
+        "Mandjak"
+    ],
+    "MGR": [
+        "mrv",
+        "Mangareva"
+    ],
+    "MKE": [
+        "emk",
+        "Maninkakan (Eastern)"
+    ],
+    "MI": [
+        "mni",
+        "Manipuri"
+    ],
+    "MIR": [
+        "mni_latn",
+        "Manipuri (Roman)"
+    ],
+    "MNO": [
+        "mev",
+        "Mano"
+    ],
+    "MNI": [
+        "mns",
+        "Mansi"
+    ],
+    "MYW": [
+        "mny",
+        "Manyawa"
+    ],
+    "MA": [
+        "mi",
+        "Maori"
+    ],
+    "MPD": [
+        "arn",
+        "Mapudungun"
+    ],
+    "MQR": [
+        "mch",
+        "Maquiritari"
+    ],
+    "OL": [
+        "rag",
+        "Maragoli"
+    ],
+    "MR": [
+        "mr",
+        "Marathi"
+    ],
+    "MAR": [
+        "mhr",
+        "Mari"
+    ],
+    "MRH": [
+        "mrj",
+        "Mari (Hill)"
+    ],
+    "MQN": [
+        "mrq",
+        "Marquesian (Nuku Hiva)"
+    ],
+    "MH": [
+        "mh",
+        "Marshallese"
+    ],
+    "MTC": [
+        "gcf_x_mtc",
+        "Martiniquan Creole"
+    ],
+    "MRW": [
+        "rwr",
+        "Marwari"
+    ],
+    "MSH": [
+        "shr",
+        "Mashi"
+    ],
+    "MTN": [
+        "mgv",
+        "Matengo"
+    ],
+    "MSS": [
+        "mcf",
+        "Matses"
+    ],
+    "CE": [
+        "mfe",
+        "Mauritian Creole"
+    ],
+    "MTS": [
+        "lsy",
+        "Mauritian Sign Language"
+    ],
+    "MAY": [
+        "yua",
+        "Maya"
+    ],
+    "MAP": [
+        "mop",
+        "Maya (Mop\u00e1n)"
+    ],
+    "MYG": [
+        "yan",
+        "Mayangna"
+    ],
+    "MYO": [
+        "mfy",
+        "Mayo"
+    ],
+    "MZH": [
+        "maz",
+        "Mazahua"
+    ],
+    "MAZ": [
+        "mau",
+        "Mazatec (Huautla)"
+    ],
+    "MBL": [
+        "mdp",
+        "Mbala"
+    ],
+    "MBN": [
+        "mxg",
+        "Mbangala"
+    ],
+    "MBO": [
+        "mbo",
+        "Mbo"
+    ],
+    "MBK": [
+        "mhw",
+        "Mbukushu"
+    ],
+    "MMU": [
+        "mdd",
+        "Mbum"
+    ],
+    "MBD": [
+        "mck",
+        "Mbunda"
+    ],
+    "MDH": [
+        "nan_x_mdh",
+        "Medan Hokkien"
+    ],
+    "DU": [
+        "byv",
+        "Medumba"
+    ],
+    "MNS": [
+        "sgn_pg",
+        "Melanesian Sign Language"
+    ],
+    "ME": [
+        "men",
+        "Mende"
+    ],
+    "MGK": [
+        "xmg",
+        "Mengaka"
+    ],
+    "MWI": [
+        "mwv",
+        "Mentawai"
+    ],
+    "UU": [
+        "mer",
+        "Meru"
+    ],
+    "MTA": [
+        "mgo",
+        "Meta'"
+    ],
+    "MWR": [
+        "mtr",
+        "Mewari"
+    ],
+    "LSM": [
+        "mfs",
+        "Mexican Sign Language"
+    ],
+    "CHN": [
+        "nan_x_chn",
+        "Min Nan (Quanzhou)"
+    ],
+    "CHW": [
+        "nan_x_chw",
+        "Min Nan (Taiwan)"
+    ],
+    "MGL": [
+        "xmf",
+        "Mingrelian"
+    ],
+    "MIS": [
+        "miq",
+        "Miskito"
+    ],
+    "MX": [
+        "mco",
+        "Mixe (North Central)"
+    ],
+    "MXC": [
+        "mio",
+        "Mixtec (Costa)"
+    ],
+    "MXG": [
+        "mxv",
+        "Mixtec (Guerrero)"
+    ],
+    "MXO": [
+        "jmx",
+        "Mixtec (Huajuapan)"
+    ],
+    "MXN": [
+        "xtd",
+        "Mixtec (Tilantongo)"
+    ],
+    "MXT": [
+        "meh",
+        "Mixtec (Tlaxiaco)"
+    ],
+    "LS": [
+        "lus",
+        "Mizo"
+    ],
+    "MKQ": [
+        "mic",
+        "Mi\u2019kmaq"
+    ],
+    "MNC": [
+        "cmo",
+        "Mnong (Central)"
+    ],
+    "MBA": [
+        "mfq",
+        "Moba"
+    ],
+    "MHK": [
+        "moh",
+        "Mohawk"
+    ],
+    "MOK": [
+        "mdf",
+        "Moksha"
+    ],
+    "KHA": [
+        "mn",
+        "Mongolian"
+    ],
+    "KHC": [
+        "mvf",
+        "Mongolian (Traditional)"
+    ],
+    "MSR": [
+        "msr",
+        "Mongolian Sign Language"
+    ],
+    "MNT": [
+        "cnr",
+        "Montenegrin"
+    ],
+    "MM": [
+        "mos",
+        "Moore"
+    ],
+    "MTU": [
+        "meu",
+        "Motu"
+    ],
+    "OU": [
+        "mua",
+        "Moundang"
+    ],
+    "MOU": [
+        "mse",
+        "Moussey"
+    ],
+    "SLM": [
+        "mzy",
+        "Mozambican Sign Language"
+    ],
+    "MNR": [
+        "unr",
+        "Mundari"
+    ],
+    "BU": [
+        "my",
+        "Myanmar"
+    ],
+    "BUS": [
+        "sgn_mm",
+        "Myanmar Sign Language"
+    ],
+    "NDI": [
+        "fij_x_ndi",
+        "Nadi"
+    ],
+    "NDR": [
+        "wyy_x_ndr",
+        "Nadroga"
+    ],
+    "NGG": [
+        "njm",
+        "Naga (Angami)"
+    ],
+    "NLM": [
+        "njn",
+        "Naga (Liangmai)"
+    ],
+    "NGR": [
+        "nbu",
+        "Naga (Rongmei)"
+    ],
+    "NGD": [
+        "nag",
+        "Nagamese"
+    ],
+    "NHC": [
+        "ncx",
+        "Nahuatl (Central)"
+    ],
+    "NHG": [
+        "ngu",
+        "Nahuatl (Guerrero)"
+    ],
+    "NHH": [
+        "nch",
+        "Nahuatl (Huasteca)"
+    ],
+    "NHT": [
+        "ncj",
+        "Nahuatl (Northern Puebla)"
+    ],
+    "NHV": [
+        "nhk",
+        "Nahuatl (Veracruz)"
+    ],
+    "NA": [
+        "naq_x_na",
+        "Nama"
+    ],
+    "NMK": [
+        "nmk",
+        "Namakura"
+    ],
+    "NB": [
+        "nmq",
+        "Nambya"
+    ],
+    "SLN": [
+        "nbs",
+        "Namibian Sign Language"
+    ],
+    "NNR": [
+        "bwb",
+        "Namosi-Naitasiri-Serua"
+    ],
+    "NCW": [
+        "ncb",
+        "Nancowry"
+    ],
+    "NV": [
+        "nv",
+        "Navajo"
+    ],
+    "NDL": [
+        "ndh",
+        "Ndali"
+    ],
+    "NDA": [
+        "ndc",
+        "Ndau"
+    ],
+    "NDW": [
+        "ndc_x_ndw",
+        "Ndau (Western)"
+    ],
+    "NBL": [
+        "nr",
+        "Ndebele"
+    ],
+    "NBZ": [
+        "nd",
+        "Ndebele (Zimbabwe)"
+    ],
+    "OD": [
+        "ng",
+        "Ndonga"
+    ],
+    "NNT": [
+        "yrk",
+        "Nenets"
+    ],
+    "RE": [
+        "nen",
+        "Nengone"
+    ],
+    "NP": [
+        "ne",
+        "Nepali"
+    ],
+    "NSL": [
+        "nsp",
+        "Nepali Sign Language"
+    ],
+    "NZS": [
+        "nzs",
+        "New Zealand Sign Language"
+    ],
+    "NW": [
+        "new",
+        "Newari"
+    ],
+    "NGB": [
+        "gym",
+        "Ngabere"
+    ],
+    "NG": [
+        "sba",
+        "Ngambaye"
+    ],
+    "NGL": [
+        "nba",
+        "Ngangela"
+    ],
+    "NGK": [
+        "nga",
+        "Ngbaka"
+    ],
+    "NGN": [
+        "ngb",
+        "Ngbandi (Northern)"
+    ],
+    "NMB": [
+        "nnh",
+        "Ngiemboon"
+    ],
+    "NGM": [
+        "pls",
+        "Ngigua (San Marcos Tlacoyalco)"
+    ],
+    "NML": [
+        "nla",
+        "Ngombale"
+    ],
+    "NGU": [
+        "yrl",
+        "Nhengatu"
+    ],
+    "NI": [
+        "nia",
+        "Nias"
+    ],
+    "LSN": [
+        "ncs",
+        "Nicaraguan Sign Language"
+    ],
+    "NC": [
+        "caq",
+        "Nicobarese"
+    ],
+    "NGP": [
+        "pcm",
+        "Nigerian Pidgin"
+    ],
+    "NNS": [
+        "nsi",
+        "Nigerian Sign Language"
+    ],
+    "NN": [
+        "niu",
+        "Niuean"
+    ],
+    "NVC": [
+        "cag",
+        "Nivacl\u00e9"
+    ],
+    "NJB": [
+        "nzb",
+        "Njebi"
+    ],
+    "NKY": [
+        "nka",
+        "Nkoya"
+    ],
+    "NOR": [
+        "ojb_x_nor",
+        "Northern Ojibwe (Roman)"
+    ],
+    "NOS": [
+        "ojb_x_nos",
+        "Northern Ojibwe (Syllabics)"
+    ],
+    "N": [
+        "no",
+        "Norwegian"
+    ],
+    "NDF": [
+        "nsl",
+        "Norwegian Sign Language"
+    ],
+    "NSM": [
+        "nse_mz",
+        "Nsenga (Mozambique)"
+    ],
+    "NEN": [
+        "nse",
+        "Nsenga (Zambia)"
+    ],
+    "UE": [
+        "nus",
+        "Nuer"
+    ],
+    "NKM": [
+        "nuq",
+        "Nukumanu"
+    ],
+    "KWN": [
+        "kdk",
+        "Num\u00e8\u00e8 (Kwenyii)"
+    ],
+    "YM": [
+        "nym",
+        "Nyamwezi"
+    ],
+    "NK": [
+        "nyk",
+        "Nyaneka"
+    ],
+    "NYL": [
+        "yly",
+        "Nyel\u00e2yu"
+    ],
+    "NY": [
+        "nih",
+        "Nyiha"
+    ],
+    "NYU": [
+        "nyu",
+        "Nyungwe"
+    ],
+    "NZ": [
+        "nzi",
+        "Nzema"
+    ],
+    "OBL": [
+        "ann",
+        "Obolo"
+    ],
+    "ODW": [
+        "otw",
+        "Odawa"
+    ],
+    "OI": [
+        "or",
+        "Odia"
+    ],
+    "OKP": [
+        "oke",
+        "Okpe"
+    ],
+    "LB": [
+        "nyd",
+        "Olunyole"
+    ],
+    "OMB": [
+        "mbm",
+        "Ombamba"
+    ],
+    "ORK": [
+        "okv",
+        "Orokaiva"
+    ],
+    "OA": [
+        "om",
+        "Oromo"
+    ],
+    "OSS": [
+        "os",
+        "Ossetian"
+    ],
+    "OSC": [
+        "os_x_osc",
+        "Ossetian (Chsan)"
+    ],
+    "OSK": [
+        "os_x_osk",
+        "Ossetian (Kudar)"
+    ],
+    "OT": [
+        "tll",
+        "Otetela"
+    ],
+    "OTE": [
+        "otm",
+        "Otomi (Eastern Highland)"
+    ],
+    "OTM": [
+        "ote",
+        "Otomi (Mezquital Valley)"
+    ],
+    "OTS": [
+        "ots",
+        "Otomi (State of Mexico)"
+    ],
+    "PPG": [
+        "ood",
+        "O\u2019odham (Tohono)"
+    ],
+    "PAO": [
+        "blk",
+        "Pa'o"
+    ],
+    "PMA": [
+        "pma",
+        "Paama"
+    ],
+    "PIC": [
+        "pri",
+        "Paic\u00ee"
+    ],
+    "PWN": [
+        "pwn",
+        "Paiwan"
+    ],
+    "PU": [
+        "pau",
+        "Palauan"
+    ],
+    "PLK": [
+        "plu",
+        "Palik\u00far"
+    ],
+    "PMO": [
+        "pmf",
+        "Pamona"
+    ],
+    "PSL": [
+        "lsp",
+        "Panamanian Sign Language"
+    ],
+    "PN": [
+        "pag",
+        "Pangasinan"
+    ],
+    "PPL": [
+        "pbo",
+        "Papel"
+    ],
+    "PAA": [
+        "pap_x_paa",
+        "Papiamento (Aruba)"
+    ],
+    "PA": [
+        "pap",
+        "Papiamento (Cura\u00e7ao)"
+    ],
+    "LSP": [
+        "pys",
+        "Paraguayan Sign Language"
+    ],
+    "PH": [
+        "ps",
+        "Pashto"
+    ],
+    "PHN": [
+        "arn_x_phn",
+        "Pehuenche"
+    ],
+    "PMN": [
+        "aoc",
+        "Pemon"
+    ],
+    "XPA": [
+        "pdc",
+        "Pennsylvania German"
+    ],
+    "PR": [
+        "fa",
+        "Persian"
+    ],
+    "SPE": [
+        "prl",
+        "Peruvian Sign Language"
+    ],
+    "PHM": [
+        "phm",
+        "Phimbi"
+    ],
+    "SIH": [
+        "pht",
+        "Phu Thai"
+    ],
+    "PRA": [
+        "pid",
+        "Piaroa"
+    ],
+    "PCM": [
+        "wes",
+        "Pidgin (Cameroon)"
+    ],
+    "PGW": [
+        "wes_x_pgw",
+        "Pidgin (West Africa)"
+    ],
+    "PLG": [
+        "plg",
+        "Pilag\u00e1"
+    ],
+    "PTJ": [
+        "pjt",
+        "Pitjantjatjara"
+    ],
+    "PP": [
+        "pon",
+        "Pohnpeian"
+    ],
+    "P": [
+        "pl",
+        "Polish"
+    ],
+    "PDF": [
+        "pso",
+        "Polish Sign Language"
+    ],
+    "PMR": [
+        "nds",
+        "Pomeranian"
+    ],
+    "PPU": [
+        "poi",
+        "Popoluca (Highland)"
+    ],
+    "JC": [
+        "jac_x_jc",
+        "Popti'"
+    ],
+    "PQM": [
+        "poh",
+        "Poqomchi'"
+    ],
+    "TNG": [
+        "pt_ao",
+        "Portuguese (Angola)"
+    ],
+    "T": [
+        "pt",
+        "Portuguese (Brazil)"
+    ],
+    "TMM": [
+        "pt_mz",
+        "Portuguese (Mozambique)"
+    ],
+    "TPO": [
+        "pt_pt",
+        "Portuguese (Portugal)"
+    ],
+    "LGP": [
+        "psr",
+        "Portuguese Sign Language"
+    ],
+    "PLR": [
+        "fuf",
+        "Pular"
+    ],
+    "PJ": [
+        "pa",
+        "Punjabi"
+    ],
+    "PJN": [
+        "pnb",
+        "Punjabi (Shahmukhi)"
+    ],
+    "PUN": [
+        "puu",
+        "Punu"
+    ],
+    "PYM": [
+        "pyu",
+        "Puyuma"
+    ],
+    "PAZ": [
+        "pbb",
+        "P\u00e1ez"
+    ],
+    "QNJ": [
+        "kjb",
+        "Q'anjob'al"
+    ],
+    "LSQ": [
+        "fcs",
+        "Quebec Sign Language"
+    ],
+    "QUN": [
+        "que",
+        "Quechua (Ancash)"
+    ],
+    "QUA": [
+        "quy",
+        "Quechua (Ayacucho)"
+    ],
+    "QUB": [
+        "qu",
+        "Quechua (Bolivia)"
+    ],
+    "QU": [
+        "quz",
+        "Quechua (Cuzco)"
+    ],
+    "QUL": [
+        "qub",
+        "Quechua (Huallaga Hu\u00e1nuco)"
+    ],
+    "QUH": [
+        "qvw",
+        "Quechua (Huaylla Wanca)"
+    ],
+    "QUM": [
+        "quf",
+        "Quechua (Lambayeque)"
+    ],
+    "QC": [
+        "quc",
+        "Quiche"
+    ],
+    "QCC": [
+        "qxr",
+        "Quichua (Ca\u00f1ar)"
+    ],
+    "QIB": [
+        "qu_x_qib",
+        "Quichua (Chibuleo)"
+    ],
+    "QIC": [
+        "qug",
+        "Quichua (Chimborazo)"
+    ],
+    "QIX": [
+        "qug_x_qix",
+        "Quichua (Cotopaxi)"
+    ],
+    "QII": [
+        "qvi",
+        "Quichua (Imbabura)"
+    ],
+    "QIP": [
+        "qvz",
+        "Quichua (Pastaza)"
+    ],
+    "QCS": [
+        "qu_x_qxl",
+        "Quichua (Salasaca)"
+    ],
+    "QIS": [
+        "qus",
+        "Quichua (Santiago del Estero)"
+    ],
+    "QIT": [
+        "quw",
+        "Quichua (Tena)"
+    ],
+    "FNR": [
+        "fij_x_fnr",
+        "Ra"
+    ],
+    "RPN": [
+        "rap",
+        "Rapa Nui"
+    ],
+    "RA": [
+        "rar",
+        "Rarotongan"
+    ],
+    "M": [
+        "ro",
+        "Romanian"
+    ],
+    "RNN": [
+        "ro_x_rnn",
+        "Romanian (Vlach)"
+    ],
+    "RNK": [
+        "ro_x_rnk",
+        "Romanian (Vlach, Ba\u010dka)"
+    ],
+    "LMG": [
+        "rms",
+        "Romanian Sign Language"
+    ],
+    "RH": [
+        "rm_x_rh",
+        "Romansh (Ladin)"
+    ],
+    "RHS": [
+        "rm_x_rhs",
+        "Romansh (Sursilvan)"
+    ],
+    "RML": [
+        "rmy_al",
+        "Romany (Albania)"
+    ],
+    "RMA": [
+        "rmy_ar",
+        "Romany (Argentina)"
+    ],
+    "RRL": [
+        "rmn_x_rrl",
+        "Romany (Arli)"
+    ],
+    "RBH": [
+        "rmn_x_rbh",
+        "Romany (Bosnia and Herzegovina)"
+    ],
+    "RMY": [
+        "rmn_x_rmy",
+        "Romany (Central Bulgaria)"
+    ],
+    "RMH": [
+        "rmy_cl",
+        "Romany (Chile)"
+    ],
+    "RNC": [
+        "rmn_x_rnc",
+        "Romany (Crimea)"
+    ],
+    "RMS": [
+        "rmc_sk",
+        "Romany (Eastern Slovakia)"
+    ],
+    "RMF": [
+        "rmo_fr",
+        "Romany (France)"
+    ],
+    "RMX": [
+        "rmo",
+        "Romany (Germany)"
+    ],
+    "RMK": [
+        "rmy_x_rmk",
+        "Romany (Kalderash, Russia)"
+    ],
+    "RVK": [
+        "rmy_x_rvk",
+        "Romany (Lovari, Chokeshi)"
+    ],
+    "LVA": [
+        "rmy_x_lva",
+        "Romany (Lovari, Hungary)"
+    ],
+    "RM": [
+        "rmn_x_rm",
+        "Romany (Macedonia)"
+    ],
+    "RMC": [
+        "rmn_cyrl",
+        "Romany (Macedonia) Cyrillic"
+    ],
+    "RCK": [
+        "rmy_x_rck",
+        "Romany (Me\u00e7kar)"
+    ],
+    "RVC": [
+        "rmy_x_rvc",
+        "Romany (Moldova) Cyrillic"
+    ],
+    "RMN": [
+        "rmn_x_rmn",
+        "Romany (Northern Greece)"
+    ],
+    "RMP": [
+        "rml_ru",
+        "Romany (Northern Russia)"
+    ],
+    "RMT": [
+        "rml",
+        "Romany (Poland)"
+    ],
+    "RMR": [
+        "rmy",
+        "Romany (Romania)"
+    ],
+    "RME": [
+        "rmn_x_rme",
+        "Romany (Serbia)"
+    ],
+    "RMG": [
+        "rmn_x_rmg",
+        "Romany (Southern Greece)"
+    ],
+    "RSP": [
+        "rmn_x_rsp",
+        "Romany (Spoitori)"
+    ],
+    "RMU": [
+        "rmy_ua",
+        "Romany (Ukraine)"
+    ],
+    "RMV": [
+        "rmy_x_rmv",
+        "Romany (Vlax, Russia)"
+    ],
+    "RMB": [
+        "rmn_x_rmb",
+        "Romany (Western Bulgaria)"
+    ],
+    "RN": [
+        "rng",
+        "Ronga"
+    ],
+    "RO": [
+        "rtm",
+        "Rotuman"
+    ],
+    "RV": [
+        "rug",
+        "Roviana"
+    ],
+    "RKI": [
+        "dru",
+        "Rukai"
+    ],
+    "RNY": [
+        "diu",
+        "Rumanyo"
+    ],
+    "RGS": [
+        "drg",
+        "Rungus"
+    ],
+    "RR": [
+        "nyn",
+        "Runyankore"
+    ],
+    "U": [
+        "ru",
+        "Russian"
+    ],
+    "RSL": [
+        "rsl",
+        "Russian Sign Language"
+    ],
+    "RSC": [
+        "rue",
+        "Rusyn (Carpathian)"
+    ],
+    "RT": [
+        "ttj",
+        "Rutoro"
+    ],
+    "RWS": [
+        "sgn_rw",
+        "Rwandan Sign Language"
+    ],
+    "RCR": [
+        "rcf",
+        "R\u00e9union Creole"
+    ],
+    "LP": [
+        "se",
+        "Saami (North)"
+    ],
+    "SDD": [
+        "sck_deva",
+        "Sadri (Devanagari)"
+    ],
+    "LUC": [
+        "acf",
+        "Saint Lucian Creole"
+    ],
+    "SAL": [
+        "loe",
+        "Saluan"
+    ],
+    "LSS": [
+        "esn",
+        "Salvadoran Sign Language"
+    ],
+    "SBR": [
+        "saq",
+        "Samburu"
+    ],
+    "LH": [
+        "lsm",
+        "Samia"
+    ],
+    "SM": [
+        "sm",
+        "Samoan"
+    ],
+    "SMS": [
+        "sgn_ws",
+        "Samoan Sign Language"
+    ],
+    "SGA": [
+        "sng",
+        "Sanga"
+    ],
+    "SGR": [
+        "sxn",
+        "Sangir"
+    ],
+    "SG": [
+        "sg",
+        "Sango"
+    ],
+    "SHD": [
+        "sat_deva",
+        "Santhali (Devanagari)"
+    ],
+    "SHR": [
+        "sat",
+        "Santhali (Roman)"
+    ],
+    "SAR": [
+        "mwm",
+        "Sar"
+    ],
+    "SRM": [
+        "srm",
+        "Saramaccan"
+    ],
+    "SRI": [
+        "hns",
+        "Sarnami"
+    ],
+    "SSK": [
+        "sas",
+        "Sasak"
+    ],
+    "STM": [
+        "mav",
+        "Sater\u00e9-Maw\u00e9"
+    ],
+    "GCS": [
+        "gd",
+        "Scottish Gaelic"
+    ],
+    "SDQ": [
+        "trv_x_sdq",
+        "Seediq"
+    ],
+    "SHW": [
+        "sfw",
+        "Sehwi"
+    ],
+    "SEN": [
+        "seh",
+        "Sena"
+    ],
+    "SFC": [
+        "sef",
+        "Senoufo (Cebaara)"
+    ],
+    "SE": [
+        "nso",
+        "Sepedi"
+    ],
+    "SPL": [
+        "nso_x_spl",
+        "Sepulana"
+    ],
+    "SB": [
+        "sr_cyrl",
+        "Serbian (Cyrillic)"
+    ],
+    "SBO": [
+        "sr_latn",
+        "Serbian (Roman)"
+    ],
+    "SBS": [
+        "sgn_rs",
+        "Serbian Sign Language"
+    ],
+    "ER": [
+        "srr",
+        "Serer"
+    ],
+    "SU": [
+        "st",
+        "Sesotho (Lesotho)"
+    ],
+    "SSA": [
+        "st_za",
+        "Sesotho (South Africa)"
+    ],
+    "TN": [
+        "tn",
+        "Setswana"
+    ],
+    "SC": [
+        "crs",
+        "Seychelles Creole"
+    ],
+    "SHA": [
+        "shn",
+        "Shan"
+    ],
+    "HWI": [
+        "cbt",
+        "Shawi"
+    ],
+    "SL": [
+        "shk",
+        "Shilluk"
+    ],
+    "SHC": [
+        "shp",
+        "Shipibo-Conibo"
+    ],
+    "CA": [
+        "sn",
+        "Shona"
+    ],
+    "SHU": [
+        "jiv",
+        "Shuar"
+    ],
+    "SGH": [
+        "sgh",
+        "Shughni"
+    ],
+    "DM": [
+        "sid",
+        "Sidama"
+    ],
+    "SSN": [
+        "szl",
+        "Silesian"
+    ],
+    "SK": [
+        "loz",
+        "Silozi"
+    ],
+    "NDV": [
+        "sd_deva",
+        "Sindhi (Devanagari)"
+    ],
+    "NDN": [
+        "snd_x_ndn",
+        "Sindhi (Indonesia)"
+    ],
+    "SGL": [
+        "sls",
+        "Singapore Sign Language"
+    ],
+    "SN": [
+        "si",
+        "Sinhala"
+    ],
+    "V": [
+        "sk",
+        "Slovak"
+    ],
+    "VSL": [
+        "svk",
+        "Slovak Sign Language"
+    ],
+    "SV": [
+        "sl",
+        "Slovenian"
+    ],
+    "SZJ": [
+        "sgn_si",
+        "Slovenian Sign Language"
+    ],
+    "SOL": [
+        "sby",
+        "Soli"
+    ],
+    "SP": [
+        "pis",
+        "Solomon Islands Pidgin"
+    ],
+    "SO": [
+        "so",
+        "Somali"
+    ],
+    "SGO": [
+        "nsx",
+        "Songo"
+    ],
+    "SGM": [
+        "soe",
+        "Songomeno"
+    ],
+    "SNK": [
+        "snk",
+        "Soninke"
+    ],
+    "SAS": [
+        "sfs",
+        "South African Sign Language"
+    ],
+    "S": [
+        "es",
+        "Spanish"
+    ],
+    "SSP": [
+        "es_es",
+        "Spanish (Spain)"
+    ],
+    "LSE": [
+        "ssp",
+        "Spanish Sign Language"
+    ],
+    "SR": [
+        "srn",
+        "Sranantongo"
+    ],
+    "SLS": [
+        "sqs",
+        "Sri Lankan Sign Language"
+    ],
+    "UK": [
+        "suk",
+        "Sukuma"
+    ],
+    "SD": [
+        "su",
+        "Sunda"
+    ],
+    "ODN": [
+        "ory_x_odn",
+        "Sundargadi"
+    ],
+    "SRG": [
+        "sgd",
+        "Surigaonon"
+    ],
+    "SSU": [
+        "sgn_sr",
+        "Suriname Sign Language"
+    ],
+    "SUS": [
+        "sus",
+        "Susu"
+    ],
+    "SVL": [
+        "sva_x_svl",
+        "Svan (Lower)"
+    ],
+    "SVN": [
+        "sva_x_svn",
+        "Svan (Upper)"
+    ],
+    "SW": [
+        "sw",
+        "Swahili"
+    ],
+    "ZS": [
+        "swc",
+        "Swahili (Congo)"
+    ],
+    "SWK": [
+        "swc_x_swk",
+        "Swahili (Katanga)"
+    ],
+    "SWI": [
+        "ss",
+        "Swati"
+    ],
+    "SWS": [
+        "sgn_sz",
+        "Swazi Sign Language"
+    ],
+    "Z": [
+        "sv",
+        "Swedish"
+    ],
+    "SSL": [
+        "swl",
+        "Swedish Sign Language"
+    ],
+    "XSW": [
+        "gsw",
+        "Swiss German"
+    ],
+    "SGS": [
+        "sgg",
+        "Swiss German Sign Language"
+    ],
+    "SYL": [
+        "syl_x_syl",
+        "Sylheti (Bengali)"
+    ],
+    "STN": [
+        "cri",
+        "S\u00e3otomense"
+    ],
+    "TBW": [
+        "tap",
+        "Taabwa"
+    ],
+    "TBN": [
+        "tab",
+        "Tabasaran"
+    ],
+    "TG": [
+        "tl",
+        "Tagalog"
+    ],
+    "TH": [
+        "ty",
+        "Tahitian"
+    ],
+    "KE": [
+        "uar",
+        "Tairuma"
+    ],
+    "AT": [
+        "dav",
+        "Taita"
+    ],
+    "TSL": [
+        "tss",
+        "Taiwanese Sign Language"
+    ],
+    "TJ": [
+        "tg",
+        "Tajiki"
+    ],
+    "TJU": [
+        "tg_uz",
+        "Tajiki (Samarkand)"
+    ],
+    "TAL": [
+        "vec",
+        "Talian"
+    ],
+    "TLY": [
+        "tly_x_tly",
+        "Talysh"
+    ],
+    "TME": [
+        "taj",
+        "Tamang (Eastern)"
+    ],
+    "TMW": [
+        "tdj",
+        "Tamang (Western)"
+    ],
+    "TL": [
+        "ta",
+        "Tamil"
+    ],
+    "TLR": [
+        "ta_x_tlr",
+        "Tamil (Roman)"
+    ],
+    "TND": [
+        "tdx",
+        "Tandroy"
+    ],
+    "TT": [
+        "nmf",
+        "Tangkhul"
+    ],
+    "TNK": [
+        "xmv",
+        "Tankarana"
+    ],
+    "TZL": [
+        "tza",
+        "Tanzanian Sign Language"
+    ],
+    "TRH": [
+        "tar",
+        "Tarahumara (Central)"
+    ],
+    "TRW": [
+        "tac",
+        "Tarahumara (Western)"
+    ],
+    "TRS": [
+        "tsz",
+        "Tarascan"
+    ],
+    "YG": [
+        "yer",
+        "Tarok"
+    ],
+    "TRK": [
+        "trv_x_trk",
+        "Taroko"
+    ],
+    "TAT": [
+        "tt",
+        "Tatar"
+    ],
+    "TA": [
+        "tsg",
+        "Tausug"
+    ],
+    "TU": [
+        "te",
+        "Telugu"
+    ],
+    "TEM": [
+        "kdh",
+        "Tem"
+    ],
+    "CHD": [
+        "nan_x_chd",
+        "Teochew"
+    ],
+    "TWD": [
+        "nan_x_twd",
+        "Teochew (Indonesia)"
+    ],
+    "TER": [
+        "ter",
+        "Ter\u00eana"
+    ],
+    "TTB": [
+        "tet",
+        "Tetun Belu"
+    ],
+    "TTP": [
+        "tdt",
+        "Tetun Dili"
+    ],
+    "TEW": [
+        "twx",
+        "Tewe"
+    ],
+    "SI": [
+        "th",
+        "Thai"
+    ],
+    "SIK": [
+        "th_x_sik",
+        "Thai (Korat)"
+    ],
+    "SIE": [
+        "tts",
+        "Thai (Northeastern)"
+    ],
+    "SIR": [
+        "nod",
+        "Thai (Northern)"
+    ],
+    "SIS": [
+        "sou",
+        "Thai (Southern)"
+    ],
+    "SIL": [
+        "tsq",
+        "Thai Sign Language"
+    ],
+    "SIG": [
+        "soa",
+        "Thai Song"
+    ],
+    "TMN": [
+        "tem",
+        "Themne"
+    ],
+    "TBT": [
+        "bo",
+        "Tibetan"
+    ],
+    "TCN": [
+        "tca",
+        "Ticuna"
+    ],
+    "TI": [
+        "ti",
+        "Tigrinya"
+    ],
+    "TII": [
+        "txq",
+        "Tii"
+    ],
+    "TV": [
+        "tiv",
+        "Tiv"
+    ],
+    "TLN": [
+        "tcf",
+        "Tlapanec"
+    ],
+    "OB": [
+        "mlu",
+        "To'abaita"
+    ],
+    "TR": [
+        "tqo",
+        "Toaripi"
+    ],
+    "TOB": [
+        "tob",
+        "Toba"
+    ],
+    "TGS": [
+        "sgn_tg",
+        "Togo Sign Language"
+    ],
+    "TJO": [
+        "toj",
+        "Tojolabal"
+    ],
+    "MP": [
+        "tpi",
+        "Tok Pisin"
+    ],
+    "OE": [
+        "tkl",
+        "Tokelauan"
+    ],
+    "TO": [
+        "to",
+        "Tongan"
+    ],
+    "TOR": [
+        "sda",
+        "Toraja"
+    ],
+    "TSC": [
+        "tcs",
+        "Torres Strait Creole"
+    ],
+    "TOT": [
+        "top",
+        "Totonac"
+    ],
+    "TPR": [
+        "tui",
+        "Toupouri"
+    ],
+    "TTS": [
+        "lst",
+        "Trinidad and Tobago Sign Language"
+    ],
+    "TRC": [
+        "trf",
+        "Trinidadian Creole"
+    ],
+    "SH": [
+        "lua",
+        "Tshiluba"
+    ],
+    "AW": [
+        "tsc",
+        "Tshwa"
+    ],
+    "TSM": [
+        "cas",
+        "Tsiman\u00e9"
+    ],
+    "TMH": [
+        "xmw",
+        "Tsimihety"
+    ],
+    "TS": [
+        "ts",
+        "Tsonga"
+    ],
+    "TUO": [
+        "tuo",
+        "Tucano"
+    ],
+    "TLU": [
+        "tcy",
+        "Tulu"
+    ],
+    "TNN": [
+        "tvu",
+        "Tunen"
+    ],
+    "TRN": [
+        "tuv",
+        "Turkana"
+    ],
+    "TK": [
+        "tr",
+        "Turkish"
+    ],
+    "TKM": [
+        "tur_x_tkm",
+        "Turkish (Meskhetian)"
+    ],
+    "TKL": [
+        "tsm",
+        "Turkish Sign Language"
+    ],
+    "TMR": [
+        "tk",
+        "Turkmen"
+    ],
+    "TM": [
+        "tk_cyrl",
+        "Turkmen (Cyrillic)"
+    ],
+    "VL": [
+        "tvl",
+        "Tuvaluan"
+    ],
+    "VI": [
+        "tyv",
+        "Tuvinian"
+    ],
+    "TW": [
+        "tw",
+        "Twi"
+    ],
+    "TYW": [
+        "car_x_tyw",
+        "Tyrewuju"
+    ],
+    "TZE": [
+        "tzh",
+        "Tzeltal"
+    ],
+    "TZO": [
+        "tzo",
+        "Tzotzil"
+    ],
+    "TZU": [
+        "tzj",
+        "Tzutujil"
+    ],
+    "UBM": [
+        "aoz",
+        "Uab Meto"
+    ],
+    "UM": [
+        "udm",
+        "Udmurt"
+    ],
+    "USL": [
+        "ugn",
+        "Ugandan Sign Language"
+    ],
+    "UGA": [
+        "ug_x_uga",
+        "Uighur (Arabic)"
+    ],
+    "UG": [
+        "ug_cyrl",
+        "Uighur (Cyrillic)"
+    ],
+    "K": [
+        "uk",
+        "Ukrainian"
+    ],
+    "UB": [
+        "umb",
+        "Umbundu"
+    ],
+    "UD": [
+        "ur",
+        "Urdu"
+    ],
+    "UR": [
+        "urh",
+        "Urhobo"
+    ],
+    "URP": [
+        "upv",
+        "Uripiv"
+    ],
+    "LSU": [
+        "ugy",
+        "Uruguayan Sign Language"
+    ],
+    "DR": [
+        "rnd",
+        "Uruund"
+    ],
+    "UZ": [
+        "uz_cyrl",
+        "Uzbek"
+    ],
+    "UZH": [
+        "uzn_x_uzh",
+        "Uzbek (Horezm)"
+    ],
+    "UZR": [
+        "uz_latn",
+        "Uzbek (Roman)"
+    ],
+    "VLC": [
+        "ca_x_vlc",
+        "Valencian"
+    ],
+    "VE": [
+        "ve",
+        "Venda"
+    ],
+    "LSV": [
+        "vsl",
+        "Venezuelan Sign Language"
+    ],
+    "VZ": [
+        "skg_x_vz",
+        "Vezo"
+    ],
+    "VT": [
+        "vi",
+        "Vietnamese"
+    ],
+    "SLV": [
+        "hab",
+        "Vietnamese Sign Language"
+    ],
+    "VRU": [
+        "vro",
+        "Voru"
+    ],
+    "WAM": [
+        "prk",
+        "Wa"
+    ],
+    "WMM": [
+        "wwa",
+        "Waama"
+    ],
+    "WA": [
+        "wls",
+        "Wallisian"
+    ],
+    "LW": [
+        "lwg",
+        "Wanga"
+    ],
+    "WPH": [
+        "wap",
+        "Wapishana"
+    ],
+    "WRO": [
+        "wba",
+        "Warao"
+    ],
+    "SA": [
+        "war",
+        "Waray-Waray"
+    ],
+    "WY": [
+        "guc",
+        "Wayuunaiki"
+    ],
+    "WJW": [
+        "wew",
+        "Wejewa"
+    ],
+    "W": [
+        "cy",
+        "Welsh"
+    ],
+    "WCH": [
+        "mzh",
+        "Wichi"
+    ],
+    "WCB": [
+        "wlv",
+        "Wichi (Bermejo)"
+    ],
+    "HCH": [
+        "hch",
+        "Wix\u00e1rika"
+    ],
+    "WL": [
+        "wal",
+        "Wolaita"
+    ],
+    "WO": [
+        "wo",
+        "Wolof"
+    ],
+    "XV": [
+        "xav",
+        "Xavante"
+    ],
+    "XO": [
+        "xh",
+        "Xhosa"
+    ],
+    "XRC": [
+        "ane",
+        "X\u00e2r\u00e2c\u00f9\u00f9"
+    ],
+    "YCB": [
+        "daf",
+        "Yacouba"
+    ],
+    "YAK": [
+        "yaf",
+        "Yaka"
+    ],
+    "YKM": [
+        "yky",
+        "Yakoma"
+    ],
+    "YK": [
+        "sah",
+        "Yakutsk"
+    ],
+    "YBS": [
+        "yas",
+        "Yambassa"
+    ],
+    "YMI": [
+        "tao",
+        "Yami"
+    ],
+    "YNS": [
+        "yns",
+        "Yansi"
+    ],
+    "YP": [
+        "yap",
+        "Yapese"
+    ],
+    "YQ": [
+        "yaq",
+        "Yaqui"
+    ],
+    "BM": [
+        "ybb",
+        "Yemba"
+    ],
+    "YMB": [
+        "yom_x_ymb",
+        "Yombe"
+    ],
+    "YN": [
+        "yno",
+        "Yong"
+    ],
+    "YR": [
+        "yo",
+        "Yoruba"
+    ],
+    "YNG": [
+        "nua",
+        "Yuanga"
+    ],
+    "YKP": [
+        "yup",
+        "Yukpa"
+    ],
+    "ZAS": [
+        "zsl",
+        "Zambian Sign Language"
+    ],
+    "ZN": [
+        "zne",
+        "Zande"
+    ],
+    "ZPG": [
+        "zpg",
+        "Zapotec (Guevea)"
+    ],
+    "ZPI": [
+        "zai",
+        "Zapotec (Isthmus)"
+    ],
+    "ZPX": [
+        "zpd",
+        "Zapotec (Ixtl\u00e1n)"
+    ],
+    "ZPL": [
+        "zpa",
+        "Zapotec (Lachiguiri)"
+    ],
+    "ZPM": [
+        "ztp",
+        "Zapotec (Loxicha)"
+    ],
+    "ZPT": [
+        "zpf",
+        "Zapotec (Quiatoni)"
+    ],
+    "ZPC": [
+        "zpj",
+        "Zapotec (Quiavicuzas)"
+    ],
+    "ZPS": [
+        "zpr",
+        "Zapotec (Santiago Xanica)"
+    ],
+    "ZPV": [
+        "zav",
+        "Zapotec (Villa Alta)"
+    ],
+    "ZPD": [
+        "zab",
+        "Zapotec (del Valle)"
+    ],
+    "ZR": [
+        "dje",
+        "Zarma"
+    ],
+    "ZSL": [
+        "zib",
+        "Zimbabwe Sign Language"
+    ],
+    "ZU": [
+        "zu",
+        "Zulu"
+    ],
+    "UKL": [
+        "ukl",
+        "\u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430 \u0436\u0435\u0441\u0442\u043e\u0432\u0430 \u043c\u043e\u0432\u0430"
+    ],
+    "CHX": [
+        "nan_x_chx",
+        "\u4e2d\u6587\uff08\u6d77\u5357\u8bdd\uff09"
+    ]
+}

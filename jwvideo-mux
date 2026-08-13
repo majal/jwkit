@@ -1,0 +1,1982 @@
+#!/usr/bin/env python3
+"""
+jwvideo-mux: A cross-platform tool to automate downloading and muxing jw.org videos.
+Downloads video, audio, and VTT subtitles for multiple languages and merges them
+into a single MKV/MP4 container or separate single-stream files.
+"""
+
+import argparse
+import collections
+import json
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+# Common ISO 639-2 codes mapping for ffmpeg metadata
+KNOWN_LANGUAGES = {
+    "E": ("eng", "English"),
+    "TG": ("tgl", "Tagalog"),
+    "CV": ("ceb", "Cebuano"),
+    "HV": ("hil", "Hiligaynon"),
+    "SA": ("war", "Waray-Waray"),
+    "FSL": ("fsl", "Filipino Sign Language"),
+    "ASL": ("ase", "American Sign Language"),
+    "S": ("spa", "Spanish"),
+    "F": ("fra", "French"),
+    "P": ("por", "Portuguese"),
+    "X": ("deu", "German"),
+    "I": ("ita", "Italian"),
+    "J": ("jpn", "Japanese"),
+    "K": ("kor", "Korean"),
+    "CH": ("zho", "Chinese"),
+}
+
+# Extension for the double-clickable mpv launcher scripts written by write_mpv_command_launcher.
+# A custom extension (rather than reusing .command) lets these carry their own file-association setup
+# (register-jwplay-launcher.sh on macOS/duti, xdg-mime on Linux) distinct from generic shell scripts.
+LAUNCHER_EXTENSION = ".jwplay"
+
+
+def update_and_load_langs() -> dict:
+    langs_dict = dict(KNOWN_LANGUAGES)
+    script_dir = Path(__file__).parent
+    repo_json_path = script_dir / "jwlangs.json"
+    cache_dir = Path.home() / ".cache" / "jwvideo-mux"
+    cache_json_path = cache_dir / "jwlangs.json"
+    
+    if repo_json_path.exists():
+        try:
+            with open(repo_json_path, 'r', encoding='utf-8') as f:
+                langs_dict.update(json.load(f))
+        except Exception:
+            pass
+            
+    if cache_json_path.exists():
+        try:
+            with open(cache_json_path, 'r', encoding='utf-8') as f:
+                langs_dict.update(json.load(f))
+        except Exception:
+            pass
+            
+    return langs_dict
+
+_LOADED_LANGUAGES = None
+
+def get_lang_meta(code: str) -> tuple[str, str]:
+    global _LOADED_LANGUAGES
+    if _LOADED_LANGUAGES is None:
+        _LOADED_LANGUAGES = update_and_load_langs()
+        
+    code_upper = code.upper()
+    if code_upper in _LOADED_LANGUAGES:
+        return tuple(_LOADED_LANGUAGES[code_upper])
+        
+    # If not found, try to fetch from API on the fly
+    try:
+        color_print(f"Language '{code_upper}' not found in cache. Fetching from jw.org...", "33")
+        url = 'https://b.jw-cdn.org/apis/mediator/v1/languages/E/all'
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            
+        cache_dir = Path.home() / ".cache" / "jwvideo-mux"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_json_path = cache_dir / "jwlangs.json"
+        
+        new_langs = {}
+        for lang in data.get('languages', []):
+            lc = lang.get('code')
+            locale = lang.get('locale', '')
+            name = lang.get('name', '')
+            if not locale:
+                locale = lc.lower()[:3]
+            new_langs[lc] = [locale, name]
+            
+        try:
+            with open(cache_json_path, 'w', encoding='utf-8') as f:
+                json.dump(new_langs, f, indent=4)
+        except Exception as e:
+            color_print(f"Warning: Could not save {cache_json_path}: {e}", "33")
+            
+        _LOADED_LANGUAGES.update(new_langs)
+        
+        if code_upper in _LOADED_LANGUAGES:
+            return tuple(_LOADED_LANGUAGES[code_upper])
+            
+    except Exception as e:
+        color_print(f"Failed to fetch languages: {e}", "31")
+
+    # Fallback
+    return (code.lower()[:3], code_upper)
+
+def color_print(msg: str, color_code: str = ""):
+    rendered = msg if not color_code else f"\033[{color_code}m{msg}\033[0m"
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(rendered.encode(encoding, errors="replace").decode(encoding))
+
+def check_dependencies():
+    if not shutil.which("ffmpeg"):
+        color_print("ffmpeg is not installed or not in PATH.", "31")
+        ans = input("Would you like to try installing ffmpeg now? [Y/n] ")
+        if ans.lower() not in ("n", "no"):
+            if sys.platform == "darwin":
+                os.system("brew install ffmpeg")
+            elif sys.platform == "linux":
+                os.system("sudo apt-get update && sudo apt-get install -y ffmpeg || sudo dnf install -y ffmpeg || sudo pacman -S --noconfirm ffmpeg")
+            elif sys.platform == "win32":
+                os.system("winget install -e --id Gyan.FFmpeg")
+            
+            if not shutil.which("ffmpeg"):
+                color_print("Failed to install ffmpeg automatically. Please install it manually.", "31")
+                sys.exit(1)
+        else:
+            sys.exit(1)
+
+def fetch_media_params(input_str: str) -> dict:
+    if re.match(r'^\d+$', input_str):
+        return {"docid": input_str}
+        
+    match = re.search(r'(?:lank=|/|^)(docid-(\d+)|pub-[a-zA-Z0-9_-]+)', input_str)
+    if match:
+        lank = match.group(1)
+        if lank.startswith('docid-'):
+            return {"docid": match.group(2)}
+        else:
+            parts = lank[4:].split('_')
+            res = {"pub": parts[0]}
+            if len(parts) > 2 and parts[1].isdigit():
+                if len(parts) > 3 or len(parts[1]) >= 6: 
+                    res["issue"] = parts[1]
+                    if parts[2].isdigit():
+                        res["track"] = parts[2]
+                else:
+                    res["track"] = parts[1]
+            elif len(parts) > 1 and parts[1].isdigit():
+                res["track"] = parts[1]
+            return res
+            
+    match = re.search(r'docid[=-](\d+)', input_str)
+    if match:
+        return {"docid": match.group(1)}
+        
+    try:
+        color_print("Fetching URL to extract docid...", "34")
+        req = urllib.request.Request(input_str, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            match = re.search(r'docid[=-](\d+)', html)
+            if match:
+                return {"docid": match.group(1)}
+    except Exception as e:
+        color_print(f"Failed to fetch or parse URL: {e}", "31")
+    
+    color_print("Could not extract valid media parameters from the input.", "31")
+    sys.exit(1)
+
+def get_media_links(params: dict, lang: str, res: str) -> dict:
+    query_parts = []
+    for k, v in params.items():
+        query_parts.append(f"{k}={v}")
+    query = "&".join(query_parts)
+    
+    url = f"https://b.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS?output=json&fileformat=MP4,VTT,MP3&alllangs=0&langwritten={lang}&{query}"
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        color_print(f"Failed to fetch metadata for language {lang}: {e}", "31")
+        return {}
+        
+    files = data.get('files', {}).get(lang, {})
+    if not files:
+        return {}
+        
+    result = {}
+    
+    # Check MP3 first (for spoken languages)
+    mp3_list = files.get('MP3', [])
+    if mp3_list and mp3_list[0].get('file', {}).get('url'):
+        result['mp3'] = mp3_list[0]['file']['url']
+        
+    # Check MP4 (for videos / sign languages)
+    mp4_list = files.get('MP4', [])
+    for item in mp4_list:
+        if item.get('label') == res or res.lower() in str(item.get('label')).lower():
+            result['mp4'] = item['file']['url']
+            # Subtitles are often tied to the MP4 object
+            sub_url = item.get('subtitles', {}).get('url')
+            if sub_url:
+                result['vtt'] = sub_url
+            break
+            
+    # Fallback to any mp4 if exact resolution not found
+    if 'mp4' not in result and mp4_list:
+        result['mp4'] = mp4_list[0]['file']['url']
+        sub_url = mp4_list[0].get('subtitles', {}).get('url')
+        if sub_url:
+            result['vtt'] = sub_url
+            
+    if mp4_list:
+        lowest_mp4 = min(mp4_list, key=lambda x: x.get('frameHeight', 9999))
+        if lowest_mp4.get('file', {}).get('url'):
+            result['mp4_low'] = lowest_mp4['file']['url']
+            
+    return result
+
+def download_file(url: str, dest: Path):
+    if dest.exists():
+        color_print(f"  Already exists: {dest.name}", "32")
+        return
+    color_print(f"  Downloading: {dest.name}...", "36")
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response, open(dest, 'wb') as out_file:
+            shutil.copyfileobj(response, out_file)
+    except Exception as e:
+        color_print(f"  Failed to download {url}: {e}", "31")
+        if dest.exists():
+            dest.unlink()
+
+def get_filename_from_url(url: str) -> str:
+    return url.split('/')[-1].split('?')[0]
+
+
+def command_output(cmd: list[str]) -> str:
+    return subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE)
+
+
+def probe_video(path: Path) -> dict:
+    """Return video properties required for safe variant comparison."""
+    raw = command_output([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,width,height,pix_fmt,avg_frame_rate,duration:format=duration",
+        "-of", "json", str(path),
+    ])
+    payload = json.loads(raw)
+    streams = payload.get("streams", [])
+    if not streams:
+        raise ValueError(f"No video stream found in {path}")
+    stream = streams[0]
+    duration = stream.get("duration") or payload.get("format", {}).get("duration")
+    return {
+        "codec": stream.get("codec_name"), "width": stream.get("width"),
+        "height": stream.get("height"), "pix_fmt": stream.get("pix_fmt"),
+        "fps": stream.get("avg_frame_rate"),
+        "duration": float(duration) if duration not in (None, "N/A") else None,
+    }
+
+
+def elementary_video_hash(path: Path) -> str:
+    """Hash copied video packets; this is the exact-reuse test."""
+    output = command_output([
+        "ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0",
+        "-c", "copy", "-f", "hash", "-hash", "sha256", "-",
+    ])
+    if not output.startswith("SHA256="):
+        raise ValueError(f"Could not hash video stream in {path}")
+    return output.strip().split("=", 1)[1]
+
+
+def parse_ssim_scores(stats_path: Path) -> list[float]:
+    scores = []
+    for line in stats_path.read_text(encoding="utf-8").splitlines():
+        match = re.search(r"All:([0-9.]+)", line)
+        if match:
+            scores.append(float(match.group(1)))
+    return scores
+
+
+def parse_psnr_scores(stats_path: Path, *, cap_db: float = 100.0) -> list[float]:
+    """Parse ffmpeg psnr filter stats (dB, higher = more similar). 'inf' (byte-identical frames) is clipped
+    to cap_db so it does not blow up median/MAD math with an unbounded outlier."""
+    scores = []
+    for line in stats_path.read_text(encoding="utf-8").splitlines():
+        match = re.search(r"psnr_avg:(inf|[0-9.]+)", line)
+        if match:
+            value = match.group(1)
+            scores.append(cap_db if value == "inf" else min(cap_db, float(value)))
+    return scores
+
+
+def fps_as_float(value: str | None) -> float:
+    if not value or value in ("0/0", "N/A"):
+        return 0.0
+    numerator, denominator = value.split("/", 1)
+    return float(numerator) / float(denominator)
+
+
+def trailing_freeze_start(path: Path, *, noise_db: float = -30.0, min_freeze_s: float = 2.0, timeout: float = 300) -> float | None:
+    """Return the timestamp where a held/frozen final frame begins, if the video ends on one and never
+    unfreezes again before EOF -- the signature of a trailing static end-card/copyright screen held for
+    a variable length per language. ffmpeg's freezedetect only reports a freeze_end once motion resumes,
+    so a freeze_start with no matching freeze_end means it ran through to the end of the stream. Returns
+    None if there's no such trailing freeze (the video is presumably "live" content all the way through).
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", str(path), "-vf", f"freezedetect=n={noise_db}dB:d={min_freeze_s}",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    pending_start = None
+    for line in result.stderr.splitlines():
+        match = re.search(r"freeze_start:\s*([0-9.]+)", line)
+        if match:
+            pending_start = float(match.group(1))
+            continue
+        if "freeze_end" in line:
+            pending_start = None
+    return pending_start
+
+
+def candidate_intervals(
+    scores: list[float], fps: float, *,
+    min_seconds: float = 1.5, mad_multiplier: float = 8.0, floor_margin: float = 0.02, cap: float | None = 0.95,
+    min_threshold: float | None = None,
+) -> tuple[float, list[tuple[float, float]]]:
+    """Return a robust per-pair threshold and sustained low-similarity ranges.
+
+    min_seconds defaults to 1.5s (well above the ~0.4s the pilot originally used) because ordinary
+    encoding-level jitter -- a fast pan, a busy texture, a couple of frames of motion blur -- routinely
+    dips a frame or two below any statistical threshold without being a real content difference. The
+    confirmed true-positive case in the pilot (a translated title card) held a sustained drop for ~4.8s;
+    sub-second dips are noise until proven otherwise.
+
+    min_threshold guards against the opposite failure, found by running against real SCE footage: when a
+    pair's scores are naturally noisy throughout (large MAD -- e.g. real per-language visual differences
+    spread across the whole clip rather than one clean window), `median - mad_multiplier*mad` can collapse
+    to a near-zero or even negative threshold, at which point nothing could ever be flagged as different
+    and a genuinely dissimilar pair reports a confident "visually_same". Clamping the threshold to a sane
+    floor keeps the detector from going blind in exactly the cases where it matters most.
+    """
+    if not scores or fps <= 0:
+        return 0.0, []
+    median = statistics.median(scores)
+    mad = statistics.median(abs(value - median) for value in scores)
+    threshold = median - max(floor_margin, mad_multiplier * mad)
+    if cap is not None:
+        threshold = min(cap, threshold)
+    if min_threshold is not None:
+        threshold = max(min_threshold, threshold)
+    min_frames = max(1, round(fps * min_seconds))
+    runs, start = [], None
+    for index, value in enumerate(scores):
+        if value < threshold and start is None:
+            start = index
+        elif value >= threshold and start is not None:
+            if index - start >= min_frames:
+                runs.append((start / fps, index / fps))
+            start = None
+    if start is not None and len(scores) - start >= min_frames:
+        runs.append((start / fps, len(scores) / fps))
+    return threshold, runs
+
+
+def resolution_only_mismatch(profile: dict, ref_profile: dict, *, aspect_tolerance: float = 0.01) -> bool:
+    """Whether profile differs from ref_profile ONLY in width/height, with everything else that matters
+    for comparison (pix_fmt, fps, aspect ratio) still matching -- e.g. a 960x540 encode of an otherwise
+    identical 1280x720 talk, which jw.org publishes for some languages when no full-resolution dub exists.
+
+    Deliberately narrow: aspect ratio must match within tolerance too, so a real letterboxed/pillarboxed
+    mismatch (different shape, not just different size) is excluded -- comparing that would require
+    guessing a crop offset, which belongs in the human-confirmed --manual-overrides + --normalize-
+    mismatched-aspect path (see build_adaptive_library), not silent automatic comparison. A pure
+    resolution difference has no such ambiguity: scaling to the reference's exact pixel grid is lossless
+    in the sense that it doesn't move or discard any content, only resamples it, so it's safe to do
+    automatically just to make comparison possible.
+    """
+    if not (profile["width"] and profile["height"] and ref_profile["width"] and ref_profile["height"]):
+        return False
+    if (profile["width"], profile["height"]) == (ref_profile["width"], ref_profile["height"]):
+        return False
+    if profile["pix_fmt"] != ref_profile["pix_fmt"]:
+        return False
+    if abs(fps_as_float(profile["fps"]) - fps_as_float(ref_profile["fps"])) > 0.1:
+        return False
+    lang_aspect = profile["width"] / profile["height"]
+    ref_aspect = ref_profile["width"] / ref_profile["height"]
+    return abs(lang_aspect - ref_aspect) <= aspect_tolerance
+
+
+def analyze_video_variants(
+    video_paths: dict[str, Path], *, min_seconds: float = 1.5,
+    scan_small_regions: bool = False, region_count: int = 8,
+) -> dict:
+    """Analyze exact and localized reuse without altering media.
+
+    Two independent similarity signals are computed for every non-reference language: SSIM (structural)
+    and PSNR (pixel-error). A single metric can be fooled -- SSIM in particular is sensitive to encoder
+    resampling/quantization differences that have nothing to do with actual localized content, which is
+    exactly how a genuinely shared video got misclassified as "different" in practice. Requiring both
+    signals to agree on a sustained drop before calling something a real localized_candidates range, and
+    falling back to review_recommended when they disagree, trades a bit of recall for a lot less
+    confidently-wrong output.
+
+    Both streams are also resampled to the reference's frame rate before comparison (see
+    _comparison_filtergraph). Comparing raw decode-order frame pairs without this breaks down over a long
+    clip whenever the two encodes don't share bit-identical frame timing (VFR, or fps that only agree to
+    within the compatibility tolerance, e.g. 23.976 vs 24.000): the pairing drifts a little more every
+    frame, and by the tail of the clip whole seconds of genuinely identical content compare as different.
+    That drift-driven tail divergence is the leading suspect for the pilot's own recorded false positive
+    (video streams reported as differing "after 180.180 seconds" with no real visual difference).
+
+    A language whose video is a different resolution than the reference, but otherwise comparable (see
+    resolution_only_mismatch), is NOT auto-rejected as incompatible: it's transparently upscaled/
+    downscaled onto the reference's pixel grid for comparison (record["resolution_normalized_for_comparison"]
+    notes when this happened), so real localized differences on a lower-bitrate encode still get found
+    automatically instead of requiring a human to already know the difference exists before writing a
+    --manual-overrides entry. This only decides whether/where a real difference exists; actually splicing
+    a resolution-mismatched localized clip into the built library still requires the separate, explicit
+    --normalize-mismatched-aspect flag, since that step re-encodes real media rather than just comparing it.
+    """
+    profiles = {lang: probe_video(path) for lang, path in video_paths.items()}
+    hashes = {lang: elementary_video_hash(path) for lang, path in video_paths.items()}
+    grouped: dict[str, list[str]] = {}
+    for lang, digest in hashes.items():
+        grouped.setdefault(digest, []).append(lang)
+    languages = list(video_paths)
+    reference = languages[0] if languages else None
+    comparisons = {}
+    if reference:
+        ref_profile = profiles[reference]
+        ref_fps = fps_as_float(ref_profile["fps"])
+        region_specs = (
+            _region_crop_specs(ref_profile["width"], ref_profile["height"], region_count)
+            if scan_small_regions and ref_profile["width"] and ref_profile["height"]
+            else None
+        )
+        ref_freeze_start = "unset"  # lazily probed at most once, only if a duration mismatch needs it
+        with tempfile.TemporaryDirectory(prefix="jwvideo-mux-ssim-") as tmp:
+            for lang in languages[1:]:
+                profile = profiles[lang]
+                duration_delta = abs((profile["duration"] or 0) - (ref_profile["duration"] or 0))
+                dims_match = (
+                    all(profile[key] == ref_profile[key] for key in ("width", "height", "pix_fmt"))
+                    and abs(fps_as_float(profile["fps"]) - fps_as_float(ref_profile["fps"])) <= 0.1
+                )
+                resolution_normalized = not dims_match and resolution_only_mismatch(profile, ref_profile)
+                comparable = dims_match or resolution_normalized
+                compatible = duration_delta <= 0.25 and comparable
+                effective_duration = None
+                trailing_freeze_note = None
+                if not compatible and comparable and profile["duration"] and ref_profile["duration"]:
+                    # Duration alone disqualifies this pair, but that's often just a trailing static
+                    # end-card/copyright screen held for a different length per language rather than a
+                    # real difference. If both languages freeze on a final frame and never unfreeze
+                    # before EOF (freezedetect never reports a freeze_end for it), and those freeze
+                    # points roughly agree, the real content is identical in length -- only the held
+                    # tail varies. Compare up to the shared freeze point and leave the tail alone (it
+                    # naturally falls back to the reference in adaptive-library planning, since no
+                    # language has recorded evidence of a real difference there).
+                    if ref_freeze_start == "unset":
+                        ref_freeze_start = trailing_freeze_start(video_paths[reference])
+                    lang_freeze_start = trailing_freeze_start(video_paths[lang])
+                    if ref_freeze_start is not None and lang_freeze_start is not None:
+                        freeze_delta = abs(ref_freeze_start - lang_freeze_start)
+                        if freeze_delta <= 0.25:
+                            compatible = True
+                            effective_duration = min(ref_freeze_start, lang_freeze_start)
+                            trailing_freeze_note = (
+                                f"duration differs by {duration_delta:.2f}s but both languages hold a frozen "
+                                f"final frame from ~{effective_duration:.2f}s onward (freeze points within "
+                                f"{freeze_delta:.2f}s of each other) -- treated as compatible; comparison is "
+                                f"limited to the shared non-frozen range and the frozen tail is left to fall "
+                                f"back to the reference."
+                            )
+                record = {"compatible": compatible, "duration_delta": duration_delta, "intervals": [], "classification": "incompatible"}
+                if trailing_freeze_note:
+                    record["trailing_freeze_note"] = trailing_freeze_note
+                    record["effective_duration"] = effective_duration
+                if resolution_normalized and compatible:
+                    record["resolution_normalized_for_comparison"] = {
+                        "from": [profile["width"], profile["height"]],
+                        "to": [ref_profile["width"], ref_profile["height"]],
+                    }
+                if compatible and not resolution_normalized and hashes[lang] == hashes[reference]:
+                    record["classification"] = "exactly_same"
+                elif compatible:
+                    ssim_stats = Path(tmp) / f"{reference}-{lang}.ssim.log"
+                    psnr_stats = Path(tmp) / f"{reference}-{lang}.psnr.log"
+                    region_ssim_paths = {
+                        spec.index: Path(tmp) / f"{reference}-{lang}.region{spec.index}.ssim.log" for spec in region_specs
+                    } if region_specs else {}
+                    region_psnr_paths = {
+                        spec.index: Path(tmp) / f"{reference}-{lang}.region{spec.index}.psnr.log" for spec in region_specs
+                    } if region_specs else {}
+                    cmd = [
+                        "ffmpeg", "-v", "error", "-i", str(video_paths[reference]), "-i", str(video_paths[lang]),
+                        "-filter_complex", _comparison_filtergraph(
+                            ref_fps, Path(ssim_stats.name), Path(psnr_stats.name),
+                            region_specs=region_specs,
+                            region_ssim_paths={index: Path(path.name) for index, path in region_ssim_paths.items()},
+                            region_psnr_paths={index: Path(path.name) for index, path in region_psnr_paths.items()},
+                            lang_scale_to=(ref_profile["width"], ref_profile["height"]) if resolution_normalized else None,
+                        ),
+                    ]
+                    if effective_duration is not None:
+                        cmd += ["-t", f"{effective_duration:.6f}"]
+                    cmd += ["-f", "null", "-"]
+                    subprocess.run(cmd, check=True, cwd=tmp)
+                    ssim_scores = parse_ssim_scores(ssim_stats)
+                    psnr_scores = parse_psnr_scores(psnr_stats)
+                    ssim_threshold, ssim_intervals = candidate_intervals(
+                        ssim_scores, ref_fps, min_seconds=min_seconds, min_threshold=0.75,
+                    )
+                    psnr_threshold, psnr_intervals = candidate_intervals(
+                        psnr_scores, ref_fps, min_seconds=min_seconds,
+                        mad_multiplier=6.0, floor_margin=3.0, cap=None, min_threshold=20.0,
+                    )
+                    corroborated = merge_intervals(_intersect_intervals(ssim_intervals, psnr_intervals))
+                    ssim_median = statistics.median(ssim_scores) if ssim_scores else 0.0
+                    psnr_median = statistics.median(psnr_scores) if psnr_scores else 0.0
+                    # A clean localized window is one story; a pair that's merely mediocre throughout (no
+                    # sustained dip, but never confidently high either) is another, and "visually_same"
+                    # shouldn't cover it -- e.g. permanently different on-screen text/captions the interval
+                    # search can't see because it's the pair's own baseline, not a deviation from it.
+                    globally_uncertain = ssim_median < 0.92
+                    # A corroborated dip is only trustworthy relative to a baseline that's itself high and
+                    # stable -- when the pair is globally_uncertain, the whole comparison already sits in
+                    # noisy territory (real cause seen in practice: a resolution-normalized comparison
+                    # where lossy up/downscaling depresses similarity everywhere, not just in one place),
+                    # and candidate_intervals' median-relative threshold can still find a "sustained dip"
+                    # inside that noise floor that isn't a real, separate content difference. Cap at
+                    # review_recommended rather than confidently promoting it to localized_candidates.
+                    if corroborated and not globally_uncertain:
+                        classification = "localized_candidates"
+                    elif ssim_intervals or psnr_intervals or globally_uncertain:
+                        classification = "review_recommended"
+                    else:
+                        classification = "visually_same"
+                    record.update({
+                        "threshold": ssim_threshold,
+                        "intervals": corroborated,
+                        "ssim_threshold": ssim_threshold,
+                        "ssim_intervals": ssim_intervals,
+                        "ssim_median": ssim_median,
+                        "psnr_threshold": psnr_threshold,
+                        "psnr_intervals": psnr_intervals,
+                        "psnr_median": psnr_median,
+                        "globally_uncertain": globally_uncertain,
+                        "classification": classification,
+                    })
+                    if region_specs:
+                        record["region_candidates"] = region_candidate_intervals(
+                            {spec.index: parse_ssim_scores(region_ssim_paths[spec.index]) for spec in region_specs},
+                            {spec.index: parse_psnr_scores(region_psnr_paths[spec.index]) for spec in region_specs},
+                            ref_fps, min_seconds=min_seconds,
+                        )
+                comparisons[lang] = record
+
+        if region_specs:
+            _apply_region_evidence(comparisons)
+
+    return {
+        "reference_language": reference, "profiles": profiles, "hashes": hashes,
+        "exact_groups": list(grouped.values()), "comparisons": comparisons,
+    }
+
+
+_RegionSpec = collections.namedtuple("_RegionSpec", "index width height x y")
+
+
+def _region_crop_specs(width: int, height: int, num_strips: int) -> list["_RegionSpec"]:
+    """Split the frame into num_strips horizontal bands, in case a localized difference is small
+    enough (a name plate, a moving text label) that it barely moves the whole-frame average but
+    dominates one band."""
+    num_strips = max(1, min(num_strips, height))
+    strip_height = height // num_strips
+    specs = []
+    y = 0
+    for index in range(num_strips):
+        band_height = strip_height if index < num_strips - 1 else height - y
+        specs.append(_RegionSpec(index, width, band_height, 0, y))
+        y += band_height
+    return specs
+
+
+def _comparison_filtergraph(
+    ref_fps: float, ssim_stats: Path, psnr_stats: Path, *,
+    region_specs: list["_RegionSpec"] | None = None,
+    region_ssim_paths: dict[int, Path] | None = None, region_psnr_paths: dict[int, Path] | None = None,
+    lang_scale_to: tuple[int, int] | None = None,
+) -> str:
+    """Resample both inputs onto the reference's frame-rate grid (fixing decode-order drift on VFR/
+    rounding-mismatched sources), then compute whole-frame SSIM/PSNR -- and, if region_specs is given,
+    per-band SSIM/PSNR for each horizontal strip -- in a single ffmpeg pass (one decode, many cheap
+    crop+compare branches).
+
+    lang_scale_to, when given, upscales/downscales stream 1 (the non-reference language) to this
+    (width, height) before comparison -- see analyze_video_variants' resolution_only_mismatch handling:
+    a same-aspect-ratio resolution difference (e.g. a lower-bitrate 960x540 encode of an otherwise
+    1280x720 talk) is resampled onto the reference's pixel grid so SSIM/PSNR can still run, rather than
+    giving up and calling the pair outright incompatible before ever looking at the content."""
+    region_specs = region_specs or []
+    branch_count = 1 + len(region_specs)
+    fps = f"fps={ref_fps:.6f}" if ref_fps > 0 else "null"
+    lang_prescale = f"scale={lang_scale_to[0]}:{lang_scale_to[1]}:flags=lanczos,setsar=1," if lang_scale_to else ""
+    parts = [f"[0:v:0]{fps}[r0]", f"[1:v:0]{lang_prescale}{fps}[r1]"]
+    if branch_count > 1:
+        parts.append(f"[r0]split={branch_count}" + "".join(f"[r0_{i}]" for i in range(branch_count)))
+        parts.append(f"[r1]split={branch_count}" + "".join(f"[r1_{i}]" for i in range(branch_count)))
+        whole0, whole1 = "[r0_0]", "[r1_0]"
+    else:
+        whole0, whole1 = "[r0]", "[r1]"
+    parts.append(f"{whole0}split[w0a][w0b]")
+    parts.append(f"{whole1}split[w1a][w1b]")
+    parts.append(f"[w0a][w1a]ssim=stats_file={ssim_stats}")
+    parts.append(f"[w0b][w1b]psnr=stats_file={psnr_stats}")
+    for branch, spec in enumerate(region_specs, start=1):
+        parts.append(f"[r0_{branch}]crop={spec.width}:{spec.height}:{spec.x}:{spec.y}[c0_{spec.index}]")
+        parts.append(f"[r1_{branch}]crop={spec.width}:{spec.height}:{spec.x}:{spec.y}[c1_{spec.index}]")
+        parts.append(f"[c0_{spec.index}]split[c0_{spec.index}a][c0_{spec.index}b]")
+        parts.append(f"[c1_{spec.index}]split[c1_{spec.index}a][c1_{spec.index}b]")
+        parts.append(f"[c0_{spec.index}a][c1_{spec.index}a]ssim=stats_file={region_ssim_paths[spec.index]}")
+        parts.append(f"[c0_{spec.index}b][c1_{spec.index}b]psnr=stats_file={region_psnr_paths[spec.index]}")
+    return ";".join(parts)
+
+
+def region_candidate_intervals(
+    ssim_scores_by_strip: dict[int, list[float]], psnr_scores_by_strip: dict[int, list[float]],
+    fps: float, *, min_seconds: float = 1.5,
+) -> list[dict]:
+    """Find sustained per-strip SSIM drops (the primary, better-behaved signal at this scale -- see
+    module docstring notes on region calibration) and coalesce overlapping strips/times into candidates.
+
+    PSNR is recorded as corroborating evidence only, never as a gate: calibrating against real footage
+    showed it both misses genuine small-region differences entirely on some clips (too much natural
+    per-region variance drives its own adaptive threshold below the real dip) and false-triggers on
+    others (a highly-detailed source region's independent compression noise can cross both metrics'
+    thresholds identically for two completely different candidate languages). Neither signal alone, nor
+    the two together, was reliable enough at region scale to auto-classify -- so results here are always
+    advisory, surfaced for a human via review_recommended rather than promoted to localized_candidates.
+    """
+    raw = []
+    for strip_index, ssim_scores in ssim_scores_by_strip.items():
+        _, ssim_intervals = candidate_intervals(
+            ssim_scores, fps, min_seconds=min_seconds, mad_multiplier=3.0, floor_margin=0.01, cap=0.99, min_threshold=0.85,
+        )
+        psnr_scores = psnr_scores_by_strip.get(strip_index, [])
+        _, psnr_intervals = candidate_intervals(
+            psnr_scores, fps, min_seconds=min_seconds, mad_multiplier=4.0, floor_margin=2.0, cap=None, min_threshold=15.0,
+        ) if psnr_scores else (0.0, [])
+        for start, end in ssim_intervals:
+            psnr_corroborated = any(s < end and e > start for s, e in psnr_intervals)
+            raw.append({"start": start, "end": end, "strips": [strip_index], "psnr_corroborated": psnr_corroborated})
+
+    raw.sort(key=lambda c: c["start"])
+    merged: list[dict] = []
+    for candidate in raw:
+        if merged and candidate["start"] < merged[-1]["end"]:
+            last = merged[-1]
+            last["start"] = min(last["start"], candidate["start"])
+            last["end"] = max(last["end"], candidate["end"])
+            last["psnr_corroborated"] = last["psnr_corroborated"] or candidate["psnr_corroborated"]
+            for strip in candidate["strips"]:
+                if strip not in last["strips"]:
+                    last["strips"].append(strip)
+        else:
+            merged.append(dict(candidate))
+    for candidate in merged:
+        candidate["strips"].sort()
+    return merged
+
+
+def _apply_region_evidence(comparisons: dict[str, dict]) -> None:
+    """Second pass across all languages' region_candidates: tag each with how many *other* languages
+    independently show an overlapping candidate (informational -- see region_candidate_intervals'
+    docstring for why this isn't treated as a reliable auto-confirm gate either), then fold the evidence
+    into classification/intervals conservatively:
+      - visually_same + any region candidate -> review_recommended (something to check, not "same")
+      - already localized_candidates -> region candidates outside the existing corroborated windows are
+        recorded separately as additional_region_windows (useful for future segment planning) without
+        touching the already-confident `intervals`
+      - review_recommended / incompatible / exactly_same -> unchanged classification, evidence attached
+    """
+    for lang, record in comparisons.items():
+        candidates = record.get("region_candidates") or []
+        for candidate in candidates:
+            others = 0
+            for other_lang, other_record in comparisons.items():
+                if other_lang == lang:
+                    continue
+                if any(
+                    oc["start"] < candidate["end"] and oc["end"] > candidate["start"]
+                    for oc in (other_record.get("region_candidates") or [])
+                ):
+                    others += 1
+            candidate["corroborating_languages"] = others
+
+        if not candidates:
+            continue
+        if record["classification"] == "visually_same":
+            record["classification"] = "review_recommended"
+        elif record["classification"] == "localized_candidates":
+            existing = record["intervals"]
+            record["additional_region_windows"] = [
+                {k: v for k, v in c.items()} for c in candidates
+                if not any(s < c["end"] and e > c["start"] for s, e in existing)
+            ]
+
+
+def load_manual_overrides(path: Path) -> dict:
+    """Load a human-audited overrides file. Uses the same schema as the SCE localization-audit ground
+    truth: a list of talks, each with a folder name and one or more videos (anchor filename, the
+    languages it was checked against, and either whole_video_same or a list of timed differences). A
+    difference marked fallback_ok means "yes, this genuinely differs, but it's fine to just show the
+    reference here" -- distinct from an unmarked difference, which must keep its own segment.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        raise RuntimeError("--manual-overrides needs Python 3.11+ (for the standard library's tomllib).")
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def find_manual_video_entry(overrides: dict, talk_folder: str, anchor_name: str) -> dict | None:
+    for talk in overrides.get("talks", []):
+        if talk.get("folder") != talk_folder:
+            continue
+        for video in talk.get("videos", []):
+            if video.get("anchor") == anchor_name:
+                return video
+    return None
+
+
+def _subtract_intervals(base: list[tuple[float, float]], remove: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    result = []
+    for b_start, b_end in base:
+        cuts = sorted(r for r in remove if r[0] < b_end and r[1] > b_start)
+        cursor = b_start
+        for r_start, r_end in cuts:
+            if r_start > cursor:
+                result.append((cursor, min(r_start, b_end)))
+            cursor = max(cursor, r_end)
+        if cursor < b_end:
+            result.append((cursor, b_end))
+    return result
+
+
+def apply_manual_overrides(variant_analysis: dict, manual_video: dict) -> list[str]:
+    """Merge human-confirmed evidence into an automated analysis in place. Manual evidence always wins:
+    a difference the auto detector missed becomes a confirmed localized_candidates window; one marked
+    fallback_ok is subtracted back out of `intervals` even if the auto detector (or a previous manual
+    entry) already found it, since a human has explicitly said it's safe to substitute the reference
+    there; whole_video_same with no differences confirms visually_same outright, even overriding an
+    `incompatible` verdict (build_adaptive_library always sources "common" segments from the reference
+    file, never from the divergent language's own file, so this is safe to trust for library planning
+    even when the language's own file is technically a different resolution/etc). Returns the list of
+    languages actually updated.
+    """
+    differences = manual_video.get("differences", [])
+    whole_same = bool(manual_video.get("whole_video_same", False))
+    confirmed = [(d["start_s"], d["end_s"]) for d in differences if not d.get("fallback_ok")]
+    fallback_ok = [(d["start_s"], d["end_s"]) for d in differences if d.get("fallback_ok")]
+    comparisons = variant_analysis.get("comparisons", {})
+    updated = []
+    for lang in manual_video.get("languages", []):
+        record = comparisons.get(lang)
+        if record is None:
+            continue
+        record["manual_confirmed"] = True
+        record["manual_confirmed_windows"] = confirmed
+        record["manual_fallback_ok_windows"] = fallback_ok
+        if whole_same and not differences:
+            record["classification"] = "visually_same"
+            record["intervals"] = []
+        else:
+            intervals = merge_intervals(list(record.get("intervals", [])) + confirmed)
+            if fallback_ok:
+                intervals = _subtract_intervals(intervals, fallback_ok)
+            record["intervals"] = intervals
+            if intervals:
+                record["classification"] = "localized_candidates"
+            elif record["classification"] != "incompatible":
+                record["classification"] = "visually_same"
+        updated.append(lang)
+    return updated
+
+
+def _intersect_intervals(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    result = []
+    for a_start, a_end in a:
+        for b_start, b_end in b:
+            start, end = max(a_start, b_start), min(a_end, b_end)
+            if start < end:
+                result.append((start, end))
+    return result
+
+def keyframe_times(path: Path) -> list[float]:
+    """Return presentation timestamps (seconds) of every keyframe in the video stream."""
+    raw = command_output([
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+        "-show_entries", "frame=pts_time", "-of", "csv=print_section=0", str(path),
+    ])
+    times = []
+    for line in raw.splitlines():
+        token = line.strip().rstrip(",")
+        if not token or token == "N/A":
+            continue
+        try:
+            times.append(float(token))
+        except ValueError:
+            continue
+    return times
+
+
+def snap_interval_to_keyframes(start: float, end: float, kf_times: list[float]) -> tuple[float, float]:
+    """Expand an interval outward to the nearest keyframes so a stream-copy split never lands mid-GOP.
+    Always expands (never shrinks), so a flagged difference is never accidentally clipped out."""
+    if not kf_times:
+        return start, end
+    at_or_before = [t for t in kf_times if t <= start]
+    snapped_start = at_or_before[-1] if at_or_before else kf_times[0]
+    at_or_after = [t for t in kf_times if t >= end]
+    snapped_end = at_or_after[0] if at_or_after else end
+    return snapped_start, snapped_end
+
+
+def merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Coalesce overlapping or touching (start, end) intervals."""
+    if not intervals:
+        return []
+    ordered = sorted(intervals)
+    merged = [list(ordered[0])]
+    for start, end in ordered[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def union_cutpoints(intervals_by_lang: dict[str, list[tuple[float, float]]], total_duration: float) -> list[float]:
+    points = {0.0, round(total_duration, 6)}
+    for intervals in intervals_by_lang.values():
+        for start, end in intervals:
+            points.add(round(max(0.0, start), 6))
+            points.add(round(min(total_duration, end), 6))
+    return sorted(p for p in points if 0.0 <= p <= total_duration)
+
+
+def plan_adaptive_segments(intervals_by_lang: dict[str, list[tuple[float, float]]], total_duration: float) -> list[dict]:
+    """Split [0, total_duration] into segments, each labeled with which languages diverge from the
+    reference there. Consecutive fully-common segments are coalesced into one."""
+    cutpoints = union_cutpoints(intervals_by_lang, total_duration)
+    raw_segments = []
+    for start, end in zip(cutpoints, cutpoints[1:]):
+        if end - start <= 0:
+            continue
+        midpoint = (start + end) / 2
+        divergent = sorted(
+            lang for lang, intervals in intervals_by_lang.items()
+            if any(istart <= midpoint < iend for istart, iend in intervals)
+        )
+        raw_segments.append({"start": start, "end": end, "divergent_languages": divergent})
+
+    segments = []
+    for segment in raw_segments:
+        if not segment["divergent_languages"] and segments and not segments[-1]["divergent_languages"]:
+            segments[-1]["end"] = segment["end"]
+        else:
+            segments.append(dict(segment))
+    for index, segment in enumerate(segments):
+        segment["index"] = index
+    return segments
+
+
+def aspect_normalize_filter(src_width: int, src_height: int, ref_width: int, ref_height: int) -> str:
+    """Center-crop src to ref's aspect ratio, then scale to ref's exact pixel dimensions, so a
+    localized clip splices in without mpv visibly resizing its window. Crops width when the source is
+    relatively wider than the reference (e.g. a 16:9 insert against a 4:3 reference), or height when
+    the source is relatively taller -- either way the fuller of the two source dimensions is kept and
+    only the excess on the other axis is trimmed, matching "clip the wide one down," not stretched."""
+    return (
+        f"crop='if(gt(iw/ih,{ref_width}/{ref_height}),ih*{ref_width}/{ref_height},iw)'"
+        f":'if(gt(iw/ih,{ref_width}/{ref_height}),ih,iw*{ref_height}/{ref_width})',"
+        f"scale={ref_width}:{ref_height}:flags=lanczos,setsar=1"
+    )
+
+
+def has_keyframe_at(t: float, keyframes: list[float], *, tolerance: float = 0.002) -> bool:
+    """Whether this file has a keyframe essentially exactly at t -- i.e. whether a stream copy can
+    start there without landing mid-GOP."""
+    return any(abs(k - t) <= tolerance for k in keyframes)
+
+
+def video_frame_count(path: Path) -> int:
+    """Number of video frames, counted by demuxing packets rather than decoding them. One video packet
+    is one frame here, and this runs in milliseconds even on an 80-minute file, where -count_frames
+    would mean a full decode."""
+    raw = command_output([
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+        "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path),
+    ]).strip()
+    return int(raw) if raw.isdigit() else 0
+
+
+def split_reference_into_segments(
+    video_path: Path, cutpoints: list[float], out_paths: list[Path], *, fps: float,
+) -> list[int]:
+    """Stream-copy the reference into consecutive segments in ONE ffmpeg pass, using the segment muxer.
+
+    Why the segment muxer rather than N separate -ss/-t extractions: with B-frames (universal in real
+    jw.org H.264), `-t`/`-to` bound by DTS, not PTS, so a copy reliably drags in 1-2 trailing frames
+    past the requested end. Each such overshoot is a frame or two of duplicated content at that splice,
+    and -- worse -- it makes the concatenated video longer than the source while the per-language audio
+    stays full-length and untouched, so the two progressively desync (measured on real footage: ~2
+    extra frames per splice; a 15-segment library would drift the better part of a second by the end).
+    The segment muxer splits at packet boundaries with correct B-frame handling, so the pieces tile the
+    source exactly: verified frame-for-frame on a real clip (180 + 2123 == 2303 source frames, no
+    duplicates, no drops).
+
+    Every cutpoint MUST be a keyframe in this file. In stream-copy mode the muxer can only split at
+    keyframes and silently rounds a non-keyframe request forward to the next one, which would put the
+    real boundary somewhere other than the plan says. build_adaptive_library guarantees this by snapping
+    all cutpoints to the reference's own keyframes up front; this function re-checks rather than trusting.
+
+    Each requested time is then nudged back by half a frame before being handed to the muxer, because
+    the split condition is "first keyframe strictly AFTER segment_time" -- so passing a cutpoint that is
+    itself exactly a keyframe silently skips to the NEXT one. That is not theoretical: it put a real
+    library's first boundary 120 frames (4 seconds) late, which then stole those frames from the final
+    segment. Half a frame is far less than any keyframe interval, so it can never select an earlier
+    keyframe by mistake.
+
+    Returns the per-segment frame counts actually produced. Callers should use these rather than
+    recomputing from durations: they are the authoritative tiling, and each localized clip must match
+    the count of the common segment it stands in for exactly (a rounding difference of even one frame
+    desyncs that language against the others for the rest of the presentation).
+    """
+    if len(out_paths) != len(cutpoints) + 1:
+        raise ValueError(f"{len(cutpoints)} cutpoints need {len(cutpoints) + 1} outputs, got {len(out_paths)}")
+
+    if not cutpoints:
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path),
+            "-map", "0:v:0", "-c", "copy", str(out_paths[0]),
+        ], check=True)
+        return [video_frame_count(out_paths[0])]
+
+    keyframes = keyframe_times(video_path)
+    off_grid = [t for t in cutpoints if not has_keyframe_at(t, keyframes)]
+    if off_grid:
+        raise ValueError(
+            f"Reference cutpoints not on keyframes of {video_path.name}: {off_grid}. A stream-copy split "
+            "would silently move these to the next keyframe, desynchronizing every language's timeline."
+        )
+
+    if not fps:
+        raise ValueError(f"A frame rate is required to split {video_path.name} safely.")
+    nudge = 0.5 / fps
+    segment_times = ",".join(f"{max(0.0, t - nudge):.6f}" for t in cutpoints)
+
+    with tempfile.TemporaryDirectory(prefix="jwvideo-mux-segments-") as tmp:
+        pattern = str(Path(tmp) / "part%05d.mkv")
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path),
+            "-map", "0:v:0", "-c", "copy", "-f", "segment",
+            "-segment_times", segment_times, "-reset_timestamps", "1", pattern,
+        ], check=True)
+        produced = sorted(Path(tmp).glob("part*.mkv"))
+        if len(produced) != len(out_paths):
+            raise ValueError(
+                f"Expected {len(out_paths)} segments from {video_path.name}, ffmpeg produced {len(produced)}."
+            )
+        for src, dest in zip(produced, out_paths):
+            shutil.move(str(src), str(dest))
+
+    counts = [video_frame_count(p) for p in out_paths]
+
+    # Verify the split landed where the plan says rather than assuming it did -- a misplaced boundary
+    # is silent, survives mpv validation (every piece still decodes fine), and only shows up as content
+    # replaying or vanishing during real playback. Compare each segment against its planned length and
+    # the whole against the source.
+    boundaries = [0.0, *cutpoints, video_frame_count(video_path) / fps]
+    expected = [round((boundaries[i + 1] - boundaries[i]) * fps) for i in range(len(out_paths))]
+    misplaced = [
+        f"{out_paths[i].name}: {counts[i]} frames, planned ~{expected[i]}"
+        for i in range(len(out_paths)) if abs(counts[i] - expected[i]) > 1
+    ]
+    total, source_total = sum(counts), video_frame_count(video_path)
+    if misplaced or total != source_total:
+        raise ValueError(
+            f"Segment split of {video_path.name} did not land on the planned boundaries "
+            f"(total {total} frames vs source {source_total})."
+            + (" Misplaced: " + "; ".join(misplaced) if misplaced else "")
+        )
+    return counts
+
+
+def extract_localized_segment(
+    video_path: Path, start: float, out_path: Path, *, frames: int, fps: float,
+    video_filter: str | None = None,
+) -> None:
+    """Re-encode one language's localized clip so it covers EXACTLY the same window as the common
+    segment it replaces -- same start, same frame rate, same frame count.
+
+    `frames` is the frame count of that very common segment as actually produced, not a number derived
+    from the window's duration. Deriving it independently drifts by a frame or two against the real
+    split (observed on real libraries: +1 frame on one, +9 on another), and one frame of difference
+    desyncs that language against every other for the remainder of the presentation.
+
+    Exactness is the whole contract, and it is not negotiable: a language's presentation is these
+    segment files concatenated in EDL order, interleaving common segments (cut from the reference) with
+    that language's own localized clips (cut from a DIFFERENT file). Cover even slightly more than the
+    planned window and the extra replays at the splice; cover less and content is skipped. Two real
+    incidents came from violating this (2026-07-29):
+      1. Adjacent segments from the same file each keyframe-expanded outward and overlapped each other.
+      2. (The one that survived the first fix.) A localized clip keyframe-expanded from its planned
+         [1.0, 4.97] out to [0.0, 6.01] -- its own file's nearest keyframes -- while the common segments
+         around it stayed at their planned bounds. Playing TG's presentation therefore ran
+         0->2.0 (common), then 0->6.01 (localized: replaying 0-2.0), then 4.97->76.84 (common:
+         replaying 4.97-6.01). Per-file overlap tracking cannot catch this, because the overlapping
+         segments come from different files; only exact cuts can.
+
+    Always a re-encode, never a stream copy: the shared cut points are the REFERENCE's keyframes, which
+    this file generally has no keyframe at, and a copy starting mid-GOP decodes as garbage. That's an
+    acceptable and bounded cost -- localized clips are short by construction (a title card, a name
+    plate), while the reference's own common segments, which carry the bulk of the runtime, are always
+    stream-copied by split_reference_into_segments. The frame count is pinned explicitly (normalize to
+    the reference's frame rate, then take exactly that many frames) rather than left to `-t`, because
+    with B-frames a duration-bounded cut is DTS-bounded and overshoots.
+    """
+    filters = [video_filter] if video_filter else []
+    filters.append(f"fps={fps:.10f}")
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{start:.6f}", "-i", str(video_path), "-map", "0:v:0",
+        "-vf", ",".join(filters), "-frames:v", str(frames),
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", str(out_path),
+    ], check=True)
+    produced = video_frame_count(out_path)
+    if produced != frames:
+        raise ValueError(
+            f"{out_path.name}: needed {frames} frames to match the common segment it replaces, but the "
+            f"source could only supply {produced}. This language's video is likely shorter than the "
+            "reference here; it cannot be spliced in without desynchronizing the presentation."
+        )
+
+
+def extract_audio_track(source_path: Path, out_path: Path):
+    """Stream-copy the full-duration audio into a standalone Matroska audio file."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source_path),
+        "-map", "0:a:0", "-vn", "-c", "copy", str(out_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def write_mpv_edl(segment_files: list[Path], out_path: Path, edl_dir: Path):
+    """Write an mpv EDL v0 file that plays the given files back-to-back as one virtual presentation."""
+    lines = ["# mpv EDL v0"]
+    for path in segment_files:
+        try:
+            rel = path.relative_to(edl_dir)
+        except ValueError:
+            rel = path
+        lines.append(str(rel))
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def sanitize_filename(name: str) -> str:
+    """Strip or convert characters that are unsafe or misleading in a filename cross-platform. `:` is
+    the common offender here -- it's legal on POSIX filesystems, but Windows/NTFS/FAT32 forbid it
+    outright, and macOS Finder renders a literal `:` in a filename as `/` for legacy HFS reasons, which
+    reads as an actual path separator and is genuinely confusing.
+
+    Separator-like characters collapse through a SPACE rather than being deleted: "Title: Sub" -> "Title
+    Sub" reads the same either way, but a scripture-style reference like "Romans 3:2" would silently
+    become the wrong-looking "Romans 32" under plain deletion.
+
+    Straight quotes are converted to their curly Unicode equivalents rather than stripped. An apostrophe
+    (ASCII 0x27) always becomes the right single quotation mark U+2019 -- the correct character for a
+    possessive or contraction, by far the common case. A straight double quote (ASCII 0x22) alternates
+    between the left curly quote U+201C and the right curly quote U+201D by occurrence, so a quoted
+    title keeps its quotation marks instead of losing them outright, e.g. real SCE titles like
+    `cew_E_r720P ("Completely Equipped for Every Good Work")` and `tscv_E_07_r720P (Develop the "Art of
+    Teaching")` end up with actual curly quotes around the quoted phrase rather than none at all. Both
+    curly forms are filesystem-safe on every platform this function cares about -- only the straight
+    ASCII double quote, which Windows forbids, needed handling at all.
+    """
+    name = name.replace("'", "’")
+    if '"' in name:
+        parts = name.split('"')
+        rebuilt = parts[0]
+        for i, part in enumerate(parts[1:]):
+            rebuilt += ("“" if i % 2 == 0 else "”") + part
+        name = rebuilt
+    for char in '<>:/\\|?*':
+        name = name.replace(char, " ")
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def build_docid_output_name(base_stem: str, lang_field: str, extension: str) -> str:
+    """Rebuild a jw.org-style docid filename (`{docid}_{lang}_{res} (Title)`) with a new language
+    field swapped in for the original one -- the same substitution the classic single-file muxer's own
+    naming does in main() (splits the reference file's stem on '_' and replaces the language token),
+    shared here so the adaptive-library launchers use the identical convention instead of the earlier
+    "Play <Language> - <Title>" style. Falls back to a `merged_{lang_field}_{base_stem}` prefix when
+    the stem doesn't look like a docid filename (fewer than 3 underscore-separated parts), matching the
+    classic muxer's own fallback for non-docid input.
+    """
+    parts = base_stem.split("_")
+    if len(parts) >= 3:
+        parts[1] = lang_field
+        return "_".join(parts) + extension
+    return f"merged_{lang_field}_{base_stem}{extension}"
+
+
+def write_mpv_command_launcher(
+    out_path: Path, edl_name: str, audio_name: str | None, sub_name: str | None, iso: str, *,
+    media_subdir: str | None = None,
+) -> None:
+    """Write a double-clickable launcher script for a language's presentation -- no CLI knowledge
+    required to play it. The caller decides the filename/extension (see LAUNCHER_EXTENSION); this
+    function only writes the executable shell body.
+
+    media_subdir is the path from the launcher's own directory down to where the EDL/audio/subtitle
+    files actually live -- "" (default) when the launcher sits alongside them inside the library folder,
+    or the library folder's own name when the launcher has been pulled up into the library's parent
+    directory instead (see build_adaptive_library's launchers_at_unit_root)."""
+    lines = ["#!/bin/bash", "set -euo pipefail", 'dir="$(cd "$(dirname "$0")" && pwd)"']
+    media_dir = f"$dir/{media_subdir}" if media_subdir else "$dir"
+    args = [f'"{media_dir}/{edl_name}"']
+    if audio_name:
+        args.append(f'--audio-file="{media_dir}/{audio_name}"')
+    if sub_name:
+        args.append(f'--sub-file="{media_dir}/{sub_name}"')
+    args.append(f"--alang={iso}")
+    args.append(f"--slang={iso},eng")
+    lines.append("exec mpv " + " ".join(args))
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out_path.chmod(0o755)
+
+
+def tool_version_string(cmd: list[str]) -> str | None:
+    try:
+        return command_output(cmd).splitlines()[0].strip()
+    except Exception:
+        return None
+
+
+def collect_tool_versions() -> dict:
+    versions = {}
+    if shutil.which("ffmpeg"):
+        versions["ffmpeg"] = tool_version_string(["ffmpeg", "-version"])
+    if shutil.which("mpv"):
+        versions["mpv"] = tool_version_string(["mpv", "--version"])
+    return versions
+
+
+def validate_edl_with_mpv(
+    edl_path: Path, segment_durations: list[float], audio_path: Path | None, sub_path: Path | None, *,
+    spot_check_seconds: float = 1.5, timeout: float = 60,
+) -> dict:
+    """Headless-decode short spot-checks -- the start, the end, and a moment around every splice
+    boundary -- rather than the whole presentation front to back. Skips gracefully if mpv is missing.
+
+    A full-decode pass (this function's original approach) is thorough but does not scale: real SCE
+    talks run 3-80 minutes, and headless mpv decode in this environment runs at roughly 2-3x realtime,
+    not the many-times-realtime speed `--untimed` might suggest -- an hour-long presentation could take
+    20-30 minutes just to validate. That's how this surfaced: validating a real 8-minute video timed out
+    at the old fixed 120s budget even though nothing was actually broken. Spot-checking every boundary
+    covers exactly the failure mode that matters here (a bad splice/keyframe cut) in a few seconds per
+    checkpoint regardless of total runtime, at the cost of not proving the untouched middle of each
+    segment decodes cleanly -- a corrupt frame mid-segment (unrelated to splicing) would slip through.
+    """
+    if not shutil.which("mpv"):
+        return {"skipped": "mpv not found in PATH"}
+    if not segment_durations:
+        return {"ok": True, "checkpoints": []}
+    cumulative = 0.0
+    checkpoints = [0.0]
+    for duration in segment_durations[:-1]:
+        cumulative += duration
+        checkpoints.append(cumulative)
+    total = cumulative + segment_durations[-1]
+    checkpoints.append(max(0.0, total - spot_check_seconds))
+    checkpoints = sorted(set(round(t, 3) for t in checkpoints if t < total))
+
+    results = []
+    for start in checkpoints:
+        cmd = ["mpv", "--no-config", "--vo=null", "--ao=null", "--really-quiet",
+               f"--start={start:.3f}", f"--length={spot_check_seconds:.3f}"]
+        if audio_path:
+            cmd.append(f"--audio-file={audio_path}")
+        if sub_path:
+            cmd.append(f"--sub-file={sub_path}")
+        cmd.append(str(edl_path))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            results.append({"checkpoint": start, "ok": result.returncode == 0, "returncode": result.returncode})
+            if result.returncode != 0:
+                results[-1]["stderr"] = result.stderr.strip()[-1000:]
+        except subprocess.TimeoutExpired:
+            results.append({"checkpoint": start, "ok": False, "error": "timed out"})
+    return {"ok": all(c["ok"] for c in results), "checkpoints": results}
+
+
+def build_adaptive_library(
+    *, reference: str, video_paths: dict[str, Path], variant_analysis: dict,
+    local_files: dict, library_dir: Path, min_seconds: float, launchers_at_unit_root: bool = False,
+    normalize_mismatched_aspect: bool = False,
+) -> dict:
+    """Materialize the adaptive mpv library: one shared common video-only file per fully-common stretch,
+    one localized video-only file per language wherever it was confirmed to actually diverge, full
+    per-language audio (MKA) and subtitles, a per-language mpv EDL presentation, and a manifest.json
+    tying it all together. Only classification == "localized_candidates" (both SSIM and PSNR agreed on a
+    sustained drop) produces localized segments; exactly_same/visually_same/review_recommended languages
+    all fall back to the reference's video for their entire duration, since only a corroborated,
+    high-confidence difference justifies keeping a separate video file. Never touches or deletes source
+    files; everything is written fresh under library_dir.
+    """
+    library_dir.mkdir(parents=True, exist_ok=True)
+
+    profiles = variant_analysis["profiles"]
+    ref_profile = profiles[reference]
+    total_duration = ref_profile["duration"]
+    if not total_duration:
+        raise ValueError(f"Reference language {reference} has no known duration; cannot plan segments.")
+
+    intervals_by_lang = {
+        lang: merge_intervals(record["intervals"])
+        for lang, record in variant_analysis["comparisons"].items()
+        if record["classification"] == "localized_candidates" and lang in video_paths
+    }
+    review_recommended = sorted(
+        lang for lang, record in variant_analysis["comparisons"].items()
+        if record["classification"] == "review_recommended" and lang in video_paths
+    )
+    incompatible = sorted(
+        lang for lang, record in variant_analysis["comparisons"].items()
+        if record["classification"] == "incompatible" and lang in video_paths
+    )
+    mismatched_resolution = sorted(
+        lang for lang in intervals_by_lang
+        if (profiles[lang]["width"], profiles[lang]["height"]) != (ref_profile["width"], ref_profile["height"])
+    )
+
+    # Snap every localized window outward to the REFERENCE file's own keyframes ONCE, here, before
+    # planning segments, so that every resulting cut point is a reference keyframe shared by the whole
+    # plan. That is what lets the reference be split by stream copy (which can only cut on keyframes)
+    # while every language's timeline still agrees on exactly where the boundaries are. Snapping
+    # outward rather than to the nearest keyframe means a confirmed difference is never clipped short.
+    ref_keyframes = keyframe_times(video_paths[reference])
+    intervals_by_lang = {
+        lang: merge_intervals([
+            snap_interval_to_keyframes(start, end, ref_keyframes) for start, end in intervals
+        ])
+        for lang, intervals in intervals_by_lang.items()
+    }
+
+    segments = plan_adaptive_segments(intervals_by_lang, total_duration)
+
+    manifest = {
+        "reference_language": reference,
+        "total_duration": total_duration,
+        "source_hashes": variant_analysis["hashes"],
+        "tool_versions": collect_tool_versions(),
+        "min_seconds": min_seconds,
+        "incompatible_languages": incompatible,
+        "segments": [],
+        "languages": {},
+        "warnings": [],
+    }
+    if review_recommended:
+        manifest["warnings"].append(
+            "SSIM and PSNR disagreed for these languages, so they were treated as fully common (no "
+            f"localized segments cut) rather than guessed either way -- review manually if you expect a "
+            f"real difference: {', '.join(review_recommended)}"
+        )
+    if mismatched_resolution and normalize_mismatched_aspect:
+        manifest["warnings"].append(
+            "These languages' localized segments were at a different resolution than the reference "
+            "(either auto-detected -- same aspect ratio, just a lower-bitrate encode -- or a "
+            "--manual-overrides entry confirming real content on a technically-incompatible "
+            "pair, e.g. a pillarboxed remaster) -- center-cropped to the reference's aspect ratio and "
+            f"re-encoded to its exact resolution so there's no mid-presentation resize: {', '.join(mismatched_resolution)}"
+        )
+    elif mismatched_resolution:
+        manifest["warnings"].append(
+            "These languages have localized segments at a different resolution than the reference "
+            "(either auto-detected -- same aspect ratio, just a lower-bitrate encode -- or a "
+            "--manual-overrides entry confirming real content on a technically-incompatible "
+            "pair, e.g. a pillarboxed remaster) -- mpv plays straight through a mid-presentation "
+            "resolution change without erroring, but the video window will visibly resize at each such "
+            f"splice: {', '.join(mismatched_resolution)}. Pass --normalize-mismatched-aspect to "
+            "center-crop and re-encode just these languages' localized clips to the reference's aspect/"
+            "resolution instead."
+        )
+
+    # Every segment covers EXACTLY its planned window -- see split_reference_into_segments and
+    # extract_localized_segment for why that is mandatory rather than merely tidy, and for the two real
+    # replay incidents that came from violating it. The plan IS the result, so there is no per-file
+    # overlap bookkeeping and no boundary drift to report.
+    #
+    # The whole reference is split in ONE stream-copy pass (the "main" video is never re-encoded, and
+    # this is also far faster than one ffmpeg invocation per segment); each language's localized clips
+    # are re-encoded individually to land on the same shared, reference-aligned boundaries.
+    ref_fps = fps_as_float(ref_profile.get("fps")) or 0.0
+    if not ref_fps:
+        raise ValueError(f"Reference language {reference} has no usable frame rate; cannot cut segments.")
+
+    common_paths = [library_dir / f"common-{segment['index']:03d}.mkv" for segment in segments]
+    common_frames = split_reference_into_segments(
+        video_paths[reference], [segment["start"] for segment in segments[1:]], common_paths, fps=ref_fps,
+    )
+    for segment, common_path, frames in zip(segments, common_paths, common_frames):
+        manifest["segments"].append({
+            "index": segment["index"], "kind": "common", "file": common_path.name,
+            "source_language": reference,
+            "analytical_start": segment["start"], "analytical_end": segment["end"],
+            "extracted_start": segment["start"], "extracted_end": segment["end"],
+            "frames": frames,
+        })
+
+    reencoded_segments = 0
+    for segment, frames in zip(segments, common_frames):
+        for lang in segment["divergent_languages"]:
+            lang_name = f"{lang.lower()}-{segment['index']:03d}.mkv"
+            video_filter = None
+            if normalize_mismatched_aspect and lang in mismatched_resolution:
+                video_filter = aspect_normalize_filter(
+                    profiles[lang]["width"], profiles[lang]["height"],
+                    ref_profile["width"], ref_profile["height"],
+                )
+            # Match the common segment's ACTUAL frame count, not one recomputed from the window's
+            # duration -- see extract_localized_segment's docstring.
+            extract_localized_segment(
+                video_paths[lang], segment["start"], library_dir / lang_name,
+                frames=frames, fps=ref_fps, video_filter=video_filter,
+            )
+            reencoded_segments += 1
+            manifest["segments"].append({
+                "index": segment["index"], "kind": "localized", "file": lang_name, "source_language": lang,
+                "analytical_start": segment["start"], "analytical_end": segment["end"],
+                "extracted_start": segment["start"], "extracted_end": segment["end"],
+                "frames": frames,
+            })
+
+    if reencoded_segments:
+        manifest["warnings"].append(
+            f"{reencoded_segments} localized clip(s) were re-encoded so they land exactly on the shared, "
+            "reference-aligned cut points (their own files have no keyframe there, and a stream copy can "
+            "only start on one). The reference's own common segments -- the bulk of the runtime -- are "
+            "always stream-copied, never re-encoded."
+        )
+    manifest["max_boundary_drift_seconds"] = 0.0
+    manifest["reencoded_segments"] = reencoded_segments
+    duration_by_file = {seg["file"]: seg["extracted_end"] - seg["extracted_start"] for seg in manifest["segments"]}
+
+    segment_durations_by_lang = {}
+    for lang in [l for l in video_paths if l not in incompatible]:
+        lang_segment_files = [
+            library_dir / (f"{lang.lower()}-{segment['index']:03d}.mkv" if lang in segment["divergent_languages"]
+                            else f"common-{segment['index']:03d}.mkv")
+            for segment in segments
+        ]
+        segment_durations_by_lang[lang] = [duration_by_file[p.name] for p in lang_segment_files]
+        edl_name = f"presentation-{lang.lower()}.edl"
+        write_mpv_edl(lang_segment_files, library_dir / edl_name, library_dir)
+
+        media = local_files.get(lang, {})
+        audio_name = None
+        audio_source = media.get("audio", media.get("video"))
+        if audio_source and Path(audio_source).exists():
+            audio_name = f"audio-{lang.lower()}.mka"
+            extract_audio_track(audio_source, library_dir / audio_name)
+
+        sub_name = None
+        sub_source = media.get("sub")
+        if sub_source and Path(sub_source).exists():
+            sub_name = f"subtitles-{lang.lower()}{Path(sub_source).suffix}"
+            shutil.copy2(sub_source, library_dir / sub_name)
+        else:
+            manifest["warnings"].append(f"No local subtitle found for language {lang}; its presentation has no subtitle track.")
+
+        iso, title = get_lang_meta(lang)
+        playback_hint = f"mpv {edl_name}"
+        if audio_name:
+            playback_hint += f" --audio-file={audio_name}"
+        if sub_name:
+            playback_hint += f" --sub-file={sub_name}"
+        playback_hint += f" --alang={iso} --slang={iso},eng"
+
+        # Same docid_LANG_res (Title) convention the source downloads and the classic muxer both use
+        # (see main()'s out_name) -- but unlike the classic muxer's one multi-track file (whose field
+        # lists every language actually muxed in), a single launcher only ever plays ONE language's
+        # audio/clip/subs together, so the field is just that language, not a compound.
+        launcher_name = sanitize_filename(
+            build_docid_output_name(video_paths[reference].stem, lang, LAUNCHER_EXTENSION)
+        )
+        if launchers_at_unit_root:
+            launcher_dir = library_dir.parent
+            media_subdir = library_dir.name
+            launcher_rel = f"../{launcher_name}"
+        else:
+            launcher_dir = library_dir
+            media_subdir = None
+            launcher_rel = launcher_name
+        write_mpv_command_launcher(
+            launcher_dir / launcher_name, edl_name, audio_name, sub_name, iso, media_subdir=media_subdir,
+        )
+
+        manifest["languages"][lang] = {
+            "iso639": iso, "title": title, "edl": edl_name,
+            "audio": audio_name, "subtitle": sub_name, "playback_hint": playback_hint,
+            "launcher": launcher_rel,
+        }
+
+    if incompatible:
+        manifest["warnings"].append(
+            "Skipped incompatible video languages (resolution/pix_fmt/fps mismatch vs. reference; not "
+            f"included in the library): {', '.join(incompatible)}"
+        )
+
+    manifest["validation"] = {
+        lang: validate_edl_with_mpv(
+            library_dir / info["edl"], segment_durations_by_lang[lang],
+            library_dir / info["audio"] if info["audio"] else None,
+            library_dir / info["subtitle"] if info["subtitle"] else None,
+        )
+        for lang, info in manifest["languages"].items()
+    }
+
+    (library_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description="jwvideo-mux: Merge videos, audio, and subtitles from jw.org")
+    parser.add_argument("input", help="URL, docid, or local file pattern to process")
+    parser.add_argument("-v", "--video", default="E", help="Comma-separated language codes for video tracks (default: E)")
+    parser.add_argument("-a", "--audio", default="E,TG,CV,HV,SA", help="Comma-separated language codes for audio tracks")
+    parser.add_argument("-s", "--subs", default="", help="Comma-separated language codes for subtitles. If omitted, uses all video/audio languages.")
+    parser.add_argument("-r", "--res", default="720p", help="Target resolution (default: 720p)")
+    parser.add_argument("-c", "--container", default="mkv", choices=["mkv", "mp4"], help="Export container format (default: mkv)")
+    parser.add_argument("-S", "--single-streams", action="store_true", help="Also produce multiple separate videos with modified audio streams")
+    parser.add_argument("-C", "--cleanup", action="store_true", help="Trash downloaded source files after muxing")
+    parser.add_argument("-o", "--output-dir", default=".", help="Directory to save output files")
+    parser.add_argument("-f", "--force", action="store_true", help="Force overwrite if output file exists without asking")
+    parser.add_argument("--no-default-subs", action="store_true", help="Do not set any subtitle track as default")
+    parser.add_argument("--default-video", help="Language code to set as default video track")
+    parser.add_argument("--default-audio", help="Language code to set as default audio track")
+    parser.add_argument("--default-sub", help="Language code to set as default subtitle track")
+    parser.add_argument("--analyze-video-variants", action="store_true", help="Report exact video reuse and reviewed localized-difference candidates; does not mux or delete media")
+    parser.add_argument("--variant-min-seconds", type=float, default=1.5, help="Minimum sustained duration (seconds) a similarity drop must hold before it counts as a localized-difference candidate (default: 1.5)")
+    parser.add_argument("--scan-small-regions", action="store_true", help="Also compare horizontal frame bands (name plates, lower-third captions) that whole-frame SSIM/PSNR dilutes; slower, and never auto-confirms by itself -- surfaces review_recommended candidates and supplementary windows on already-localized videos")
+    parser.add_argument("--region-count", type=int, default=8, help="Number of horizontal bands to split the frame into for --scan-small-regions (default: 8)")
+    parser.add_argument("--manual-overrides", type=Path, help="TOML file (ground-truth.toml schema: talks -> videos -> differences, with an optional fallback_ok flag per difference) of human-confirmed evidence for local-file-mode SCE-layout input; always wins over automatic detection for the languages/windows it covers. Matched by exact talk-folder-name + anchor-filename, so reuse one file across a whole library.")
+    parser.add_argument("--dedupe-identical-video", action="store_true", help="When muxing, retain one video stream from each byte-identical video group")
+    parser.add_argument("--dedupe-visually-same", action="store_true", help="When muxing, retain one reference video where SSIM+PSNR both verified comparisons are visually_same or exactly_same (asks for confirmation unless --force)")
+    parser.add_argument("--adaptive-mpv-library", action="store_true", help="Export a space-saving mpv library (shared common video segments + per-language localized segments/audio/subs/EDL/manifest) instead of muxing; does not alter or delete source media. If analysis finds no real localized differences for any language, falls back to an ordinary single-file mux (one shared video track) written directly to the output directory instead of building an unnecessary EDL library.")
+    parser.add_argument("--launchers-in-video-folder", action="store_true", help=f"With --adaptive-mpv-library, write the {LAUNCHER_EXTENSION} launchers inside the per-video library folder (the old default) instead of the output directory (the unit root). Default is the unit root, one level up, so every video's launchers for a unit are visible without opening each video's own subfolder; launcher names there already carry the video's own docid/title (see build_docid_output_name), so multiple videos in one unit never collide.")
+    parser.add_argument("--normalize-mismatched-aspect", action="store_true", help="With --adaptive-mpv-library, when a language's localized clips are a different resolution/aspect ratio than the reference (e.g. a 16:9 insert against a 4:3 reference), center-crop and re-encode just those short localized clips to the reference's exact aspect ratio and resolution so mpv never visibly resizes mid-presentation. The shared common/reference segments are never re-encoded -- only the mismatched language's own short localized clips are.")
+
+    args = parser.parse_args()
+    check_dependencies()
+    
+    vid_langs = [l.strip().upper() for l in args.video.split(',')] if args.video and args.video.upper() != "NONE" else []
+    aud_langs = [l.strip().upper() for l in args.audio.split(',')] if args.audio and args.audio.upper() != "NONE" else []
+    sub_langs_explicit = [l.strip().upper() for l in args.subs.split(',')] if args.subs else []
+    
+    # If explicit subs is NONE, then sub_langs is empty.
+    if args.subs and args.subs.upper() == "NONE":
+        sub_langs_explicit = []
+        sub_langs = []
+    elif not args.subs:
+        # Default to all media langs if not specified
+        sub_langs = list(dict.fromkeys(vid_langs + aud_langs))
+    else:
+        sub_langs = sub_langs_explicit
+        
+    if not vid_langs and not aud_langs and not sub_langs:
+        color_print("Error: You must specify at least one video, audio, or subtitle language.", "31")
+        sys.exit(1)
+        
+    all_langs = list(dict.fromkeys(vid_langs + aud_langs + sub_langs))
+    
+    out_dir = Path(args.output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    local_files = {}
+
+    if Path(args.input).is_file():
+        color_print("\n>> Local file mode detected. Skipping API downloads...", "34")
+        # Keep a deliberately supplied symlink location intact. This makes
+        # local-language staging possible without copying large source videos.
+        base_vid_path = Path(args.input).absolute()
+        if args.output_dir == ".":
+            out_dir = base_vid_path.parent
+        
+        base_lang = vid_langs[0] if vid_langs else (aud_langs[0] if aud_langs else "E")
+        
+        local_files[base_lang] = {'video': base_vid_path}
+
+        # Attempt to find a subtitle sidecar for the base video (same name, .vtt or .srt --
+        # jw.org API downloads land as .vtt, but real SCE-layout sources are commonly .srt).
+        for suffix in ('.vtt', '.srt'):
+            base_sub = base_vid_path.with_suffix(suffix)
+            if base_sub.exists():
+                local_files[base_lang]['sub'] = base_sub
+                break
+
+        for lang in all_langs:
+            if lang == base_lang:
+                continue
+
+            # Replace base_lang with target lang in the filename (case-sensitive or insensitive)
+            # Example: "video_FSL_720p.mp4" -> "video_E_720p.mp4"
+            target_name_mp4 = base_vid_path.name.replace(f"_{base_lang}_", f"_{lang}_")
+            if target_name_mp4 == base_vid_path.name:
+                # Try without underscores
+                target_name_mp4 = base_vid_path.name.replace(base_lang, lang)
+
+            local_files[lang] = {}
+            target_path_mp4 = out_dir / target_name_mp4
+            target_path_mp3 = target_path_mp4.with_suffix('.mp3')
+            # Resolved once the actual video path for this language is known below -- the subtitle
+            # sidecar sits next to THAT file, which for SCE-layout siblings is a different directory
+            # than out_dir (a bug: this used to always look for target_path_mp4's sidecar in out_dir,
+            # which is only right for the flat, non-SCE layout).
+            resolved_video_path = None
+
+            if target_path_mp4.exists():
+                local_files[lang]['video'] = target_path_mp4
+                resolved_video_path = target_path_mp4
+            elif base_vid_path.parent.name.upper() == base_lang:
+                # Typical SCE layout: one sibling directory per language, with
+                # descriptive filename tails that differ by translation.
+                # A number immediately after the language code (tscv_E_18_..., tscv_E_19_...)
+                # disambiguates between multiple same-day videos sharing a base prefix -- it must
+                # stay part of the glob, or e.g. "..._18_..." and "..._19_..." both match and the
+                # len(candidates) == 1 guard below correctly refuses to pick either (safe, but it
+                # means neither video can be resolved at all without this).
+                numbered = re.match(rf"^(.*?)_{re.escape(base_lang)}_(\d+)_", base_vid_path.name)
+                if numbered:
+                    glob_pattern = f"{numbered.group(1)}_{lang}_{numbered.group(2)}_*.mp4"
+                else:
+                    prefix = base_vid_path.name.split(f"_{base_lang}_", 1)[0]
+                    glob_pattern = f"{prefix}_{lang}_*.mp4"
+                sibling = base_vid_path.parent.parent / lang
+                candidates = sorted(sibling.glob(glob_pattern)) if sibling.is_dir() else []
+                if len(candidates) == 1:
+                    local_files[lang]['video'] = candidates[0]
+                    resolved_video_path = candidates[0]
+            if target_path_mp3.exists() and lang not in vid_langs:
+                # If MP3 exists and we aren't explicitly needing video for this lang, prefer audio
+                local_files[lang]['audio'] = target_path_mp3
+                if 'video' in local_files[lang]:
+                    del local_files[lang]['video']
+
+            if lang in sub_langs and resolved_video_path is not None:
+                for suffix in ('.vtt', '.srt'):
+                    target_sub = resolved_video_path.with_suffix(suffix)
+                    if target_sub.exists():
+                        local_files[lang]['sub'] = target_sub
+                        break
+
+            if local_files[lang]:
+                color_print(f"  [{lang}] Found local: {', '.join(local_files[lang].keys())}", "32")
+            else:
+                color_print(f"  [{lang}] No matching local files found.", "33")
+                
+    else:
+        # API Mode
+        params = fetch_media_params(args.input)
+        color_print(f"Extracted media params: {params}", "32")
+        
+        downloads = {}
+        
+        color_print("\n>> Fetching media links...", "34")
+        for lang in all_langs:
+            links = get_media_links(params, lang, args.res)
+            if not links:
+                color_print(f"  [{lang}] No media found.", "33")
+                continue
+                
+            downloads[lang] = {}
+            
+            if lang in vid_langs:
+                if 'mp4' in links:
+                    downloads[lang]['video'] = links['mp4']
+                else:
+                    color_print(f"  [{lang}] Error: Video requested but no MP4 found.", "31")
+                    sys.exit(1)
+            
+            if lang in aud_langs and lang not in vid_langs:
+                if 'mp3' in links:
+                    downloads[lang]['audio'] = links['mp3']
+                elif 'mp4_low' in links:
+                    downloads[lang]['audio (via MP4 fallback)'] = links['mp4_low']
+                elif 'mp4' in links:
+                    downloads[lang]['audio (via MP4 fallback)'] = links['mp4']
+                    
+            # Subtitles
+            if lang in sub_langs and 'vtt' in links:
+                downloads[lang]['sub'] = links['vtt']
+                
+            # Rename fallback keys for internal consistency after logging
+            log_keys = list(downloads[lang].keys())
+            if 'audio (via MP4 fallback)' in downloads[lang]:
+                downloads[lang]['audio'] = downloads[lang].pop('audio (via MP4 fallback)')
+                
+            color_print(f"  [{lang}] Found {', '.join(log_keys)}", "32")
+
+        color_print("\n>> Downloading files...", "34")
+        for lang, media in downloads.items():
+            local_files[lang] = {}
+            for mtype, url in media.items():
+                fname = get_filename_from_url(url)
+                dest = out_dir / fname
+                download_file(url, dest)
+                local_files[lang][mtype] = dest
+
+    video_paths = {
+        lang: local_files[lang]["video"]
+        for lang in vid_langs
+        if lang in local_files and "video" in local_files[lang]
+    }
+    variant_analysis = None
+    variant_flags = (args.analyze_video_variants, args.dedupe_identical_video, args.dedupe_visually_same, args.adaptive_mpv_library)
+    if any(variant_flags) and len(video_paths) <= 1:
+        # A variant-analysis flag means the caller wants analysis, not a mux -- falling through to the
+        # ordinary mux path below (which happens whenever nothing resolved this branch) would silently
+        # write a real output file nobody asked for. Confirmed live: an ambiguous sibling-prefix match
+        # (e.g. two same-day talks sharing a filename prefix once the language token is stripped) drops
+        # video_paths to 1, and the old code just muxed whatever it had instead of saying so.
+        color_print(
+            f"\n>> Only {len(video_paths)} comparable video language(s) resolved "
+            f"({', '.join(video_paths) or 'none'}); nothing to analyze, so stopping here instead of muxing.",
+            "33",
+        )
+        return
+    if any(variant_flags):
+        color_print("\n>> Analyzing video variants...", "34")
+        try:
+            variant_analysis = analyze_video_variants(
+                video_paths, min_seconds=args.variant_min_seconds,
+                scan_small_regions=args.scan_small_regions, region_count=args.region_count,
+            )
+        except (subprocess.CalledProcessError, ValueError, OSError) as exc:
+            color_print(f"Variant analysis failed: {exc}", "31")
+            sys.exit(1)
+        if args.manual_overrides:
+            if not Path(args.input).is_file():
+                color_print("  --manual-overrides only applies in local-file mode; ignoring.", "33")
+            else:
+                anchor_path = Path(args.input).absolute()
+                talk_folder = anchor_path.parent.parent.name
+                try:
+                    overrides = load_manual_overrides(args.manual_overrides)
+                except Exception as exc:
+                    color_print(f"Failed to load --manual-overrides file: {exc}", "31")
+                    sys.exit(1)
+                manual_video = find_manual_video_entry(overrides, talk_folder, anchor_path.name)
+                if manual_video is None:
+                    color_print(
+                        f"  No --manual-overrides entry found for folder={talk_folder!r} anchor={anchor_path.name!r}.",
+                        "33",
+                    )
+                else:
+                    updated = apply_manual_overrides(variant_analysis, manual_video)
+                    color_print(f"  Applied manual overrides for: {', '.join(updated) or 'none'}", "36")
+        if args.analyze_video_variants:
+            print(json.dumps(variant_analysis, indent=2, sort_keys=True))
+            return
+        if args.adaptive_mpv_library:
+            reference = variant_analysis["reference_language"]
+            localized = sorted(
+                lang for lang, record in variant_analysis["comparisons"].items()
+                if record["classification"] == "localized_candidates"
+            )
+            review = sorted(
+                lang for lang, record in variant_analysis["comparisons"].items()
+                if record["classification"] == "review_recommended"
+            )
+            if not localized:
+                color_print(
+                    f"\n>> No corroborated localized differences found (reference={reference}, "
+                    f"review_recommended={review or 'none'}) -- nothing to adapt, so this is really just "
+                    "one video. Falling back to an ordinary single-file mux with one shared video track "
+                    "instead of building an EDL library.", "34",
+                )
+                args.dedupe_visually_same = True
+                # Fall through to the dedupe_visually_same / classic-mux code below (no early return).
+            else:
+                library_dir = out_dir / sanitize_filename(video_paths[reference].stem)
+                color_print(f"\n>> Adaptive library plan: reference={reference}, localized={localized}, review_recommended={review or 'none'}", "34")
+                color_print(f"  Output directory: {library_dir}", "34")
+                if not args.force:
+                    ans = input("Write the adaptive mpv library now? Source files are never modified or deleted. [y/N] ")
+                    if ans.lower() not in ("y", "yes"):
+                        color_print("Aborting adaptive library export.", "31")
+                        return
+                manifest = build_adaptive_library(
+                    reference=reference, video_paths=video_paths, variant_analysis=variant_analysis,
+                    local_files=local_files, library_dir=library_dir, min_seconds=args.variant_min_seconds,
+                    launchers_at_unit_root=not args.launchers_in_video_folder,
+                    normalize_mismatched_aspect=args.normalize_mismatched_aspect,
+                )
+                for warning in manifest["warnings"]:
+                    color_print(f"  ! {warning}", "33")
+                failed = [lang for lang, v in manifest["validation"].items() if v.get("ok") is False]
+                if failed:
+                    color_print(f"  mpv validation FAILED for: {', '.join(failed)} -- inspect manifest.json before use.", "31")
+                else:
+                    color_print("  mpv validation passed for every language presentation.", "32")
+                color_print(f"✓ Adaptive library written to {library_dir}", "32")
+                return
+        if args.dedupe_identical_video:
+            duplicate_langs = {
+                lang
+                for group in variant_analysis["exact_groups"]
+                for lang in group[1:]
+            }
+            if duplicate_langs:
+                color_print(f"  Reusing shared video; omitted duplicate video tracks: {', '.join(sorted(duplicate_langs))}", "32")
+                vid_langs = [lang for lang in vid_langs if lang not in duplicate_langs]
+        if args.dedupe_visually_same:
+            reference = variant_analysis["reference_language"]
+            reusable = {
+                lang for lang, record in variant_analysis["comparisons"].items()
+                if record["classification"] in {"exactly_same", "visually_same"}
+            }
+            if reusable:
+                color_print(f"  Verified reusable as '{reference}' video (SSIM+PSNR corroborated, or byte-identical): {', '.join(sorted(reusable))}", "36")
+                if not args.force:
+                    ans = input("  Omit these languages' own video tracks from the mux and reuse the reference instead? [y/N] ")
+                    if ans.lower() not in ("y", "yes"):
+                        reusable = set()
+                if reusable:
+                    color_print(f"  Reusing {reference} video after visual verification; omitted: {', '.join(sorted(reusable))}", "32")
+                    vid_langs = [lang for lang in vid_langs if lang == reference or lang not in reusable]
+
+    color_print("\n>> Muxing...", "34")
+    
+    # 1. Mux into a single multi-stream MKV/MP4
+    ff_inputs = []
+    ff_maps = []
+    ff_meta = []
+    
+    input_idx = 0
+    input_paths = []
+    
+    def get_or_add_input(path):
+        nonlocal input_idx
+        path_str = str(path)
+        if path_str in input_paths:
+            return input_paths.index(path_str)
+        ff_inputs.extend(["-i", path_str])
+        input_paths.append(path_str)
+        idx = input_idx
+        input_idx += 1
+        return idx
+        
+    video_stream_idx = 0
+    langs_loaded = []
+    
+    for lang in vid_langs:
+        if lang not in local_files or 'video' not in local_files[lang]:
+            continue
+            
+        idx = get_or_add_input(local_files[lang]['video'])
+        iso, title = get_lang_meta(lang)
+        
+        ff_maps.extend(["-map", f"{idx}:v:0"])
+        ff_meta.extend([
+            f"-metadata:s:v:{video_stream_idx}", f"language={iso}",
+            f"-metadata:s:v:{video_stream_idx}", f"title={title}"
+        ])
+        if (args.default_video and args.default_video.upper() == lang) or (not args.default_video and video_stream_idx == 0):
+            ff_meta.extend([f"-disposition:v:{video_stream_idx}", "default"])
+        video_stream_idx += 1
+        if lang not in langs_loaded: langs_loaded.append(lang)
+        
+    audio_stream_idx = 0
+    for lang in aud_langs:
+        if lang not in local_files:
+            continue
+            
+        media = local_files[lang]
+        path = media.get('audio', media.get('video'))
+        if not path:
+            continue
+            
+        idx = get_or_add_input(path)
+        iso, title = get_lang_meta(lang)
+        
+        ff_maps.extend(["-map", f"{idx}:a:0?"])
+        ff_meta.extend([
+            f"-metadata:s:a:{audio_stream_idx}", f"language={iso}",
+            f"-metadata:s:a:{audio_stream_idx}", f"title={title}"
+        ])
+        if (args.default_audio and args.default_audio.upper() == lang) or (not args.default_audio and audio_stream_idx == 0):
+            ff_meta.extend([f"-disposition:a:{audio_stream_idx}", "default"])
+        audio_stream_idx += 1
+        if lang not in langs_loaded: langs_loaded.append(lang)
+        
+    subtitle_stream_idx = 0
+    for lang in all_langs:
+        if lang in local_files and 'sub' in local_files[lang]:
+            idx = get_or_add_input(local_files[lang]['sub'])
+            iso, title = get_lang_meta(lang)
+            
+            ff_maps.extend(["-map", f"{idx}:s"])
+            ff_meta.extend([
+                f"-metadata:s:s:{subtitle_stream_idx}", f"language={iso}",
+                f"-metadata:s:s:{subtitle_stream_idx}", f"title={title}"
+            ])
+            if args.container == "mp4":
+                ff_meta.extend([f"-c:s:{subtitle_stream_idx}", "mov_text"])
+            else:
+                ff_meta.extend([f"-c:s:{subtitle_stream_idx}", "srt"])
+                
+            if not args.no_default_subs:
+                if (args.default_sub and args.default_sub.upper() == lang) or (not args.default_sub and subtitle_stream_idx == 0):
+                    ff_meta.extend([f"-disposition:s:{subtitle_stream_idx}", "default"])
+                
+            subtitle_stream_idx += 1
+            if lang not in langs_loaded: langs_loaded.append(lang)
+
+    if not langs_loaded:
+        color_print("No media to mux. Exiting.", "31")
+        sys.exit(1)
+
+    # Find a base file path for naming
+    base_vid = None
+    if vid_langs and 'video' in local_files.get(vid_langs[0], {}):
+        base_vid = local_files[vid_langs[0]]['video']
+    elif aud_langs and 'audio' in local_files.get(aud_langs[0], {}):
+        base_vid = local_files[aud_langs[0]]['audio']
+    else:
+        for lang_files in local_files.values():
+            for path in lang_files.values():
+                base_vid = path
+                break
+            if base_vid: break
+            
+    if base_vid:
+        parts = base_vid.stem.split('_')
+        
+        # Build the new language group string (video+audio)
+        v_loaded = [l for l in vid_langs if l in langs_loaded]
+        a_loaded = [l for l in aud_langs if l in langs_loaded]
+        v_str = '-'.join(v_loaded)
+        a_str = '-'.join(a_loaded)
+        if v_str and a_str:
+            lang_group = f"{v_str}+{a_str}"
+        else:
+            lang_group = v_str or a_str or '-'.join(langs_loaded)
+            
+        if len(parts) >= 3:
+            parts[1] = lang_group
+            out_name = f"{'_'.join(parts)}.{args.container}"
+        else:
+            out_name = f"merged_{lang_group}_{base_vid.stem}.{args.container}"
+    else:
+        out_name = f"merged_{'-'.join(langs_loaded)}_output.{args.container}"
+    out_path = out_dir / out_name
+    
+    if out_path.exists() and not args.force:
+        ans = input(f"File {out_name} already exists. Overwrite? [y/N] ")
+        if ans.lower() not in ['y', 'yes']:
+            color_print("Aborting muxing.", "31")
+            sys.exit(0)
+            
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + ff_inputs + ff_maps + ff_meta + ["-c:v", "copy", "-c:a", "copy", str(out_path)]
+    
+    color_print(f"Creating merged {args.container.upper()}: {out_name}", "36")
+    res = subprocess.run(cmd)
+    if res.returncode == 0:
+        color_print("✓ Merged video created successfully.", "32")
+    else:
+        color_print("✗ Merged video creation failed.", "31")
+
+    # Every path actually handed to ffmpeg as an -i input, across the merge above and the
+    # single-stream loop below. This -- not "everything local-file discovery happened to resolve" --
+    # is the only safe basis for --cleanup: a language merely probed as an audio-fallback candidate
+    # (e.g. swept in by -a's default covering more languages than -v ever requested) but never
+    # actually embedded in any output must never be deleted.
+    used_source_paths = set(input_paths)
+
+    # 2. Mux single streams
+    if args.single_streams and vid_langs:
+        base_vid_lang = vid_langs[0]
+        base_vid = local_files.get(base_vid_lang, {}).get('video')
+
+        if base_vid:
+            color_print("\n>> Creating single-stream videos...", "34")
+            used_source_paths.add(str(base_vid))
+            for lang in aud_langs:
+                if lang == base_vid_lang and len(aud_langs) == 1:
+                    continue
+
+                out_single = out_dir / f"single_{lang}_{base_vid.stem}.mp4"
+
+                if out_single.exists() and not args.force:
+                    ans = input(f"File {out_single.name} already exists. Overwrite? [y/N] ")
+                    if ans.lower() not in ['y', 'yes']:
+                        color_print(f"Skipping {out_single.name}", "33")
+                        continue
+
+                cmd_single = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(base_vid)]
+                maps = ["-map", "0:v"]
+
+                media = local_files.get(lang, {})
+                audio_path = media.get('audio', media.get('video'))
+
+                if audio_path:
+                    used_source_paths.add(str(audio_path))
+                    if str(audio_path) != str(base_vid):
+                        cmd_single.extend(["-i", str(audio_path)])
+                        maps.extend(["-map", "1:a?"])
+                    else:
+                        maps.extend(["-map", "0:a?"])
+
+                # Embed subtitle if present for this language, else use base subtitle
+                sub_file = media.get('sub', local_files.get(base_vid_lang, {}).get('sub'))
+                if sub_file:
+                    used_source_paths.add(str(sub_file))
+                    sub_idx = 2 if (audio_path and str(audio_path) != str(base_vid)) else 1
+                    cmd_single.extend(["-i", str(sub_file)])
+                    maps.extend(["-map", f"{sub_idx}:s", "-c:s", "mov_text"])
+
+                cmd_single += maps + ["-c:v", "copy", "-c:a", "copy", str(out_single)]
+                subprocess.run(cmd_single)
+                color_print(f"  ✓ Single-stream created: {out_single.name}", "32")
+
+    # Cleanup
+    if args.cleanup:
+        color_print("\n>> Cleaning up source files actually used above (never anything merely discovered)...", "33")
+        skipped_unused = []
+        for lang, media in local_files.items():
+            for mtype, path in media.items():
+                if str(path) not in used_source_paths:
+                    skipped_unused.append(path.name)
+                    continue
+                if path.exists():
+                    try:
+                        path.unlink()
+                    except Exception as e:
+                        color_print(f"  Failed to delete {path.name}: {e}", "31")
+        if skipped_unused:
+            color_print(
+                f"  Left {len(skipped_unused)} file(s) untouched (resolved but never used in any output): "
+                f"{', '.join(sorted(set(skipped_unused)))}", "36",
+            )
+        color_print("  Cleanup complete.", "32")
+
+if __name__ == "__main__":
+    main()
