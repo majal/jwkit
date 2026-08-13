@@ -23,6 +23,7 @@ All tools share one config namespace, `~/.config/jwkit/<tool>/` (e.g. `~/.config
 ## Operational Notes
 
 - **`jwdl` is called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwdl-weekly.service` + `.timer`, `ExecStart=... %h/MyFiles/Digitalis/jwkit/jwdl all`, weekly). Any change to `jwdl`'s existing music CLI surface (`jwdl <pub> [lang]`, `jwdl all`, `jwdl list`) must stay backward-compatible, or the service needs a coordinated update on that host first. `jwdl periodicals ...` is a fully separate command path added specifically to avoid touching that surface — keep it that way rather than folding periodicals into the same `pub`/`all` positional.
+- **`slverse` is also called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwsl-sync-weekly.service` + `.timer` — the unit files keep the pre-rename `jwsl` name, only their `ExecStart` was updated to `%h/MyFiles/Digitalis/jwkit/slverse sync all`; renaming the unit files themselves was judged not worth the re-enable risk). This one was missed in the initial `jwsl`→`slverse`/`jwkit` split (2026-08-13) because the audit at the time only grepped for `jwdl`, not `jwsl` — found and fixed in a follow-up broader audit the same day. When auditing for live callers on a host, grep `ExecStart=` across **all** `~/.config/systemd/user/*.service` and (`sudo`) `/etc/systemd/system/*.service` for the tool's old **and** new name, not just the one you're actively changing.
 
 ## Installer (`install.sh` / `install.ps1`)
 

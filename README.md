@@ -1,14 +1,12 @@
 # jwkit
 
-Tools for pulling and processing content from jw.org — Bible sign-language clips, music, periodicals, and video. `slverse` (sign-language verse extraction) is the modern successor to [the original `ffv`](https://github.com/majal/maj-scripts-archive-2026/blob/master/SL/ffv), a long-running personal tool for the same job — rebuilt from scratch around JW.org's own verse-marker data instead of manual timestamping.
+jwkit downloads and processes content from jw.org: Bible sign-language clips, music, periodicals, and video.
 
 ## Overview
 
-If you're just here to use a tool, start here. This README is the friendly map:
+New here? Jump to [Quick Install](#quick-install) — one command, no manual setup.
 
-- Not sure where to start? Jump to [Quick Install](#quick-install) — one command, no manual setup.
-- Each tool section tells you what it does, what it needs, and the safest first commands to try — full detail lives in `docs/<tool>.md`, linked from each section.
-- Use [Your Local Setup](#your-local-setup) if you'd rather install things by hand, or the quick install needs troubleshooting.
+Each tool below has its own section covering what it does, what it needs, and the commands to try first. Full detail lives in `docs/<tool>.md`, linked from each section. Prefer to install things by hand, or hit something the quick install can't fix on its own? See [Your Local Setup](#your-local-setup).
 
 ## Table of Contents
 
@@ -60,7 +58,7 @@ If a step needs your password (installing Homebrew on macOS, or `sudo` on Linux)
 
 ### [`ffrife`](./ffrife)
 
-`ffrife` is a standalone AI frame-interpolation tool built on `rife-ncnn-vulkan` (GPU-accelerated). It's not JW/Bible-specific — it takes any local file or remote URL, an optional trim window, an optional `ffmpeg -vf` filter chain, and an optional retime speed, and produces real AI-interpolated (not motion-blended) output at a target frame rate. `slverse` uses it as a library for its own `rife` interpolation engine instead of carrying a separate copy of this logic.
+`ffrife` interpolates any video to a higher frame rate using `rife-ncnn-vulkan`, a GPU-accelerated AI model that generates real in-between frames instead of just blending adjacent ones. It works on any local file or URL, JW-related or not — trim a section, add an `ffmpeg` filter, or retime the speed, all in a single pass. `slverse` uses it as a library for its own interpolation instead of duplicating the logic.
 
 Full docs: [docs/ffrife.md](docs/ffrife.md)
 
@@ -68,7 +66,7 @@ Full docs: [docs/ffrife.md](docs/ffrife.md)
 
 ### [`jwdl`](./jwdl)
 
-`jwdl` downloads official JW music (MP3) and periodicals (PDF: Watchtower, the meeting workbook) from jw.org into a local library, one folder per collection.
+`jwdl` downloads JW music (MP3) and periodicals (PDF: the Watchtower and the meeting workbook) from jw.org, one folder per collection.
 
 Full docs: [docs/jwdl.md](docs/jwdl.md)
 
@@ -76,9 +74,7 @@ Full docs: [docs/jwdl.md](docs/jwdl.md)
 
 ### [`jwvideo-mux`](./jwvideo-mux)
 
-`jwvideo-mux` is an automated media downloader and muxer for jw.org videos.
-
-Designed to be accessible for semi-techies, this script simplifies the otherwise complex process of downloading and merging multiple language tracks into a single video file.
+`jwvideo-mux` downloads a jw.org video and merges the language tracks you want into one file, so you get a single video with selectable audio and subtitles instead of a separate download per language.
 
 Full docs: [docs/jwvideo-mux.md](docs/jwvideo-mux.md)
 
@@ -86,7 +82,7 @@ Full docs: [docs/jwvideo-mux.md](docs/jwvideo-mux.md)
 
 ### [`slverse`](./slverse)
 
-`slverse` (formerly `jwsl`; the successor to the original `ffv`, see above) is a unified tool for downloading, extracting, overlaying, and interpolating Sign Language Bible videos. It's not techie-only: `slverse setup` walks through the choices below with plain-language prompts and sane defaults.
+`slverse` finds, extracts, and interpolates Sign Language Bible videos, verse by verse. It's the successor to the original [`ffv`](https://github.com/majal/maj-scripts-archive-2026/blob/master/SL/ffv), rebuilt around JW.org's own verse-marker data instead of manual timestamping. Run `slverse setup` for a guided walkthrough — pick your sign languages, cache size, and more.
 
 Full docs: [docs/slverse.md](docs/slverse.md)
 
@@ -155,7 +151,7 @@ winget install Git.Git
 
 ## Contributing Docs
 
-When new tools are added, keep this README as the main navigation page and update it alongside the tool so new additions stay easy to discover — see [`AGENTS.md`](./AGENTS.md) for the full contributor/agent rules and doc template this repo follows (same pattern as `maj-scripts`).
+Adding a new tool? Update this README alongside it so it stays easy to find — see [`AGENTS.md`](./AGENTS.md) for the full contributor rules and doc template.
 
 For quick repo checks, run the lightweight test harness before or after changes:
 
