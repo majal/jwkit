@@ -6,18 +6,23 @@ Repo name: `jwkit`
 
 ## Purpose
 
-`jwkit` holds tools for pulling and processing content from jw.org: Bible sign-language clips (`slverse`), music (`jwdl`), periodicals (`jwget`), videos (`jwvideo-mux`), and AI frame interpolation (`ffrife`, used as a library by `slverse` but not jw.org-specific itself).
+`jwkit` holds tools for pulling and processing content from jw.org: Bible sign-language clips (`slverse`), music and periodicals (`jwdl`), videos (`jwvideo-mux`), and AI frame interpolation (`ffrife`, used as a library by `slverse` but not jw.org-specific itself).
 
 Split out of [`majal/maj-scripts`](https://github.com/majal/maj-scripts) on 2026-08-13, once the jw.org-specific tools there outnumbered the general-purpose ones. `maj-scripts` keeps its own disparate utility scripts (`gmail-cleanup`, `whisper`, `wh`, `printing-mode`, `ubuntu-hibernate`, etc.); this repo is scoped to jw.org content tools only.
 
+`jwget` (a legacy, unauthenticated bash periodicals scraper) was absorbed into `jwdl` as `jwdl periodicals` on the same day, then retired to `bin-archive-2026` — jw.org's modern `pub-media` API (checksummed, already used by `jwdl` for music) covers the periodicals that are still actually published; two of `jwget`'s four (`wp`, `g`) turned out to be discontinued jw.org-side years ago, not just stale locally.
+
 ## Naming
 
-Tools here don't carry a `jw` prefix by default — the repo name already scopes them. `slverse` (sign-language verse extraction, formerly `jwsl`) follows this. `jwdl`, `jwget`, and `jwvideo-mux` kept their existing names on the move rather than being renamed along with the repo split — don't rename them without explicit direction, since `jwdl` in particular has a live external caller (see Operational Notes below).
+Tools here don't carry a `jw` prefix by default — the repo name already scopes them. `slverse` (sign-language verse extraction, formerly `jwsl`) follows this. `jwdl` and `jwvideo-mux` kept their existing names on the move rather than being renamed along with the repo split — don't rename them without explicit direction, since `jwdl` in particular has a live external caller (see Operational Notes below).
+
+## Configuration
+
+All tools share one config namespace, `~/.config/jwkit/<tool>/` (e.g. `~/.config/jwkit/slverse/`, `~/.config/jwkit/jwdl/`, `~/.config/jwkit/ffrife/`). Each tool auto-migrates its config on first run from wherever it used to live (pre-jwkit `~/.config/maj-scripts/<tool>/`, or `slverse`'s brief standalone `~/.config/slverse/` waypoint) — nothing is lost across a rename or the unification, including `ffrife`'s downloaded RIFE binary and `slverse`'s synced verse-marker index. New tools should follow this same `~/.config/jwkit/<tool>/` layout from the start rather than inventing their own.
 
 ## Operational Notes
 
-- **`jwdl` is called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwdl-weekly.service` + `.timer`, `ExecStart=... %h/MyFiles/Digitalis/jwkit/jwdl all`, weekly). Any change to `jwdl`'s CLI surface (subcommands, required args) must stay backward-compatible with `jwdl all`, or the service needs a coordinated update on that host first.
-- `slverse` auto-migrates an existing `~/.config/maj-scripts/jwsl/` (from before the rename/split) to `~/.config/slverse/` on first run. `jwdl` and `ffrife` kept their original `~/.config/maj-scripts/<tool>/` config paths unchanged — only `slverse` needed migration since its name changed.
+- **`jwdl` is called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwdl-weekly.service` + `.timer`, `ExecStart=... %h/MyFiles/Digitalis/jwkit/jwdl all`, weekly). Any change to `jwdl`'s existing music CLI surface (`jwdl <pub> [lang]`, `jwdl all`, `jwdl list`) must stay backward-compatible, or the service needs a coordinated update on that host first. `jwdl periodicals ...` is a fully separate command path added specifically to avoid touching that surface — keep it that way rather than folding periodicals into the same `pub`/`all` positional.
 
 ## Public Repo And Secrets
 
@@ -100,4 +105,5 @@ Same spirit as `maj-scripts`: practical and skimmable, a light touch is fine, bu
 - keep `## Tools` above Your Local Setup
 - use `↑ TOC` consistently in README, and the back-link in `docs/<tool>.md`
 - keep examples concise and copy-pasteable
+- store config/state under `~/.config/jwkit/<tool>/` (see Configuration above), with a migration helper if you're renaming/moving an existing tool
 - if the tool has a live external caller (cron/systemd elsewhere), note it under Operational Notes above and keep its CLI surface backward-compatible

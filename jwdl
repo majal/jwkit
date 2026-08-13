@@ -6,22 +6,47 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import date
 from pathlib import Path
 
-CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "jwdl"
+CONFIG_DIR = Path.home() / ".config" / "jwkit" / "jwdl"
+_LEGACY_CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "jwdl"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+
+def migrate_legacy_config_dir():
+    """One-time move from the pre-unification ~/.config/maj-scripts/jwdl
+    location to ~/.config/jwkit/jwdl now that all jwkit tools share one
+    config namespace."""
+    if _LEGACY_CONFIG_DIR.exists() and not CONFIG_DIR.exists():
+        CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(_LEGACY_CONFIG_DIR), str(CONFIG_DIR))
+        print(f"Moved your existing settings from {_LEGACY_CONFIG_DIR} to {CONFIG_DIR}.")
+
 DEFAULT_BASE_DIR = Path.home() / "Music" / "Watchtower Music"
+DEFAULT_PERIODICALS_BASE_DIR = Path.home() / "Documents" / "JW Periodicals"
 AUDIO_DESC_SUFFIX = "(With Audio Descriptions)"
 API_URL = "https://b.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS"
 USER_AGENT = "jwdl (jwkit; https://github.com/majal/jwkit)"
 REQUEST_TIMEOUT = 30
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF = 2
+
+# periodical pub code -> folder name. Absorbed from the old standalone
+# jwget script. Only 'w' (Watchtower Study Edition) and 'mwb' (meeting
+# workbook) are included - jwget also carried 'wp' (Watchtower Public
+# Edition) and 'g' (Awake!), but jw.org's own pub-media API 404s on both
+# of those regardless of issue: jw.org discontinued them as separate
+# monthly periodicals years ago, so there's nothing left to port for them.
+PERIODICALS = {
+    "w": "Watchtower (Study Edition)",
+    "mwb": "Life and Ministry Meeting Workbook",
+}
 
 # pub code -> folder name under the base music dir.
 # Folder names intentionally match years of prior downloads byte-for-byte
@@ -204,11 +229,177 @@ def cmd_list(pubs):
     for code, folder in pubs.items():
         print(f"  {code:<8} {folder}")
     print("\n  all      download all of the above")
+    print("\nLooking for periodicals (Watchtower, meeting workbook)? See 'jwdl periodicals list'.")
+
+
+# --- Periodicals (jwdl periodicals ...) ---
+def issue_range(months):
+    """Current month plus (months - 1) months ahead, as YYYYMM strings -
+    matches the old jwget's "current + next 4" default (months=5)."""
+    today = date.today()
+    issues = []
+    for i in range(months):
+        total = today.month - 1 + i
+        year = today.year + total // 12
+        month = total % 12 + 1
+        issues.append(f"{year:04d}{month:02d}")
+    return issues
+
+
+def fetch_periodical_media(pub, lang, issue):
+    """Returns (files, None) on success, or (None, reason) when this issue
+    isn't published (e.g. a future issue not out yet) - not an error."""
+    url = f"{API_URL}?output=json&pub={pub}&fileformat=PDF&alllangs=0&langwritten={lang}&issue={issue}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    last_err = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                data = json.load(resp)
+            if isinstance(data, list):
+                reason = data[0].get("title", "unknown error") if data else "empty response"
+                return None, reason
+            return data.get("files", {}).get(lang, {}).get("PDF", []), None
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
+            last_err = e
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+    raise RuntimeError(f"Failed to fetch '{pub}' issue {issue}: {last_err}")
+
+
+def download_periodical_file(entry, dest_dir, dry_run, include_large_print):
+    if not include_large_print and entry.get("format") == "lp":
+        return "skipped-lp", entry.get("editionDescr", "Large Print")
+
+    file_info = entry.get("file", {})
+    url = file_info.get("url", "")
+    filename = sanitize(os.path.basename(url))
+    dest_path = dest_dir / filename
+    expected_size = entry.get("filesize")
+
+    if dest_path.exists() and (expected_size is None or dest_path.stat().st_size == expected_size):
+        return "skipped-exists", filename
+
+    if dry_run:
+        return "would-download", filename
+
+    expected_checksum = file_info.get("checksum")
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp, open(tmp_path, "wb") as f:
+                f.write(resp.read())
+
+            if expected_checksum:
+                digest = hashlib.md5(tmp_path.read_bytes()).hexdigest()
+                if digest != expected_checksum:
+                    raise ValueError(f"checksum mismatch (got {digest}, expected {expected_checksum})")
+
+            os.replace(tmp_path, dest_path)
+            return "downloaded", filename
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+            else:
+                return "error", f"{filename}: {e}"
+
+    return "error", filename
+
+
+def download_periodical(pub, dest_dir, lang, months, dry_run, include_large_print):
+    name = PERIODICALS[pub]
+    echo_y(f"Processing periodical: {pub} ({name}), lang: {lang} ...")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    counts = {}
+    errors = []
+    for issue in issue_range(months):
+        files, not_published = fetch_periodical_media(pub, lang, issue)
+        if files is None:
+            counts["not-yet-published"] = counts.get("not-yet-published", 0) + 1
+            continue
+        for entry in files:
+            status, detail = download_periodical_file(entry, dest_dir, dry_run, include_large_print)
+            counts[status] = counts.get(status, 0) + 1
+            if status == "downloaded":
+                echo_g(f"  downloaded: {detail}")
+            elif status == "would-download":
+                print(f"  would download: {detail}")
+            elif status == "error":
+                errors.append(detail)
+                echo_r(f"  error: {detail}")
+
+    summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+    print(f"  {pub}: {summary or 'nothing to do'}")
+    return errors
+
+
+def cmd_periodicals_list():
+    print("Available periodical codes:\n")
+    for code, name in PERIODICALS.items():
+        print(f"  {code:<8} {name}")
+    print("\n  all      download all of the above")
+
+
+def run_periodicals(argv, config):
+    parser = argparse.ArgumentParser(
+        prog="jwdl periodicals",
+        description="Download JW periodicals (PDF): the Watchtower Study Edition and the meeting workbook",
+    )
+    parser.add_argument("code", nargs="?", help="periodical code (see 'jwdl periodicals list'), or 'all'")
+    parser.add_argument("lang", nargs="?", default="E", help="language code (default: E)")
+    parser.add_argument("--months", type=int, default=5, help="how many issues to fetch starting this month (default: 5)")
+    parser.add_argument("--include-large-print", action="store_true", help="also download the large-print edition where available")
+    parser.add_argument("--dir", type=Path, help="override the destination directory for a single periodical")
+    parser.add_argument("--base-dir", type=Path, help="override the base periodicals directory")
+    parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
+    args = parser.parse_args(argv)
+
+    base_dir = args.base_dir or Path(config.get("periodicals_base_dir", str(DEFAULT_PERIODICALS_BASE_DIR)))
+
+    if not args.code or args.code == "list":
+        cmd_periodicals_list()
+        return 0
+
+    if args.code != "all" and args.code not in PERIODICALS:
+        echo_r(f"Unknown periodical code: {args.code}\n")
+        cmd_periodicals_list()
+        return 2
+
+    targets = list(PERIODICALS.items()) if args.code == "all" else [(args.code, PERIODICALS[args.code])]
+
+    all_errors = []
+    for pub, name in targets:
+        dest_dir = args.dir if (args.dir and len(targets) == 1) else base_dir / name
+        errors = download_periodical(pub, dest_dir, args.lang, args.months, args.dry_run, args.include_large_print)
+        all_errors.extend(errors)
+        print()
+
+    if all_errors:
+        echo_r(f"Finished with {len(all_errors)} error(s).")
+        return 1
+
+    echo_g("Done.")
+    return 0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="jwdl - download JW music (MP3) to a local library")
-    parser.add_argument("pub", nargs="?", help="pub code (see 'jwdl list'), or 'all'")
+    migrate_legacy_config_dir()
+    config = load_config()
+
+    # 'periodicals' is a separate command family (different content type,
+    # different API shape - issue-based, not pub-code-only) rather than
+    # being folded into the same 'pub'/'all' positional, so plain 'jwdl all'
+    # (the one emeth4's weekly systemd timer calls) keeps meaning exactly
+    # what it always has: all configured music.
+    if len(sys.argv) > 1 and sys.argv[1] == "periodicals":
+        sys.exit(run_periodicals(sys.argv[2:], config))
+
+    parser = argparse.ArgumentParser(description="jwdl - download JW music (MP3) and periodicals (PDF) to a local library")
+    parser.add_argument("pub", nargs="?", help="pub code (see 'jwdl list'), or 'all' - or 'periodicals' for the Watchtower/workbook")
     parser.add_argument("lang", nargs="?", default="E", help="language code (default: E)")
     parser.add_argument("--dir", type=Path, help="override the destination directory for a single pub")
     parser.add_argument("--base-dir", type=Path, help="override the base Watchtower Music directory")
@@ -221,7 +412,6 @@ def main():
     parser.add_argument("--workers", type=int, help="parallel downloads per pub (default: 4)")
     args = parser.parse_args()
 
-    config = load_config()
     pubs = resolve_pubs(config)
     base_dir = args.base_dir or Path(config["base_dir"])
     workers = args.workers or config.get("workers", 4)

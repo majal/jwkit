@@ -48,3 +48,15 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("cache_max_gb", result.stdout)
         self.assertIn("languages", result.stdout)
         self.assertIn("video_crf", result.stdout)
+
+    def test_jwdl_music_list_unchanged_by_periodicals_merge(self) -> None:
+        result = self.run_script("jwdl", "list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("osg", result.stdout)
+        self.assertIn("all", result.stdout)
+
+    def test_jwdl_periodicals_list(self) -> None:
+        result = self.run_script("jwdl", "periodicals", "list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("w", result.stdout)
+        self.assertIn("mwb", result.stdout)

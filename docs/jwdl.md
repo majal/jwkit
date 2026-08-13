@@ -2,11 +2,12 @@
 
 [← Back to README](../README.md#table-of-contents)
 
-`jwdl` downloads official JW music (MP3) publications from jw.org into a local library, one folder per collection.
+`jwdl` downloads official JW music (MP3) publications and periodicals (PDF) from jw.org into a local library, one folder per collection.
 
 ## What It Does
 
 - Downloads JW music collections (Original Songs, "Sing Out Joyfully", soundtracks, International Music, etc.) via jw.org's public `pub-media` API.
+- `jwdl periodicals` downloads the Watchtower Study Edition and the Life and Ministry Meeting Workbook as PDFs, fetching the current issue plus several months ahead — absorbed from the old standalone `jwget` script, but through the same modern, checksummed `pub-media` API `jwdl` already used for music (`jwget`'s legacy scrape endpoint didn't verify downloads at all). Two periodicals `jwget` also carried, Watchtower Public Edition (`wp`) and Awake! (`g`), are not included: jw.org's API 404s on both regardless of issue — they were discontinued as separate monthly periodicals years ago, so there was nothing left to port.
 - Skips audio-description ("for the blind") narrated variants by default — those add spoken narration meant for listeners who can't see, which most people don't want mixed into a regular playlist. Pass `--include-audio-descriptions` to fetch them instead.
 - Verifies every download against the checksum the API provides and retries transient failures with backoff.
 - Skips tracks already on disk at the expected size, so re-running is fast and safe — designed to run unattended on a schedule (e.g. a weekly timer) to pick up newly released songs automatically.
@@ -63,17 +64,28 @@ Preview what a run would fetch without downloading:
 ./jwdl all --dry-run
 ```
 
+See what periodicals are available, then preview and download them:
+
+```bash
+./jwdl periodicals list
+./jwdl periodicals w --dry-run
+./jwdl periodicals all
+```
+
 ## Important Behavior / Defaults
 
-- Default destination is `~/Music/Watchtower Music/<collection>`; override it for every collection with `--base-dir`, or for a single pub with `--dir`.
-- Default language is `E` (English); pass a language code as the second positional argument (e.g. `./jwdl osg S`).
-- Audio-description tracks are excluded by default; use `--include-audio-descriptions` when you specifically want them.
-- A config file at `~/.config/maj-scripts/jwdl/config.json` can add pub codes jw.org releases later without touching the script (`{"pubs": {"newcode": "Folder Name"}}`) and can override `base_dir` or `workers`.
-- Downloads are written to a `.part` file and only renamed into place once the checksum matches, so an interrupted run never leaves a broken track sitting in the library.
+- Default destination is `~/Music/Watchtower Music/<collection>`; override it for every collection with `--base-dir`, or for a single pub with `--dir`. Periodicals default to `~/Documents/JW Periodicals/<publication>` and take the same `--base-dir`/`--dir` overrides.
+- Default language is `E` (English); pass a language code as the second positional argument (e.g. `./jwdl osg S`, `./jwdl periodicals w S`).
+- Audio-description tracks are excluded by default for music; use `--include-audio-descriptions` when you specifically want them.
+- `jwdl periodicals` fetches the current issue plus 4 months ahead by default (`--months N` to change that); each issue is checked individually since future issues aren't published yet — those are counted as `not-yet-published`, not errors. Large-print editions are skipped by default; pass `--include-large-print` to also fetch them.
+- `jwdl all` (music) and `jwdl periodicals all` are entirely separate commands — `all` never implicitly includes periodicals, so anything already scripting `jwdl all` keeps its exact original behavior.
+- A config file at `~/.config/jwkit/jwdl/config.json` can add music pub codes jw.org releases later without touching the script (`{"pubs": {"newcode": "Folder Name"}}`), override `base_dir`/`workers`, or set `periodicals_base_dir`.
+- Downloads are written to a `.part` file and only renamed into place once the checksum matches, so an interrupted run never leaves a broken file sitting in the library.
 
 ## Notes / Caveats
 
 - Relies on jw.org's public, unauthenticated `pub-media` API; if a pub code stops responding, jw.org has likely renamed or retired it — check `https://www.jw.org/en/library/music-songs/` for the current code and add it via the config file above.
 - Filenames intentionally reproduce the naming used by years of prior downloads (curly quotes, `_` in place of `:`, etc.) so an existing library never ends up with a second, differently-named copy of a track it already has.
+- `jwdl` has a live weekly caller on the `emeth4` host (systemd user timer running `jwdl all`) — see this repo's `AGENTS.md` Operational Notes before changing `jwdl`'s existing music CLI surface.
 
 [↑ Back to README TOC](../README.md#table-of-contents)
