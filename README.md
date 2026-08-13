@@ -6,12 +6,14 @@ Tools for pulling and processing content from jw.org — Bible sign-language cli
 
 If you're just here to use a tool, start here. This README is the friendly map:
 
+- Not sure where to start? Jump to [Quick Install](#quick-install) — one command, no manual setup.
 - Each tool section tells you what it does, what it needs, and the safest first commands to try — full detail lives in `docs/<tool>.md`, linked from each section.
-- Use [Your Local Setup](#your-local-setup) when Python, Git, `ffmpeg`, or package managers need a little help.
+- Use [Your Local Setup](#your-local-setup) if you'd rather install things by hand, or the quick install needs troubleshooting.
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Quick Install](#quick-install)
 - [Tools](#tools)
   - [`slverse`](#slverse)
   - [`ffrife`](#ffrife)
@@ -23,6 +25,37 @@ If you're just here to use a tool, start here. This README is the friendly map:
   - [Git](#git)
   - [Package Managers](#package-managers)
 - [Contributing Docs](#contributing-docs)
+
+## Quick Install
+
+One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `jwdl`, `ffrife`, and `jwvideo-mux` just work. No manual downloads, no separate setup steps.
+
+**macOS or Linux** (Terminal):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/majal/jwkit/main/install.sh | bash
+```
+
+**Windows** (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/majal/jwkit/main/install.ps1 | iex
+```
+
+Then open a **new** terminal window and try:
+
+```bash
+slverse --help
+jwdl list
+```
+
+For the interactive setup (which sign languages you watch, cache size, etc.), run `slverse setup` once.
+
+To update jwkit later, run `jwkit-update` (installed alongside the tools) — or just re-run the install command above; it's safe to repeat.
+
+If a step needs your password (installing Homebrew on macOS, or `sudo` on Linux) or a Windows Store component (`winget`), that's your system's own installer asking, not jwkit. See [Your Local Setup](#your-local-setup) below if you'd rather do each step by hand, or if the quick install hits something it can't resolve on its own.
+
+[↑ TOC](#table-of-contents)
 
 ## Tools
 
@@ -69,6 +102,8 @@ Full docs: [docs/jwvideo-mux-shortcuts.md](docs/jwvideo-mux-shortcuts.md)
 [↑ TOC](#table-of-contents)
 
 ## Your Local Setup
+
+Most people should just use [Quick Install](#quick-install) above. This section is for doing each step by hand — useful if the quick install can't finish something automatically (e.g. no `winget` on an older Windows install) or you just prefer to see each piece go in yourself.
 
 ### [Python](https://www.python.org/downloads/)
 

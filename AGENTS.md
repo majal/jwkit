@@ -24,6 +24,16 @@ All tools share one config namespace, `~/.config/jwkit/<tool>/` (e.g. `~/.config
 
 - **`jwdl` is called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwdl-weekly.service` + `.timer`, `ExecStart=... %h/MyFiles/Digitalis/jwkit/jwdl all`, weekly). Any change to `jwdl`'s existing music CLI surface (`jwdl <pub> [lang]`, `jwdl all`, `jwdl list`) must stay backward-compatible, or the service needs a coordinated update on that host first. `jwdl periodicals ...` is a fully separate command path added specifically to avoid touching that surface — keep it that way rather than folding periodicals into the same `pub`/`all` positional.
 
+## Installer (`install.sh` / `install.ps1`)
+
+Root-level one-liner installers for non-technical users (`curl | bash` on macOS/Linux, `irm | iex` on Windows) — see the Quick Install section of `README.md`. They install missing dependencies (Python, `ffmpeg`, `git` via Homebrew/apt/dnf/pacman/winget), download jwkit to `~/.jwkit` (`%USERPROFILE%\.jwkit` on Windows), add it to `PATH`, and drop a `jwkit-update` command that re-runs the same script.
+
+- Both scripts hardcode a `TOOLS`/`$Tools` list of the top-level commands to make runnable (`slverse`, `ffrife`, `jwdl`, `jwvideo-mux`). **Add new tools to that list in both scripts** when they're added to the repo, or the installer won't make them executable/shimmed.
+- `install.sh` is tested locally by overriding `HOME` to a scratch directory (`HOME=/tmp/fake bash install.sh`) so it never touches a real shell profile during testing.
+- `install.ps1` is **not verified on a real Windows machine** as of 2026-08-13 — it was written to the same patterns as `install.sh` (idempotent, guarded PATH edits, friendly error trap) but there was no Windows environment available to test it in. Treat changes to it with extra care and prefer a real Windows test before relying on it.
+- Windows needs `.cmd` shims (`slverse.cmd`, etc.) alongside the actual scripts, since Windows doesn't run a `#!/usr/bin/env python3` shebang line directly the way macOS/Linux do — `install.sh` doesn't need this, since the scripts are already directly executable there once `chmod +x`'d.
+- Both scripts are designed to be safe to re-run (used as the update mechanism) — don't add steps that aren't idempotent (e.g. that fail or duplicate on a second run) without guarding them.
+
 ## Public Repo And Secrets
 
 This repository is public. Treat anything committed here as readable by others.
@@ -107,3 +117,4 @@ Same spirit as `maj-scripts`: practical and skimmable, a light touch is fine, bu
 - keep examples concise and copy-pasteable
 - store config/state under `~/.config/jwkit/<tool>/` (see Configuration above), with a migration helper if you're renaming/moving an existing tool
 - if the tool has a live external caller (cron/systemd elsewhere), note it under Operational Notes above and keep its CLI surface backward-compatible
+- add the tool to the `TOOLS`/`$Tools` list in both `install.sh` and `install.ps1` (see Installer above) so the one-line installers pick it up
