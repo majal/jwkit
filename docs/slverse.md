@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md#table-of-contents)
 
-`slverse` is a unified tool for downloading, extracting, overlaying, and interpolating Sign Language Bible videos. It's not techie-only: `slverse setup` walks through the choices below with plain-language prompts and sane defaults.
+`slverse` finds, extracts, overlays, and interpolates Sign Language Bible videos, verse by verse. It's the successor to the original [`ffv`](https://github.com/majal/maj-scripts-archive-2026/blob/master/SL/ffv), rebuilt around JW.org's own verse-marker data instead of manual timestamping. Run `slverse setup` for a guided walkthrough of the choices below — plain-language prompts, sane defaults.
 
 ## What It Does
 

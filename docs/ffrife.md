@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md#table-of-contents)
 
-`ffrife` is a standalone AI frame-interpolation tool built on `rife-ncnn-vulkan` (GPU-accelerated). It's not JW/Bible-specific — it takes any local file or remote URL, an optional trim window, an optional `ffmpeg -vf` filter chain, and an optional retime speed, and produces real AI-interpolated (not motion-blended) output at a target frame rate. `jwsl` uses it as a library for its own `rife` interpolation engine (and its `--slow`/`--fast` sectioned retiming) instead of carrying a separate copy of this logic, and `ffslow`'s `--rife` flag shells out to it for smoother slow-motion.
+`ffrife` interpolates any video to a higher frame rate using `rife-ncnn-vulkan`, a GPU-accelerated AI model that generates real in-between frames instead of just blending adjacent ones. It works on any local file or URL, JW-related or not — trim a section, add an `ffmpeg` filter, or retime the speed, all in a single pass. `slverse` uses it as a library for its own interpolation (and its `--slow`/`--fast` sectioned retiming) instead of duplicating the logic, and the standalone `ffslow`'s `--rife` flag shells out to it too.
 
 ## What It Does
 
