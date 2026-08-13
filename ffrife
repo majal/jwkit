@@ -5,7 +5,7 @@ ffrife - standalone rife-ncnn-vulkan (AI frame interpolation) wrapper.
 Not JW/Bible-specific: takes any local file or remote URL, an optional
 time window and ffmpeg -vf filter chain, and produces a real-AI-interpolated
 (not motion-blended) output at a target frame rate in a single lossy
-re-encode generation. `jwsl` uses this as a library (see its import of
+re-encode generation. `slverse` uses this as a library (see its import of
 ffrife via importlib) instead of carrying its own copy of this logic;
 other tools (e.g. `ffslow`'s --rife flag) can shell out to this CLI directly.
 
@@ -40,6 +40,9 @@ import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _jwkit_common
 
 CONFIG_DIR = Path.home() / ".config" / "jwkit" / "ffrife"
 _LEGACY_CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "ffrife"
@@ -540,6 +543,7 @@ def normalize_argv(argv):
 def main():
     migrate_legacy_config_dir()
     args = build_parser().parse_args(normalize_argv(sys.argv[1:]))
+    _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     config = load_config()
 
     global FFMPEG_BIN, FFPROBE_BIN

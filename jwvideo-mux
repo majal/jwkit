@@ -19,6 +19,9 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _jwkit_common
+
 # Common ISO 639-2 codes mapping for ffmpeg metadata
 KNOWN_LANGUAGES = {
     "E": ("eng", "English"),
@@ -1485,6 +1488,7 @@ def main():
     parser.add_argument("--normalize-mismatched-aspect", action="store_true", help="With --adaptive-mpv-library, when a language's localized clips are a different resolution/aspect ratio than the reference (e.g. a 16:9 insert against a 4:3 reference), center-crop and re-encode just those short localized clips to the reference's exact aspect ratio and resolution so mpv never visibly resizes mid-presentation. The shared common/reference segments are never re-encoded -- only the mismatched language's own short localized clips are.")
 
     args = parser.parse_args()
+    _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     check_dependencies()
     
     vid_langs = [l.strip().upper() for l in args.video.split(',')] if args.video and args.video.upper() != "NONE" else []
