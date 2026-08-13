@@ -16,7 +16,6 @@ If you're just here to use a tool, start here. This README is the friendly map:
   - [`slverse`](#slverse)
   - [`ffrife`](#ffrife)
   - [`jwdl`](#jwdl)
-  - [`jwget`](#jwget)
   - [`jwvideo-mux`](#jwvideo-mux)
   - [`jwvideo-mux-shortcuts.sh`](#jwvideo-mux-shortcutssh)
 - [Your Local Setup](#your-local-setup)
@@ -45,17 +44,9 @@ Full docs: [docs/ffrife.md](docs/ffrife.md)
 
 ### [`jwdl`](./jwdl)
 
-`jwdl` downloads official JW music (MP3) publications from jw.org into a local library, one folder per collection.
+`jwdl` downloads official JW music (MP3) and periodicals (PDF: Watchtower, the meeting workbook) from jw.org into a local library, one folder per collection.
 
 Full docs: [docs/jwdl.md](docs/jwdl.md)
-
-[↑ TOC](#table-of-contents)
-
-### [`jwget`](./jwget)
-
-`jwget` is a legacy bash script that bulk-downloads jw.org periodicals (Watchtower, Awake!, the meeting workbook) as PDFs — different content and a much older codebase than `jwdl`.
-
-Full docs: [docs/jwget.md](docs/jwget.md)
 
 [↑ TOC](#table-of-contents)
 

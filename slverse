@@ -24,8 +24,14 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 # Paths
-CONFIG_DIR = Path.home() / ".config" / "slverse"
-_LEGACY_CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "jwsl"
+CONFIG_DIR = Path.home() / ".config" / "jwkit" / "slverse"
+# Checked oldest-first: pre-rename (jwsl, in maj-scripts) and the brief
+# ~/.config/slverse waypoint from before jwkit tools shared one config
+# namespace under ~/.config/jwkit/.
+_LEGACY_CONFIG_DIRS = [
+    Path.home() / ".config" / "maj-scripts" / "jwsl",
+    Path.home() / ".config" / "slverse",
+]
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 STATE_FILE = CONFIG_DIR / "state.json"
 INDEX_DIR = CONFIG_DIR / "index"  # one JSON file per synced language, kept out of state.json
@@ -33,14 +39,18 @@ DEFAULT_CACHE_DIR = Path.home() / ".cache" / "slverse"
 JWLANGS_FILE = Path(__file__).resolve().parent / "jwlangs.json"
 
 def migrate_legacy_config_dir():
-    """One-time move from the pre-split ~/.config/maj-scripts/jwsl location
-    (back when this tool was named jwsl and lived in maj-scripts) to this
-    tool's own ~/.config/slverse now that it's split out into jwkit. Keeps
-    an existing sync index/cache-size config from silently resetting."""
-    if _LEGACY_CONFIG_DIR.exists() and not CONFIG_DIR.exists():
-        CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(_LEGACY_CONFIG_DIR), str(CONFIG_DIR))
-        print(f"Moved your existing settings from {_LEGACY_CONFIG_DIR} to {CONFIG_DIR} (this tool is now 'slverse', split out of maj-scripts into jwkit).")
+    """One-time move from wherever this tool's config used to live (jwsl in
+    maj-scripts, or the brief standalone ~/.config/slverse) to its current
+    home, ~/.config/jwkit/slverse. Keeps an existing sync index/cache-size
+    config from silently resetting across the rename/moves."""
+    if CONFIG_DIR.exists():
+        return
+    for legacy_dir in _LEGACY_CONFIG_DIRS:
+        if legacy_dir.exists():
+            CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy_dir), str(CONFIG_DIR))
+            print(f"Moved your existing settings from {legacy_dir} to {CONFIG_DIR}.")
+            return
 
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF = 2

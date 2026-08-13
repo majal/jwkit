@@ -162,5 +162,111 @@ class JwdlListCommandTest(unittest.TestCase):
         self.assertIn("all", output)
 
 
+class JwdlIssueRangeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    def test_length_matches_months_requested(self) -> None:
+        self.assertEqual(len(self.jwdl.issue_range(5)), 5)
+
+    def test_each_issue_is_six_digit_yyyymm(self) -> None:
+        for issue in self.jwdl.issue_range(3):
+            self.assertRegex(issue, r"^\d{6}$")
+
+    def test_issues_are_sequential_months_no_duplicates(self) -> None:
+        issues = self.jwdl.issue_range(14)  # long enough to cross a year boundary
+        self.assertEqual(issues, sorted(set(issues)))
+        for prev, cur in zip(issues, issues[1:]):
+            py, pm = int(prev[:4]), int(prev[4:])
+            cy, cm = int(cur[:4]), int(cur[4:])
+            expected = (py, pm + 1) if pm < 12 else (py + 1, 1)
+            self.assertEqual((cy, cm), expected)
+
+
+class JwdlPeriodicalsListTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    def test_list_includes_all_marker_and_known_codes(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.jwdl.cmd_periodicals_list()
+        output = stdout.getvalue()
+        self.assertIn("w", output)
+        self.assertIn("mwb", output)
+        self.assertIn("all", output)
+
+    def test_discontinued_periodicals_are_not_offered(self) -> None:
+        # jw.org's pub-media API 404s on both regardless of issue - they
+        # were discontinued as separate monthly periodicals years ago, so
+        # jwget's other two pub codes were deliberately not ported.
+        self.assertNotIn("wp", self.jwdl.PERIODICALS)
+        self.assertNotIn("g", self.jwdl.PERIODICALS)
+
+
+class JwdlDownloadPeriodicalFileTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    def test_large_print_is_skipped_by_default(self) -> None:
+        entry = {"format": "lp", "editionDescr": "Large Print", "file": {"url": "https://example.com/w_lp_E_202601.pdf"}}
+        status, _ = self.jwdl.download_periodical_file(entry, mock.Mock(), dry_run=True, include_large_print=False)
+        self.assertEqual(status, "skipped-lp")
+
+    def test_large_print_is_included_when_requested(self) -> None:
+        dest_dir = mock.Mock()
+        dest_path = mock.Mock()
+        dest_path.exists.return_value = False
+        dest_dir.__truediv__ = mock.Mock(return_value=dest_path)
+        entry = {"format": "lp", "file": {"url": "https://example.com/w_lp_E_202601.pdf"}, "filesize": 123}
+        status, _ = self.jwdl.download_periodical_file(entry, dest_dir, dry_run=True, include_large_print=True)
+        self.assertEqual(status, "would-download")
+
+    def test_existing_file_with_matching_size_is_skipped(self) -> None:
+        dest_dir = mock.Mock()
+        dest_path = mock.Mock()
+        dest_path.exists.return_value = True
+        dest_path.stat.return_value = mock.Mock(st_size=42)
+        dest_dir.__truediv__ = mock.Mock(return_value=dest_path)
+        entry = {"format": "", "file": {"url": "https://example.com/w_E_202601.pdf"}, "filesize": 42}
+        status, _ = self.jwdl.download_periodical_file(entry, dest_dir, dry_run=True, include_large_print=False)
+        self.assertEqual(status, "skipped-exists")
+
+    def test_dry_run_reports_would_download_without_network(self) -> None:
+        dest_dir = mock.Mock()
+        dest_path = mock.Mock()
+        dest_path.exists.return_value = False
+        dest_dir.__truediv__ = mock.Mock(return_value=dest_path)
+        entry = {"format": "", "file": {"url": "https://example.com/w_E_202601.pdf"}, "filesize": 42}
+        with mock.patch.object(self.jwdl.urllib.request, "urlopen") as urlopen:
+            status, detail = self.jwdl.download_periodical_file(dest_dir=dest_dir, entry=entry, dry_run=True, include_large_print=False)
+            urlopen.assert_not_called()
+        self.assertEqual(status, "would-download")
+        self.assertEqual(detail, "w_E_202601.pdf")
+
+
+class JwdlFetchPeriodicalMediaTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    def test_list_response_is_treated_as_not_yet_published(self) -> None:
+        # The API returns a JSON list (an error-shaped payload, same as the
+        # music endpoint) for issues that don't exist yet, not a 4xx - this
+        # must not be raised as an error, since 4 of 5 default months are
+        # normally still unpublished at fetch time.
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.object(self.jwdl.json, "load", return_value=[{"title": "Not Found", "status": 404}]):
+            with mock.patch.object(self.jwdl.urllib.request, "urlopen", return_value=response):
+                files, reason = self.jwdl.fetch_periodical_media("w", "E", "209912")
+        self.assertIsNone(files)
+        self.assertEqual(reason, "Not Found")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -41,9 +41,27 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "ffrife"
+CONFIG_DIR = Path.home() / ".config" / "jwkit" / "ffrife"
+_LEGACY_CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "ffrife"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 BIN_DIR = CONFIG_DIR / "bin"
+
+def migrate_legacy_config_dir():
+    """One-time move from the pre-unification ~/.config/maj-scripts/ffrife
+    location to ~/.config/jwkit/ffrife now that all jwkit tools share one
+    config namespace (also carries over the downloaded RIFE binary in
+    bin/, so it doesn't need re-downloading)."""
+    if _LEGACY_CONFIG_DIR.exists() and not CONFIG_DIR.exists():
+        CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(_LEGACY_CONFIG_DIR), str(CONFIG_DIR))
+        # config.toml's rife_binary_path is an absolute string, so a plain
+        # directory move leaves it pointing at the old location - rewrite it
+        # rather than making the user re-download RIFE.
+        config_file = CONFIG_DIR / "config.toml"
+        if config_file.exists():
+            text = config_file.read_text()
+            config_file.write_text(text.replace(str(_LEGACY_CONFIG_DIR), str(CONFIG_DIR)))
+        print(f"Moved your existing settings from {_LEGACY_CONFIG_DIR} to {CONFIG_DIR}.")
 
 FFMPEG_FULL_KEG_PATHS = [
     "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg-full",
@@ -520,6 +538,7 @@ def normalize_argv(argv):
     return argv
 
 def main():
+    migrate_legacy_config_dir()
     args = build_parser().parse_args(normalize_argv(sys.argv[1:]))
     config = load_config()
 
