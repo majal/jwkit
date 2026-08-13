@@ -33,12 +33,15 @@ def migrate_legacy_config_dir():
 
 DEFAULT_BASE_DIR = Path.home() / "Music" / "Watchtower Music"
 DEFAULT_PERIODICALS_BASE_DIR = Path.home() / "Documents" / "JW Periodicals"
+DEFAULT_VIDEO_BASE_DIR = Path.home() / "Videos" / "JW Videos"
 AUDIO_DESC_SUFFIX = "(With Audio Descriptions)"
 API_URL = "https://b.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS"
+VIDEO_CATEGORY_API_URL = "https://data.jw-api.org/mediator/v1/categories"
 USER_AGENT = "jwdl (jwkit; https://github.com/majal/jwkit)"
 REQUEST_TIMEOUT = 30
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF = 2
+DEFAULT_VIDEO_RESOLUTION = "720p"
 
 # periodical pub code -> folder name. Absorbed from the old standalone
 # jwget script. Only 'w' (Watchtower Study Edition) and 'mwb' (meeting
@@ -233,6 +236,7 @@ def cmd_list(pubs):
         print(f"  {code:<8} {folder}")
     print("\n  all      download all of the above")
     print("\nLooking for periodicals (Watchtower, meeting workbook)? See 'jwdl periodicals list'.")
+    print("Looking for videos? See 'jwdl video'.")
 
 
 # --- Periodicals (jwdl periodicals ...) ---
@@ -390,20 +394,196 @@ def run_periodicals(argv, config):
     return 0
 
 
+# --- Video (jwdl video ...) ---
+def fetch_video_category(category, lang):
+    """Returns the category dict (with 'media' and/or 'subcategories') on
+    success, or None if the category key doesn't exist. jw.org's video
+    catalog is a tree: some categories hold videos directly (e.g.
+    LatestVideos), others are just folders of subcategories (e.g.
+    VideoOnDemand itself) - the caller decides what to do with an empty
+    'media' list based on whether 'subcategories' has anything."""
+    url = f"{VIDEO_CATEGORY_API_URL}/{lang}/{category}?detailed=1&mediaLimit=0&clientType=www"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    last_err = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                data = json.load(resp)
+            if isinstance(data, list):
+                return None  # e.g. [{"title": "Not Found", "status": 404}]
+            return data.get("category", {})
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None  # unlike pub-media, this API 404s for real instead of returning an error-shaped 200
+            last_err = e
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
+            last_err = e
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+    raise RuntimeError(f"Failed to fetch video category '{category}': {last_err}")
+
+
+def pick_video_rendition(files, resolution):
+    """Picks the file matching `resolution` (e.g. '720p') if available,
+    else the closest one at or below it, else the smallest available -
+    not every video has every rendition, and jw.org's own labels
+    ('144p'..'1080p') aren't guaranteed present across all of them."""
+    video_files = [f for f in files if f.get("mimetype", "").startswith("video/")]
+    if not video_files:
+        return None
+
+    def height(f):
+        try:
+            return int(str(f.get("label", "0p")).rstrip("p"))
+        except ValueError:
+            return 0
+
+    exact = [f for f in video_files if f.get("label") == resolution]
+    if exact:
+        return exact[0]
+
+    try:
+        target = int(str(resolution).rstrip("p"))
+    except ValueError:
+        target = 720
+    video_files.sort(key=height)
+    at_or_below = [f for f in video_files if height(f) <= target]
+    return at_or_below[-1] if at_or_below else video_files[0]
+
+
+def download_video(entry, dest_dir, resolution, dry_run):
+    title = entry.get("title", "")
+    file_entry = pick_video_rendition(entry.get("files", []), resolution)
+    if not file_entry:
+        return "skipped-no-file", title
+
+    url = file_entry.get("progressiveDownloadURL", "")
+    filename = sanitize(os.path.basename(url))
+    dest_path = dest_dir / filename
+    expected_size = file_entry.get("filesize")
+
+    if dest_path.exists() and (expected_size is None or dest_path.stat().st_size == expected_size):
+        return "skipped-exists", filename
+
+    if dry_run:
+        return "would-download", filename
+
+    expected_checksum = file_entry.get("checksum")
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp, open(tmp_path, "wb") as f:
+                f.write(resp.read())
+
+            if expected_checksum:
+                digest = hashlib.md5(tmp_path.read_bytes()).hexdigest()
+                if digest != expected_checksum:
+                    raise ValueError(f"checksum mismatch (got {digest}, expected {expected_checksum})")
+
+            os.replace(tmp_path, dest_path)
+            return "downloaded", filename
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+            else:
+                return "error", f"{filename}: {e}"
+
+    return "error", filename
+
+
+def run_video(argv, config):
+    parser = argparse.ArgumentParser(
+        prog="jwdl video",
+        description="Browse and download JW videos by category from jw.org",
+    )
+    parser.add_argument(
+        "category", nargs="?", default="VideoOnDemand",
+        help="Category key (default: VideoOnDemand, the top-level browser). "
+             "If the category holds videos, downloads them; if it's just a folder "
+             "of subcategories (like VideoOnDemand itself), lists them instead.",
+    )
+    parser.add_argument("lang", nargs="?", default="E", help="language code (default: E)")
+    parser.add_argument("--resolution", default=DEFAULT_VIDEO_RESOLUTION, help=f"target resolution: 144p/240p/360p/480p/720p/1080p when available (default: {DEFAULT_VIDEO_RESOLUTION}; falls back to the closest available)")
+    parser.add_argument("--dir", type=Path, help="override the destination directory")
+    parser.add_argument("--base-dir", type=Path, help="override the base video directory")
+    parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
+    args = parser.parse_args(argv)
+    _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
+
+    base_dir = args.base_dir or Path(config.get("video_base_dir", str(DEFAULT_VIDEO_BASE_DIR)))
+
+    cat = fetch_video_category(args.category, args.lang)
+    if cat is None:
+        echo_r(f"Unknown video category: {args.category}\n")
+        print("Run 'jwdl video' with no category to browse from the top (VideoOnDemand).")
+        return 2
+
+    name = cat.get("name", args.category)
+    media = cat.get("media", [])
+    subcategories = cat.get("subcategories", [])
+
+    if not media:
+        # A container category (or a genuinely empty one) - browse instead
+        # of trying to download nothing.
+        print(f"{name} ({args.category}):\n")
+        if subcategories:
+            print("Subcategories:")
+            for sub in subcategories:
+                print(f"  {sub['key']:<24} {sub['name']}")
+            print(f"\nRun 'jwdl video <key>' to go into one of these.")
+        else:
+            print("(no videos or subcategories found here)")
+        return 0
+
+    dest_dir = args.dir or (base_dir / name)
+    echo_y(f"Processing video category: {args.category} ({name}), lang: {args.lang} ...")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    counts = {}
+    errors = []
+    for entry in media:
+        status, detail = download_video(entry, dest_dir, args.resolution, args.dry_run)
+        counts[status] = counts.get(status, 0) + 1
+        if status == "downloaded":
+            echo_g(f"  downloaded: {detail}")
+        elif status == "would-download":
+            print(f"  would download: {detail}")
+        elif status == "error":
+            errors.append(detail)
+            echo_r(f"  error: {detail}")
+
+    summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+    print(f"  {args.category}: {summary or 'nothing to do'}")
+
+    if errors:
+        echo_r(f"Finished with {len(errors)} error(s).")
+        return 1
+
+    echo_g("Done.")
+    return 0
+
+
 def main():
     migrate_legacy_config_dir()
     config = load_config()
 
-    # 'periodicals' is a separate command family (different content type,
-    # different API shape - issue-based, not pub-code-only) rather than
-    # being folded into the same 'pub'/'all' positional, so plain 'jwdl all'
-    # (the one emeth4's weekly systemd timer calls) keeps meaning exactly
-    # what it always has: all configured music.
+    # 'periodicals' and 'video' are separate command families (different
+    # content types/API shapes) rather than being folded into the same
+    # 'pub'/'all' positional, so plain 'jwdl all' (the one emeth4's weekly
+    # systemd timer calls) keeps meaning exactly what it always has: all
+    # configured music.
     if len(sys.argv) > 1 and sys.argv[1] == "periodicals":
         sys.exit(run_periodicals(sys.argv[2:], config))
+    if len(sys.argv) > 1 and sys.argv[1] == "video":
+        sys.exit(run_video(sys.argv[2:], config))
 
-    parser = argparse.ArgumentParser(description="jwdl - download JW music (MP3) and periodicals (PDF) to a local library")
-    parser.add_argument("pub", nargs="?", help="pub code (see 'jwdl list'), or 'all' - or 'periodicals' for the Watchtower/workbook")
+    parser = argparse.ArgumentParser(description="jwdl - download JW music (MP3), periodicals (PDF), and videos to a local library")
+    parser.add_argument("pub", nargs="?", help="pub code (see 'jwdl list'), or 'all' - or 'periodicals'/'video' for other content types")
     parser.add_argument("lang", nargs="?", default="E", help="language code (default: E)")
     parser.add_argument("--dir", type=Path, help="override the destination directory for a single pub")
     parser.add_argument("--base-dir", type=Path, help="override the base Watchtower Music directory")

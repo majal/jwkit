@@ -268,5 +268,111 @@ class JwdlFetchPeriodicalMediaTest(unittest.TestCase):
         self.assertEqual(reason, "Not Found")
 
 
+class JwdlPickVideoRenditionTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    def setUp(self) -> None:
+        # matches real jw-api.org shapes: a 3gp rendition is still labeled a
+        # real resolution ("144p"), not "0p" - it's just a different mimetype
+        self.files = [
+            {"label": "144p", "mimetype": "video/3gpp", "progressiveDownloadURL": "https://example.com/144p.3gp"},
+            {"label": "240p", "mimetype": "video/mp4", "progressiveDownloadURL": "https://example.com/240p.mp4"},
+            {"label": "360p", "mimetype": "video/mp4", "progressiveDownloadURL": "https://example.com/360p.mp4"},
+            {"label": "720p", "mimetype": "video/mp4", "progressiveDownloadURL": "https://example.com/720p.mp4"},
+        ]
+
+    def test_exact_match_is_preferred(self) -> None:
+        picked = self.jwdl.pick_video_rendition(self.files, "360p")
+        self.assertEqual(picked["label"], "360p")
+
+    def test_falls_back_to_closest_below_when_exact_missing(self) -> None:
+        picked = self.jwdl.pick_video_rendition(self.files, "480p")
+        self.assertEqual(picked["label"], "360p")
+
+    def test_falls_back_to_smallest_when_requested_is_below_everything(self) -> None:
+        picked = self.jwdl.pick_video_rendition(self.files, "100p")
+        self.assertEqual(picked["label"], "144p")
+
+    def test_returns_none_when_no_video_files_present(self) -> None:
+        audio_only = [{"label": "mp3", "mimetype": "audio/mpeg"}]
+        self.assertIsNone(self.jwdl.pick_video_rendition(audio_only, "720p"))
+
+
+class JwdlDownloadVideoTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    def test_dry_run_reports_would_download_without_network(self) -> None:
+        dest_dir = mock.Mock()
+        dest_path = mock.Mock()
+        dest_path.exists.return_value = False
+        dest_dir.__truediv__ = mock.Mock(return_value=dest_path)
+        entry = {
+            "title": "Some Video",
+            "files": [{"label": "720p", "mimetype": "video/mp4", "progressiveDownloadURL": "https://example.com/foo_r720P.mp4", "filesize": 42}],
+        }
+        with mock.patch.object(self.jwdl.urllib.request, "urlopen") as urlopen:
+            status, detail = self.jwdl.download_video(entry, dest_dir, "720p", dry_run=True)
+            urlopen.assert_not_called()
+        self.assertEqual(status, "would-download")
+        self.assertEqual(detail, "foo_r720P.mp4")
+
+    def test_existing_file_with_matching_size_is_skipped(self) -> None:
+        dest_dir = mock.Mock()
+        dest_path = mock.Mock()
+        dest_path.exists.return_value = True
+        dest_path.stat.return_value = mock.Mock(st_size=42)
+        dest_dir.__truediv__ = mock.Mock(return_value=dest_path)
+        entry = {
+            "title": "Some Video",
+            "files": [{"label": "720p", "mimetype": "video/mp4", "progressiveDownloadURL": "https://example.com/foo_r720P.mp4", "filesize": 42}],
+        }
+        status, _ = self.jwdl.download_video(entry, dest_dir, "720p", dry_run=True)
+        self.assertEqual(status, "skipped-exists")
+
+    def test_no_matching_video_file_is_skipped(self) -> None:
+        entry = {"title": "Audio Only", "files": [{"label": "mp3", "mimetype": "audio/mpeg"}]}
+        status, _ = self.jwdl.download_video(entry, mock.Mock(), "720p", dry_run=True)
+        self.assertEqual(status, "skipped-no-file")
+
+
+class JwdlFetchVideoCategoryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    def test_404_http_error_returns_none_without_retrying(self) -> None:
+        # Unlike the music/periodicals endpoints, this API 404s for real
+        # instead of returning an error-shaped 200 - must be treated as
+        # "unknown category" immediately, not retried 3x and crash.
+        err = self.jwdl.urllib.error.HTTPError("url", 404, "Not Found", {}, None)
+        with mock.patch.object(self.jwdl.urllib.request, "urlopen", side_effect=err) as urlopen:
+            result = self.jwdl.fetch_video_category("NotReal", "E")
+        self.assertIsNone(result)
+        urlopen.assert_called_once()
+
+    def test_list_response_is_treated_as_not_found(self) -> None:
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.object(self.jwdl.json, "load", return_value=[{"title": "Not Found", "status": 404}]):
+            with mock.patch.object(self.jwdl.urllib.request, "urlopen", return_value=response):
+                result = self.jwdl.fetch_video_category("NotReal", "E")
+        self.assertIsNone(result)
+
+    def test_successful_response_returns_category_dict(self) -> None:
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        payload = {"category": {"key": "LatestVideos", "name": "Latest Videos", "media": []}}
+        with mock.patch.object(self.jwdl.json, "load", return_value=payload):
+            with mock.patch.object(self.jwdl.urllib.request, "urlopen", return_value=response):
+                result = self.jwdl.fetch_video_category("LatestVideos", "E")
+        self.assertEqual(result["name"], "Latest Videos")
+
+
 if __name__ == "__main__":
     unittest.main()

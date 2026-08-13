@@ -6,11 +6,13 @@ Repo name: `jwkit`
 
 ## Purpose
 
-`jwkit` holds tools for pulling and processing content from jw.org: Bible sign-language clips (`slverse`), music and periodicals (`jwdl`), videos (`jwvideo-mux`), and AI frame interpolation (`ffrife`, used as a library by `slverse` but not jw.org-specific itself).
+`jwkit` holds tools for pulling and processing content from jw.org: Bible sign-language clips (`slverse`), music/periodicals/video (`jwdl`), multi-language video downloading and muxing (`jwvideo-mux`), and AI frame interpolation (`ffrife`, used as a library by `slverse` but not jw.org-specific itself).
 
 Split out of [`majal/maj-scripts`](https://github.com/majal/maj-scripts) on 2026-08-13, once the jw.org-specific tools there outnumbered the general-purpose ones. `maj-scripts` keeps its own disparate utility scripts (`gmail-cleanup`, `whisper`, `wh`, `printing-mode`, `ubuntu-hibernate`, etc.); this repo is scoped to jw.org content tools only.
 
 `jwget` (a legacy, unauthenticated bash periodicals scraper) was absorbed into `jwdl` as `jwdl periodicals` on the same day, then retired to `bin-archive-2026` — jw.org's modern `pub-media` API (checksummed, already used by `jwdl` for music) covers the periodicals that are still actually published; two of `jwget`'s four (`wp`, `g`) turned out to be discontinued jw.org-side years ago, not just stale locally.
+
+`jwdl video` and `jwvideo-mux` both touch video but solve different problems, and that's intentional, not overlap to clean up: `jwdl video` bulk-downloads by category (Bible, Dramas, Latest Videos, ...) at one resolution, one language at a time - browsing jw.org's own catalog tree via its `mediator` API. `jwvideo-mux` downloads *one specific, already-known* video and merges multiple language audio/subtitle tracks into a single file. Reach for `jwdl video` to explore/bulk-fetch; reach for `jwvideo-mux` when you already have a docid/URL and want several languages muxed together.
 
 ## Naming
 
