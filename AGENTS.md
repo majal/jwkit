@@ -90,7 +90,7 @@ Full per-tool docs live in `docs/<tool>.md`, not inline in `README.md` — this 
 8. `## Notes / Caveats`
 9. `[↑ Back to README TOC](../README.md#table-of-contents)` at the end.
 
-Doc filename: `docs/<tool-name>.md`, stripping a trailing `.sh` if the tool has one (e.g. `jwvideo-mux-shortcuts.sh` → `docs/jwvideo-mux-shortcuts.md`).
+Doc filename: `docs/<tool-name>.md`, stripping a trailing `.sh` if the tool has one.
 
 Keep examples short, practical, and copy-pasteable.
 
@@ -103,6 +103,7 @@ Same spirit as `maj-scripts`: practical and skimmable, a light touch is fine, bu
 - Keep README headings stable and predictable so anchors remain valid.
 - Prefer `## Tools` as the parent section and `### <tool-name>` for each tool.
 - Prefer `### [<tool-name>](./<tool-file>)` when the tool file lives at the repo root.
+- Keep the tool list **alphabetical** everywhere it appears: the README TOC, the `## Tools` section itself, and the `TOOLS`/`$Tools` arrays in `install.sh`/`install.ps1`. Insert new tools in alphabetical position rather than appending them at the end.
 - Use `↑ TOC` for major sections and primary subsections.
 - If a new shared subsection is added, it must also be added to the README TOC in the same order it appears in the file.
 

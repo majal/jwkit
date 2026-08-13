@@ -11,7 +11,7 @@ set -euo pipefail
 JWKIT_HOME="${JWKIT_HOME:-$HOME/.jwkit}"
 REPO_URL="https://github.com/majal/jwkit"
 TARBALL_URL="${REPO_URL}/archive/refs/heads/main.tar.gz"
-TOOLS=(slverse ffrife jwdl jwvideo-mux)
+TOOLS=(ffrife jwdl jwvideo-mux slverse)
 
 c_bold()   { printf '\033[1m%s\033[0m\n' "$1"; }
 c_green()  { printf '\033[32m%s\033[0m\n' "$1"; }
@@ -113,7 +113,6 @@ fi
 for tool in "${TOOLS[@]}"; do
     [ -f "$JWKIT_HOME/$tool" ] && chmod +x "$JWKIT_HOME/$tool"
 done
-[ -f "$JWKIT_HOME/jwvideo-mux-shortcuts.sh" ] && chmod +x "$JWKIT_HOME/jwvideo-mux-shortcuts.sh"
 
 # --- PATH ---
 step "Adding jwkit to your PATH"

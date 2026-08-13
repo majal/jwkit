@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 $RepoUrl = "https://github.com/majal/jwkit"
 $RepoZip = "$RepoUrl/archive/refs/heads/main.zip"
 $JwkitHome = if ($env:JWKIT_HOME) { $env:JWKIT_HOME } else { Join-Path $HOME ".jwkit" }
-$Tools = @("slverse", "ffrife", "jwdl", "jwvideo-mux")
+$Tools = @("ffrife", "jwdl", "jwvideo-mux", "slverse")
 
 function Write-Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg) { Write-Host $msg -ForegroundColor Green }

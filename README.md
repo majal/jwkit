@@ -1,6 +1,6 @@
 # jwkit
 
-Tools for pulling and processing content from jw.org — Bible sign-language clips, music, videos, and periodicals. Split out of [`majal/maj-scripts`](https://github.com/majal/maj-scripts) into its own home now that the jw.org-specific tools outnumbered the general-purpose ones there.
+Tools for pulling and processing content from jw.org — Bible sign-language clips, music, periodicals, and video. `slverse` (sign-language verse extraction) is the modern successor to [the original `ffv`](https://github.com/majal/maj-scripts-archive-2026/blob/master/SL/ffv), a long-running personal tool for the same job — rebuilt from scratch around JW.org's own verse-marker data instead of manual timestamping.
 
 ## Overview
 
@@ -15,11 +15,10 @@ If you're just here to use a tool, start here. This README is the friendly map:
 - [Overview](#overview)
 - [Quick Install](#quick-install)
 - [Tools](#tools)
-  - [`slverse`](#slverse)
   - [`ffrife`](#ffrife)
   - [`jwdl`](#jwdl)
   - [`jwvideo-mux`](#jwvideo-mux)
-  - [`jwvideo-mux-shortcuts.sh`](#jwvideo-mux-shortcutssh)
+  - [`slverse`](#slverse)
 - [Your Local Setup](#your-local-setup)
   - [Python](#python)
   - [Git](#git)
@@ -59,14 +58,6 @@ If a step needs your password (installing Homebrew on macOS, or `sudo` on Linux)
 
 ## Tools
 
-### [`slverse`](./slverse)
-
-`slverse` (formerly `jwsl`) is a unified tool for downloading, extracting, overlaying, and interpolating Sign Language Bible videos. It's not techie-only: `slverse setup` walks through the choices below with plain-language prompts and sane defaults.
-
-Full docs: [docs/slverse.md](docs/slverse.md)
-
-[↑ TOC](#table-of-contents)
-
 ### [`ffrife`](./ffrife)
 
 `ffrife` is a standalone AI frame-interpolation tool built on `rife-ncnn-vulkan` (GPU-accelerated). It's not JW/Bible-specific — it takes any local file or remote URL, an optional trim window, an optional `ffmpeg -vf` filter chain, and an optional retime speed, and produces real AI-interpolated (not motion-blended) output at a target frame rate. `slverse` uses it as a library for its own `rife` interpolation engine instead of carrying a separate copy of this logic.
@@ -93,11 +84,11 @@ Full docs: [docs/jwvideo-mux.md](docs/jwvideo-mux.md)
 
 [↑ TOC](#table-of-contents)
 
-### [`jwvideo-mux-shortcuts.sh`](./jwvideo-mux-shortcuts.sh)
+### [`slverse`](./slverse)
 
-`jwvideo-mux-shortcuts.sh` is a set of short shell functions that wrap `jwvideo-mux`'s most common commands for a local SCE-style video library, so you don't have to retype the same flags for every video.
+`slverse` (formerly `jwsl`; the successor to the original `ffv`, see above) is a unified tool for downloading, extracting, overlaying, and interpolating Sign Language Bible videos. It's not techie-only: `slverse setup` walks through the choices below with plain-language prompts and sane defaults.
 
-Full docs: [docs/jwvideo-mux-shortcuts.md](docs/jwvideo-mux-shortcuts.md)
+Full docs: [docs/slverse.md](docs/slverse.md)
 
 [↑ TOC](#table-of-contents)
 
