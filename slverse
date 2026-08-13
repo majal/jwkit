@@ -1,0 +1,1763 @@
+#!/usr/bin/env python3
+"""
+slverse - JW Sign Language Video Tool
+Downloads, syncs, extracts, overlays, and interpolates JW SL videos.
+"""
+import argparse
+import concurrent.futures
+import hashlib
+import importlib.util
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from fractions import Fraction
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+# Paths
+CONFIG_DIR = Path.home() / ".config" / "slverse"
+_LEGACY_CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "jwsl"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+STATE_FILE = CONFIG_DIR / "state.json"
+INDEX_DIR = CONFIG_DIR / "index"  # one JSON file per synced language, kept out of state.json
+DEFAULT_CACHE_DIR = Path.home() / ".cache" / "slverse"
+JWLANGS_FILE = Path(__file__).resolve().parent / "jwlangs.json"
+
+def migrate_legacy_config_dir():
+    """One-time move from the pre-split ~/.config/maj-scripts/jwsl location
+    (back when this tool was named jwsl and lived in maj-scripts) to this
+    tool's own ~/.config/slverse now that it's split out into jwkit. Keeps
+    an existing sync index/cache-size config from silently resetting."""
+    if _LEGACY_CONFIG_DIR.exists() and not CONFIG_DIR.exists():
+        CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(_LEGACY_CONFIG_DIR), str(CONFIG_DIR))
+        print(f"Moved your existing settings from {_LEGACY_CONFIG_DIR} to {CONFIG_DIR} (this tool is now 'slverse', split out of maj-scripts into jwkit).")
+
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF = 2
+
+# Homebrew's plain 'ffmpeg' formula ships without freetype/fontconfig, so it
+# can't draw text overlays. A full build is usually installed keg-only under
+# a '-full' suffix so it can coexist with the plain formula; these are the
+# places to look for it before falling back to plain ffmpeg.
+FFMPEG_FULL_KEG_PATHS = [
+    "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg-full",
+    "/usr/local/opt/ffmpeg-full/bin/ffmpeg-full",
+]
+FFPROBE_FULL_KEG_PATHS = [
+    "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe-full",
+    "/usr/local/opt/ffmpeg-full/bin/ffprobe-full",
+]
+
+# Resolved once at startup by main() -> resolve_ffmpeg_binary/resolve_ffprobe_binary/resolve_ffplay_binary.
+FFMPEG_BIN = "ffmpeg"
+FFPROBE_BIN = "ffprobe"
+FFPLAY_BIN = "ffplay"
+
+# Overlay fonts, auto-downloaded into CONFIG_DIR/fonts/ on first use (see
+# resolve_font_paths/ensure_font) via the same Google Fonts CSS2 endpoint
+# browsers use (fonts.googleapis.com/css2?family=...&wght@N) - that always
+# resolves to the family's *current* file, unlike hardcoding one versioned
+# fonts.gstatic.com path that Google can (and does) rotate. "noto-sans-display"
+# is the default: it's what old ffv used
+# (~/.fonts/Sans/Noto_Sans_Display/static/NotoSansDisplay-{SemiBold,Regular}.ttf
+# on the original machine), and a frame-by-frame comparison against a real
+# JW SL video's own burned-in caption (Psalm 16:11, FSL) confirmed it's a
+# close visual match - though without JW's actual production source files,
+# "close match by eye" is the ceiling of what's verifiable here. "inter" and
+# "google-sans-flex" are offered as configurable alternatives per user
+# request, to compare side by side.
+FONT_DIR = CONFIG_DIR / "fonts"
+FONT_FAMILIES = {
+    "noto-sans-display": "Noto Sans Display",
+    "inter": "Inter",
+    "google-sans-flex": "Google Sans Flex",
+}
+FONT_MAIN_WEIGHT = "600"      # SemiBold - old ffv's main drawtext weight
+FONT_ESTIMATOR_WEIGHT = "400"  # Regular - old ffv's delogo-sizing estimator weight
+
+# Default configs
+DEFAULT_CONFIG = {
+    "cache_dir": str(DEFAULT_CACHE_DIR),
+    "cache_policy": "lru",  # keep_all, lru, delete_after_use
+    "cache_max_gb": "5",
+    "extract_mode": "onthefly",  # onthefly (stream, no disk use), cache (download chapter, reuse for later verses)
+    "hardware_encoder": "cpu",  # nvenc, videotoolbox, qsv, cpu
+    "video_codec": "h264",  # h264, hevc, av1
+    "video_crf": "20",
+    "video_preset": "slow",
+    "interpolation_engine": "none",  # none, minterpolate, rife, framerate - "rife" delegates to the sibling ffrife tool; see its own config for rife_binary_path/rife_fallback_engine
+    "languages": "ASL,FSL,BVL,INI,SPE",
+    "sync_workers": "4",
+    "extract_workers": "3",
+    "auto_sync": "true",  # once-a-day background refresh on extract/find/bulk, so non-techies stay current without running 'sync' themselves
+    "auto_sync_interval_hours": "24",
+    "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
+    "font_family": "noto-sans-display",  # noto-sans-display, inter, google-sans-flex - see FONT_FAMILIES
+    "api_language": "E",  # Language for book names (e.g., E for English)
+    "ffmpeg_binary": "",  # override auto-detection, e.g. /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg-full
+    "ffprobe_binary": "",
+    "ffplay_binary": "",  # override auto-detection, used for preview (extract without --write)
+    # Overlay layout - same coordinates/sizes old ffv used, so a verse
+    # extracted today lands in the same spot as one extracted years ago.
+    "overlay_x": "93",
+    "overlay_y": "54",
+    "overlay_fontsize": "34",
+    "overlay_alpha": "0.66",
+    "overlay_source_label_alpha": "0.5",  # small "which SL is this" label under the reference
+    "delogo_width_pad": "10",   # extra px beyond the auto-measured text width, in case the source's own caption runs a bit longer
+    "delogo_height_pad": "10",
+    "default_target_lang": "FSL",  # requesting this SL skips delogo/drawtext entirely - its own burned-in caption is already correct
+}
+
+# --- Config Management ---
+def load_config():
+    config = DEFAULT_CONFIG.copy()
+    if not CONFIG_FILE.exists():
+        return config
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("["):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'").strip('"')
+                    config[k] = v
+    except Exception as e:
+        print(f"Warning: could not parse config: {e}")
+    return config
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        for k, v in config.items():
+            f.write(f'{k} = "{v}"\n')
+
+def get_state():
+    """Small, fast-loading state: sync timestamps, cache-access bookkeeping,
+    and cached book-name metadata. Per-language verse/marker indexes live in
+    INDEX_DIR instead (see load_index/save_index) so state.json doesn't grow
+    to tens of megabytes as more languages get synced."""
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+    except Exception:
+        return {}
+
+    legacy_langs = [k for k in state if not k.startswith("_")]
+    if legacy_langs:
+        print(f"One-time migration: moving {len(legacy_langs)} language index(es) out of state.json into {INDEX_DIR}/")
+        for lang in legacy_langs:
+            entries = state.pop(lang)
+            existing = load_index(lang)
+            existing.update(entries)
+            save_index(lang, existing)
+        save_state(state)
+
+    return state
+
+def save_state(state):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+def load_index(lang):
+    path = INDEX_DIR / f"{lang}.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_index(lang, entries):
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    with open(INDEX_DIR / f"{lang}.json", "w") as f:
+        json.dump(entries, f, indent=2)
+
+def synced_languages():
+    """Languages with an on-disk index, for commands like 'find' that search
+    across everything already synced rather than just the configured list."""
+    if not INDEX_DIR.exists():
+        return []
+    return sorted(p.stem for p in INDEX_DIR.glob("*.json"))
+
+def load_jwlangs():
+    try:
+        with open(JWLANGS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def lang_display(code, jwlangs=None):
+    jwlangs = jwlangs if jwlangs is not None else load_jwlangs()
+    entry = jwlangs.get(code.upper())
+    return f"{code.upper()} ({entry[1]})" if entry else code.upper()
+
+def get_lang_list(config, lang_arg=None):
+    """Resolve a language argument to a list of codes.
+    'all' or None uses the configured language list; a comma list is split;
+    anything else is a single code."""
+    if lang_arg and lang_arg.lower() != "all":
+        parts = lang_arg.split(",")
+    else:
+        parts = config.get("languages", DEFAULT_CONFIG["languages"]).split(",")
+    return [p.strip().upper() for p in parts if p.strip()]
+
+# --- System Check & Setup ---
+def command_exists(cmd):
+    return shutil.which(cmd) is not None
+
+def focus_process(pid):
+    """macOS-only: activate a just-launched GUI process by pid via System
+    Events. mpv and ffplay are both bare CLI binaries there (no signed
+    .app bundle), so launching either from a background terminal process
+    doesn't get the NSApplication activation a Dock/Finder launch would.
+    A short retry loop covers the moment between process start and the
+    window registering with the WindowServer - the very first attempt
+    typically fails simply because the window doesn't exist yet."""
+    if platform.system() != "Darwin":
+        return
+    script = f'tell application "System Events" to set frontmost of (first process whose unix id is {pid}) to true'
+    for attempt in range(5):
+        if attempt:
+            time.sleep(0.3)
+        result = subprocess.run(["osascript", "-e", script], capture_output=True)
+        if result.returncode == 0:
+            return
+
+def launch_mpv(args, wait=True):
+    """Spawn mpv with `args` and try to bring it to the front on every OS.
+    --force-window=immediate plus mpv's own --focus-on=open default (mpv
+    0.34+) cover Linux/Windows window managers reasonably well; see
+    focus_process for the macOS-specific piece. --no-keep-open matches old
+    ffv's mpv_opts (mpv's own default is already --keep-open=no, so this
+    is belt-and-suspenders, not a behavior change)."""
+    cmd = ["mpv", "--no-config", "--fullscreen=yes", "--force-window=immediate", "--no-keep-open"] + list(args)
+    proc = subprocess.Popen(cmd)
+    focus_process(proc.pid)
+    if wait:
+        proc.wait()
+    return proc
+
+def launch_ffplay(args, wait=True):
+    """Same idea as launch_mpv but for ffplay, used by the default preview
+    path (see preview_verse) - ffplay is SDL-based and usually grabs focus
+    fine on its own, but macOS's bare-CLI-binary activation gap applies to
+    it exactly the same way it does to mpv."""
+    cmd = [FFPLAY_BIN, "-hide_banner", "-loglevel", "error", "-autoexit"] + list(args)
+    proc = subprocess.Popen(cmd)
+    focus_process(proc.pid)
+    if wait:
+        proc.wait()
+    return proc
+
+def detect_hardware_encoder():
+    """Defaults to 'cpu' (libx264) everywhere. Measured directly on this
+    machine's Apple Silicon GPU for a 31s 720p verse clip: videotoolbox at
+    the quality setting matching crf 20 produced an 8.0MB file (SSIM
+    0.99786 against the source), while libx264 crf 20 preset slow produced
+    a 3.1MB file - close to the 2.9MB source itself - at SSIM 0.99752,
+    a difference too small to see. Encode time was nearly identical either
+    way (3.6s vs 3.0s for that clip) - GPU's speed advantage isn't
+    meaningful at these short clip lengths, so there's no real tradeoff:
+    CPU gets a ~2.6x smaller file for immeasurably different quality.
+    Matching bitrate explicitly (700kbps VBR) instead of crf made GPU
+    *worse* than CPU at the same size (SSIM 0.99633 vs 0.99723) - x264's
+    rate-distortion efficiency beats videotoolbox's at a fixed bitrate too.
+    videotoolbox/nvenc remain available via 'slverse config set
+    hardware_encoder videotoolbox' for anyone who wants GPU speed for bulk
+    processing many chapters, where CPU's per-clip cost adds up."""
+    return "cpu"
+
+def ffmpeg_has_filter(ffmpeg_bin, filter_name):
+    try:
+        result = subprocess.run([ffmpeg_bin, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=10)
+        return filter_name in result.stdout
+    except Exception:
+        return False
+
+def resolve_ffmpeg_binary(config):
+    override = config.get("ffmpeg_binary")
+    if override and command_exists(override):
+        return override
+    candidates = [c for c in [
+        shutil.which("ffmpeg-full"),
+        *[p for p in FFMPEG_FULL_KEG_PATHS if os.path.exists(p)],
+        shutil.which("ffmpeg"),
+    ] if c]
+    for c in candidates:
+        if ffmpeg_has_filter(c, "drawtext"):
+            return c
+    return candidates[0] if candidates else "ffmpeg"
+
+def resolve_ffplay_binary(config):
+    override = config.get("ffplay_binary")
+    if override and command_exists(override):
+        return override
+    candidates = [c for c in [shutil.which("ffplay-full"), shutil.which("ffplay")] if c]
+    return candidates[0] if candidates else "ffplay"
+
+def resolve_ffprobe_binary(config):
+    override = config.get("ffprobe_binary")
+    if override and command_exists(override):
+        return override
+    candidates = [c for c in [
+        shutil.which("ffprobe-full"),
+        *[p for p in FFPROBE_FULL_KEG_PATHS if os.path.exists(p)],
+        shutil.which("ffprobe"),
+    ] if c]
+    return candidates[0] if candidates else "ffprobe"
+
+_FFRIFE_MODULE = None
+
+def load_ffrife():
+    """Import the sibling `ffrife` script as a module (same pattern
+    tests/support.py uses to load slverse itself). RIFE interpolation isn't
+    Bible/JW-specific, so it lives in its own standalone, reusable tool
+    (ffrife) instead of being duplicated here - other tools (ffslow's --ai
+    flag) share the exact same RIFE install/interpolation logic this way.
+    Cached at module level so repeated extract calls (e.g. multi-language
+    ThreadPoolExecutor runs) don't re-parse/re-exec the script each time."""
+    global _FFRIFE_MODULE
+    if _FFRIFE_MODULE is None:
+        script_path = Path(__file__).resolve().parent / "ffrife"
+        loader = SourceFileLoader("ffrife", str(script_path))
+        spec = importlib.util.spec_from_loader("ffrife", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        module.FFMPEG_BIN = FFMPEG_BIN
+        module.FFPROBE_BIN = FFPROBE_BIN
+        _FFRIFE_MODULE = module
+    return _FFRIFE_MODULE
+
+def ffrife_config_for(config):
+    """Bridges slverse's own encode-quality settings into ffrife's config
+    shape for one interpolate() call. ffrife's own config file only holds
+    what's genuinely ffrife-specific (rife_binary_path, rife_fallback_engine);
+    encode quality (hardware_encoder/video_crf/etc.) stays a single source
+    of truth in slverse's config rather than needing to be kept in sync across
+    two separate files."""
+    ffrife = load_ffrife()
+    ffrife_config = ffrife.load_config()
+    for key in ("hardware_encoder", "video_codec", "video_crf", "video_preset"):
+        if key in config:
+            ffrife_config[key] = config[key]
+    return ffrife_config
+
+def setup_dependencies(config):
+    print("Setting up dependencies...")
+    system = platform.system()
+    ffmpeg_bin = resolve_ffmpeg_binary(config)
+    has_ffmpeg = command_exists(ffmpeg_bin) or os.path.exists(ffmpeg_bin)
+
+    if has_ffmpeg and ffmpeg_has_filter(ffmpeg_bin, "drawtext"):
+        print(f"Found a drawtext-capable ffmpeg at: {ffmpeg_bin}")
+        print("(overlays will work — nothing to install)")
+    elif has_ffmpeg:
+        print(f"Found ffmpeg at {ffmpeg_bin}, but it's missing the drawtext filter (no freetype/fontconfig).")
+        print("Text overlays won't work until you install a build that has it.")
+        if system == "Darwin":
+            print("Installing a freetype/fontconfig-enabled FFmpeg on macOS...")
+            subprocess.run(["brew", "tap", "homebrew-ffmpeg/ffmpeg"], check=True)
+            subprocess.run(["brew", "install", "homebrew-ffmpeg/ffmpeg/ffmpeg", "--with-freetype", "--with-fontconfig"], check=True)
+        elif system == "Linux":
+            print("Installing FFmpeg on Linux (Ubuntu/Debian builds normally include drawtext already)...")
+            subprocess.run(["sudo", "apt", "update"], check=True)
+            subprocess.run(["sudo", "apt", "install", "-y", "ffmpeg"], check=True)
+        else:
+            print("Please manually install an FFmpeg build with freetype/fontconfig on Windows (e.g., the gyan.dev 'full' builds).")
+    else:
+        if system == "Darwin":
+            print("Installing FFmpeg with freetype/fontconfig on macOS...")
+            subprocess.run(["brew", "tap", "homebrew-ffmpeg/ffmpeg"], check=True)
+            subprocess.run(["brew", "install", "homebrew-ffmpeg/ffmpeg/ffmpeg", "--with-freetype", "--with-fontconfig"], check=True)
+        elif system == "Linux":
+            print("Installing FFmpeg on Linux...")
+            subprocess.run(["sudo", "apt", "update"], check=True)
+            subprocess.run(["sudo", "apt", "install", "-y", "ffmpeg"], check=True)
+        else:
+            print("Please manually install FFmpeg on Windows (e.g., winget install ffmpeg).")
+
+def profile_already_has_dir(existing, target_dir):
+    """Check every existing `set_dir="..."` assignment (this repo's own
+    convention for guarded PATH blocks), not just slverse's own marker, so this
+    doesn't add a second entry next to one someone wrote by hand."""
+    for line in existing.splitlines():
+        line = line.strip()
+        if not line.startswith("set_dir="):
+            continue
+        value = line.split("=", 1)[1].strip().strip('"').strip("'")
+        value = value.replace("$HOME", str(Path.home())).replace("~", str(Path.home()))
+        try:
+            if Path(value).resolve() == target_dir.resolve():
+                return True
+        except OSError:
+            continue
+    return False
+
+def add_to_path_profile():
+    script_dir = Path(__file__).resolve().parent
+    marker = "# maj-scripts slverse PATH (added by 'slverse setup')"
+    profile = Path.home() / ".profile"
+    existing = profile.read_text() if profile.exists() else ""
+    if marker in existing or profile_already_has_dir(existing, script_dir):
+        print(f"{profile} already has slverse's folder on PATH.")
+        return
+    block = (
+        f'\n{marker}\n'
+        f'set_dir="{script_dir}"\n'
+        f'if [ -d "$set_dir" ] ; then\n'
+        f'    PATH="$set_dir:$PATH"\n'
+        f'fi\n'
+    )
+    with open(profile, "a") as f:
+        f.write(block)
+    print(f"Added slverse's folder to PATH via {profile}.")
+    print("Run 'source ~/.profile' or open a new terminal for it to take effect.")
+
+# --- API & Network ---
+def fetch_json(url):
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return None
+
+def get_pub_media_links(lang, booknum=None):
+    url = f"https://b.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS?output=json&pub=nwt&fileformat=MP4%2CM4V&alllangs=0&langwritten={lang}&txtCMSLang={lang}"
+    if booknum:
+        url += f"&booknum={booknum}"
+    return fetch_json(url)
+
+def get_bible_metadata(lang_code):
+    lc = "en" if lang_code == "E" else lang_code.lower()
+    url = f"https://www.jw.org/{lc}/library/bible/study-bible/books/json/"
+    return fetch_json(url)
+
+def list_all_sign_languages():
+    data = fetch_json("https://data.jw-api.org/mediator/v1/languages/E/all")
+    if not data:
+        return []
+    return [l["code"] for l in data.get("languages", []) if l.get("isSignLanguage")]
+
+def _progress_bar(frac, width=30):
+    filled = int(width * max(0.0, min(1.0, frac)))
+    return "#" * filled + "-" * (width - filled)
+
+def print_progress(downloaded, total, width=30):
+    """Minimal single-line progress bar, redrawn in place via \\r - used for
+    downloads (RIFE's zip, chapter videos) big enough that silence for tens
+    of seconds would otherwise look hung."""
+    if total:
+        frac = downloaded / total
+        sys.stdout.write(f"\r[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({downloaded/1e6:.1f}/{total/1e6:.1f} MB)")
+    else:
+        sys.stdout.write(f"\r{downloaded/1e6:.1f} MB downloaded")
+    sys.stdout.flush()
+
+def print_time_progress(current_s, total_s, label="", width=30):
+    """Same bar, driven by seconds-of-output-encoded-so-far instead of
+    bytes - for ffmpeg's own -progress pipe (see run_ffmpeg)."""
+    frac = (current_s / total_s) if total_s else 0.0
+    prefix = f"{label} " if label else ""
+    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current_s:.1f}/{total_s:.1f}s)")
+    sys.stdout.flush()
+
+def print_count_progress(current, total, label="", width=30):
+    """Same bar, driven by a plain item count (e.g. frames written) - for
+    steps with no time-based progress signal, like the RIFE binary."""
+    frac = (current / total) if total else 0.0
+    prefix = f"{label} " if label else ""
+    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current}/{total} frames)")
+    sys.stdout.flush()
+
+def download_file(url, output_path, expected_checksum=None):
+    tmp_path = Path(str(output_path) + ".part")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            print(f"Downloading {url}...")
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_path, "wb") as f:
+                total = int(resp.headers.get("Content-Length") or 0)
+                downloaded = 0
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    print_progress(downloaded, total)
+                print()
+            if expected_checksum:
+                digest = hashlib.md5(tmp_path.read_bytes()).hexdigest()
+                if digest != expected_checksum:
+                    raise ValueError(f"checksum mismatch (got {digest}, expected {expected_checksum})")
+            os.replace(tmp_path, output_path)
+            print("Download complete.")
+            return True
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            print(f"Download attempt {attempt} failed: {e}")
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+    return False
+
+# --- Cache management ---
+def note_cache_use(state, path):
+    state.setdefault("_cache_access", {})[str(path)] = time.time()
+
+def enforce_cache_budget(config, state, protect=None):
+    if config.get("cache_policy") != "lru":
+        return
+    try:
+        max_gb = float(config.get("cache_max_gb", DEFAULT_CONFIG["cache_max_gb"]))
+    except ValueError:
+        return
+    cache_dir = Path(config["cache_dir"])
+    if not cache_dir.exists():
+        return
+    budget_bytes = max_gb * (1024 ** 3)
+    access_map = state.setdefault("_cache_access", {})
+
+    files = []
+    total = 0
+    for p in cache_dir.rglob("*"):
+        if p.is_file():
+            size = p.stat().st_size
+            total += size
+            last_used = access_map.get(str(p), p.stat().st_mtime)
+            files.append((p, size, last_used))
+
+    if total <= budget_bytes:
+        return
+
+    files.sort(key=lambda f: f[2])  # oldest-used first
+    protect_path = Path(protect).resolve() if protect else None
+    for path, size, _ in files:
+        if total <= budget_bytes:
+            break
+        if protect_path and path.resolve() == protect_path:
+            continue
+        try:
+            path.unlink()
+            access_map.pop(str(path), None)
+            total -= size
+            print(f"Cache trim: removed {path.name} ({size/1e6:.1f} MB) to stay under {max_gb}GB.")
+        except OSError:
+            pass
+    # Mutates state in place; the caller is responsible for save_state(), the
+    # same as every other function that touches state — this must never
+    # persist on its own, since a caller can pass a throwaway dict (tests do)
+    # and save_state() always writes to the one real on-disk state.json.
+
+def cache_dir_size(cache_dir):
+    total = 0
+    if Path(cache_dir).exists():
+        for p in Path(cache_dir).rglob("*"):
+            if p.is_file():
+                total += p.stat().st_size
+    return total
+
+# --- Video Processing ---
+def run_ffmpeg(args, duration=None, slow_after=4.0):
+    """Runs ffmpeg. Most extract/interpolate steps finish in a few seconds
+    and stay quiet; pass `duration` (expected output seconds, known by the
+    caller from the verse's own start/end times) to show a minimal live
+    progress bar once a run has actually taken longer than `slow_after`
+    seconds, instead of going silent on a genuinely slow one (a long clip,
+    a CPU-bound filter)."""
+    base = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y"]
+    print()
+    print(f"Running: {' '.join(base + args)}")
+
+    if not duration:
+        subprocess.run(base + args, check=True)
+        return
+
+    cmd = base + ["-progress", "pipe:1", "-nostats"] + args
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    start = time.time()
+    shown = False
+    for line in proc.stdout:
+        line = line.strip()
+        if not line.startswith("out_time="):
+            continue
+        try:
+            current = parse_hms(line.split("=", 1)[1])
+        except ValueError:
+            continue
+        if not shown and time.time() - start > slow_after:
+            shown = True
+        if shown:
+            print_time_progress(current, duration, label="Encoding")
+    proc.stdout.close()
+    proc.wait()
+    if shown:
+        print()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+def nvenc_quality_from_crf(crf):
+    # nvenc has no crf; -cq on the same 0-51 scale is the closest analogue.
+    return crf
+
+def videotoolbox_quality_from_crf(crf):
+    # videotoolbox has no crf; -q:v is a 0-100 "higher is better" scale with
+    # no fixed formula, so this is a rough inverse mapping, not an exact
+    # match. The previous "100 - crf*3" curve put crf 20 (a fairly
+    # high-quality setting) at q:v 40 - visibly blocky, since 40 sits in
+    # videotoolbox's mediocre-quality range. A flat "100 - crf" keeps crf 20
+    # at q:v 80, much closer to what -crf 20 -preset slow actually looks
+    # like on libx264.
+    try:
+        crf_val = float(crf)
+    except ValueError:
+        crf_val = 20
+    return max(1, min(100, round(100 - crf_val)))
+
+def build_encode_args(config):
+    hw = config.get("hardware_encoder", "cpu")
+    codec = config.get("video_codec", "h264")
+    crf = config.get("video_crf", "20")
+    preset = config.get("video_preset", "slow")
+
+    if hw == "nvenc":
+        vcodec = {"hevc": "hevc_nvenc", "av1": "av1_nvenc"}.get(codec, "h264_nvenc")
+        args = ["-c:v", vcodec, "-preset", preset, "-cq", str(nvenc_quality_from_crf(crf))]
+    elif hw == "videotoolbox":
+        vcodec = "hevc_videotoolbox" if codec == "hevc" else "h264_videotoolbox"
+        args = ["-c:v", vcodec, "-q:v", str(videotoolbox_quality_from_crf(crf))]
+    elif hw == "qsv":
+        vcodec = "hevc_qsv" if codec == "hevc" else "h264_qsv"
+        args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
+    else:
+        vcodec = {"hevc": "libx265", "av1": "libsvtav1"}.get(codec, "libx264")
+        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", preset]
+
+    return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+
+def google_fonts_ttf_url(family, weight):
+    """Resolve the current .ttf URL for a Google Fonts family/weight by
+    reading the same CSS2 endpoint a browser would
+    (fonts.googleapis.com/css2?family=...&wght@N) and pulling the url(...)
+    out of the returned @font-face rule. A plain 'Mozilla/5.0' UA (no
+    modern Accept/Sec-CH-UA hints) gets served a .ttf instead of .woff2 -
+    verified live for Noto Sans Display, Inter, and Google Sans Flex."""
+    css_url = f"https://fonts.googleapis.com/css2?family={urllib.parse.quote(family)}:wght@{weight}&display=swap"
+    try:
+        req = urllib.request.Request(css_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            css = resp.read().decode('utf-8')
+    except Exception as e:
+        print(f"Error fetching Google Fonts CSS for {family} {weight}: {e}")
+        return None
+    match = re.search(r"url\((https://fonts\.gstatic\.com/[^)]+\.ttf)\)", css)
+    return match.group(1) if match else None
+
+def ensure_font(family_key, weight):
+    """Auto-download one weight of a configured font family into
+    CONFIG_DIR/fonts/ the first time it's needed, so a fresh machine gets
+    working overlay typography without a manual font install step. Returns
+    the local Path, or None if it's not already there and the download
+    failed (callers fall back to fontconfig's default font)."""
+    family = FONT_FAMILIES.get(family_key)
+    if not family:
+        return None
+    path = FONT_DIR / f"{family_key}-{weight}.ttf"
+    if path.exists():
+        return path
+    url = google_fonts_ttf_url(family, weight)
+    if not url:
+        return None
+    FONT_DIR.mkdir(parents=True, exist_ok=True)
+    if download_file(url, path):
+        return path
+    return None
+
+def resolve_font_paths(config):
+    """(main drawtext font, estimator font) - config font_path is a full
+    manual override (same file used for both); otherwise font_family (see
+    FONT_FAMILIES) picks which family to auto-download. The estimator (a
+    lighter weight, used purely to *measure* how big the source video's own
+    burned-in caption roughly is for delogo auto-sizing - see
+    build_overlay_filter) falls back to the main font if its own download
+    fails."""
+    configured = config.get("font_path")
+    if configured and os.path.exists(configured):
+        return Path(configured), Path(configured)
+
+    family_key = (config.get("font_family") or DEFAULT_CONFIG["font_family"]).strip().lower()
+    if family_key not in FONT_FAMILIES:
+        family_key = "noto-sans-display"
+    main_font = ensure_font(family_key, FONT_MAIN_WEIGHT)
+    estimator_font = ensure_font(family_key, FONT_ESTIMATOR_WEIGHT) or main_font
+    return main_font, estimator_font
+
+def measure_text_size(text, font_path, fontsize):
+    """Pixel (width, height) `text` renders at when drawn with `font_path`
+    at `fontsize` - used to auto-size the delogo box instead of the manual
+    per-verse pixel offsets old ffv needed (-w/-t). Shells out to
+    ImageMagick, the same way old ffv measured this; falls back to a rough
+    character-count heuristic if ImageMagick isn't installed, so overlays
+    still work, just with a less precisely fitted box."""
+    if command_exists("magick") and command_exists("identify"):
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                img_path = Path(tmp_dir) / "measure.png"
+                cmd = ["magick", "-background", "none", "-fill", "black"]
+                if font_path:
+                    cmd += ["-font", str(font_path)]
+                cmd += ["-pointsize", str(fontsize), f"label:{text}", str(img_path)]
+                subprocess.run(cmd, check=True, capture_output=True)
+                result = subprocess.run(["identify", "-format", "%w %h", str(img_path)], check=True, capture_output=True, text=True)
+                w, h = result.stdout.split()
+                return int(w), int(h)
+        except Exception:
+            pass
+    return round(len(text) * fontsize * 0.55), round(fontsize * 1.3)
+
+def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box):
+    """delogo (blur out the source video's own burned-in reference caption)
+    + drawtext (the correct reference, in the caption position old ffv
+    used) + a small label of which sign language this clip came from -
+    mirrors old ffv's generate_filters(). Returns None when `lang` is the
+    configured default_target_lang: that language's own burned-in caption
+    is already correct, so no overlay is needed at all (old ffv's
+    `if [ "${ll}" = "${lang_tr}" ]` early-out - skip delogo/drawtext
+    entirely rather than draw a second caption on top of the first).
+
+    `show_box` draws the delogo rectangle as a visible outline instead of
+    actually blurring it (ffmpeg delogo's own show=1 debug mode) - used for
+    preview so you can see where the box lands before writing anything.
+    """
+    target_lang = (config.get("default_target_lang") or "").strip().upper()
+    if target_lang and lang.upper() == target_lang:
+        return None
+
+    main_font, estimator_font = resolve_font_paths(config)
+    x = int(config.get("overlay_x", DEFAULT_CONFIG["overlay_x"]))
+    y = int(config.get("overlay_y", DEFAULT_CONFIG["overlay_y"]))
+    fontsize = int(config.get("overlay_fontsize", DEFAULT_CONFIG["overlay_fontsize"]))
+    alpha = config.get("overlay_alpha", DEFAULT_CONFIG["overlay_alpha"])
+    label_alpha = config.get("overlay_source_label_alpha", DEFAULT_CONFIG["overlay_source_label_alpha"])
+    width_pad = int(config.get("delogo_width_pad", DEFAULT_CONFIG["delogo_width_pad"]))
+    height_pad = int(config.get("delogo_height_pad", DEFAULT_CONFIG["delogo_height_pad"]))
+
+    label_text = f"{book_name} {chapter}:{verse_label}"
+    # The estimator font approximates the source video's own burned-in
+    # caption closely enough to auto-size the delogo box without per-verse
+    # manual pixel offsets.
+    w, h = measure_text_size(label_text, estimator_font, fontsize)
+
+    def esc(text):
+        return text.replace(":", "\\:").replace("'", "\\'")
+
+    font_arg = f":fontfile='{main_font}'" if main_font else ""
+    show = 1 if show_box else 0
+    delogo = f"delogo=x={x - 5}:y={y - 5}:w={w + 10 + width_pad}:h={h + 5 + height_pad}:show={show}"
+    drawtext = f"drawtext=text='{esc(label_text)}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y}:alpha={alpha}"
+    drawtext_ll = f"drawtext=text='{lang.upper()}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y + h - 5}:alpha={label_alpha}"
+    return f"{delogo},{drawtext},{drawtext_ll}"
+
+def preview_verse(source, start_time, end_time, book_name, chapter, verse_label, lang, config, use_mpv=False):
+    """Default 'slverse extract' behavior (no --write): play the verse with
+    its overlay applied live - including a visible box where delogo would
+    remove the source caption - without writing anything to disk. Mirrors
+    old ffv's play_video(): ffplay applies -vf directly against the stream
+    (fastest - no encode at all), while mpv can't take -vf on a remote/
+    local source directly, so --play/-m instead makes a quick ultrafast
+    temp clip first, the same tradeoff the old script made."""
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True)
+    duration = end_time - start_time
+
+    if use_mpv:
+        if not command_exists("mpv"):
+            print("(--play needs mpv, which isn't installed - falling back to ffplay)")
+        else:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_out = Path(tmp_dir) / "preview.mkv"
+                cmd = ["-ss", str(start_time), "-t", str(duration), "-i", str(source)]
+                if overlay:
+                    cmd += ["-vf", overlay]
+                cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "copy", "-f", "matroska", str(tmp_out)]
+                run_ffmpeg(cmd, duration=duration)
+                launch_mpv([str(tmp_out)])
+            return
+
+    ffplay_args = ["-ss", str(start_time), "-t", str(duration), "-i", str(source)]
+    if overlay:
+        ffplay_args += ["-vf", overlay]
+    print()
+    print(f"Previewing (nothing written - pass --write/-f to save): {FFPLAY_BIN} {' '.join(ffplay_args)}")
+    launch_ffplay(ffplay_args)
+
+def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False):
+    """Single-pass: trim + overlay + (for framerate/minterpolate) the fps
+    filter all happen in ONE ffmpeg encode, straight from `source`. Used to
+    be two full lossy re-encode generations (extract-with-overlay, then a
+    second pass just to add the fps filter) - now it's one, for every
+    engine except rife, which has an unavoidable one-lossy-generation
+    minimum of its own (see ffrife.interpolate: PNG extraction and RIFE
+    itself are lossless, only the final merge encodes)."""
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False)
+    engine = config.get("interpolation_engine", "none")
+    duration = end_time - start_time
+
+    if engine == "rife":
+        ffrife = load_ffrife()
+        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=overlay, fps=60)
+        return
+
+    vf_chain = list(filter(None, [overlay]))
+    if engine == "minterpolate":
+        print()
+        print("Interpolating using ffmpeg minterpolate...")
+        vf_chain.append("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+    elif engine == "framerate":
+        print()
+        print("Interpolating using ffmpeg framerate...")
+        vf_chain.append("framerate=fps=60")
+
+    # -ss before -i does an input-side seek; on a remote URL that means the
+    # CDN is only asked for bytes from roughly that point on, which is what
+    # keeps onthefly mode from pulling the whole chapter over the network.
+    cmd = ["-ss", str(start_time), "-to", str(end_time), "-i", str(source)]
+    if vf_chain:
+        cmd += ["-vf", ",".join(vf_chain)]
+    cmd += ["-c:a", "copy"] + build_encode_args(config) + [str(output_file)]
+    run_ffmpeg(cmd, duration=duration)
+
+def parse_speed(value):
+    """Accepts whatever notation is most natural to type: a plain decimal
+    (0.5, 2.5), a fraction (1/3), or a percentage (40%, 150%) - same
+    notation ffrife's own --speed takes (kept as a small standalone copy
+    here rather than importing ffrife just for this, since that would
+    force-load the sibling script on every slverse invocation instead of only
+    ones that actually touch --slow/--fast/rife)."""
+    s = str(value).strip()
+    if s.endswith("%"):
+        return float(s[:-1]) / 100
+    if "/" in s:
+        num, den = s.split("/", 1)
+        return float(num) / float(den)
+    return float(s)
+
+def probe_source_fps(source):
+    """ffprobe's r_frame_rate comes back as an 'N/D' fraction (e.g.
+    '30000/1001'), not a plain float. Used to size ffrife's merge fps for
+    --slow sections: RIFE always exactly doubles frame count, so requesting
+    2x source fps keeps the pre-retime frame set at the source's original
+    duration - the only fps value that keeps final output duration correct
+    for any --speed (see extract_verse_sections)."""
+    cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(source)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return float(Fraction(result.stdout.strip()))
+
+def build_sectioned_filter_complex(boundaries, speed, mode, base_label):
+    """Builds a filter_complex that trims [0:v] (or `base_label`, if an
+    ffmpeg-filter interpolation engine already ran on it) into N alternating
+    normal/retimed sections at `boundaries` (seconds, relative to whatever
+    window the caller already trimmed to via -ss/-to), then concats them -
+    all in one pass. 'slow' retimes the even sections (2nd, 4th, ...),
+    'fast' the odd ones (1st, 3rd, ...) - the same alternating pattern (and
+    parity per direction) as the standalone ffslow/fffast tools. Returns
+    (filter_complex_str, output_label)."""
+    n = len(boundaries) + 1
+    fc = ""
+    labels = []
+    for i in range(1, n + 1):
+        if i == 1:
+            fc += f"{base_label}trim=0:{boundaries[0]},setpts=PTS-STARTPTS[v{i}];"
+        elif i == n:
+            fc += f"{base_label}trim=start={boundaries[i - 2]},setpts=PTS-STARTPTS[v{i}];"
+        else:
+            fc += f"{base_label}trim={boundaries[i - 2]}:{boundaries[i - 1]},setpts=PTS-STARTPTS[v{i}];"
+        retime = (i % 2 == 0) if mode == "slow" else (i % 2 == 1)
+        if retime:
+            fc += f"[v{i}]setpts=PTS/{speed:.6g}[r{i}];"
+            labels.append(f"r{i}")
+        else:
+            labels.append(f"v{i}")
+    fc += "".join(f"[{l}]" for l in labels) + f"concat=n={n}:v=1:a=0[out]"
+    return fc, "[out]"
+
+def extract_verse_sections(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, mode, boundaries, speed):
+    """--slow/--fast: split the verse window at `boundaries` (seconds,
+    relative to the verse's own start) into alternating normal/retimed
+    sections at `speed` - ported from the standalone ffslow/fffast tools'
+    own section handling (see build_sectioned_filter_complex). Like those
+    tools, the sectioned output is video-only: the concat step only carries
+    a video stream (mixing RIFE'd and plain-trimmed pieces, or applying
+    setpts to only half the timeline, leaves no single consistent audio
+    track to carry through) - the single-window extract_verse path above
+    still keeps audio."""
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False)
+    engine = config.get("interpolation_engine", "none")
+    duration = end_time - start_time
+
+    if mode == "slow" and engine == "rife":
+        ffrife = load_ffrife()
+        ffrife_config = ffrife_config_for(config)
+        n = len(boundaries) + 1
+        abs_bounds = [start_time + b for b in boundaries]
+        starts = [start_time] + abs_bounds
+        ends = abs_bounds + [end_time]
+        source_fps = None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pieces = []
+            for i in range(n):
+                seg_start, seg_end = starts[i], ends[i]
+                piece = Path(tmp_dir) / f"piece_{i}.mp4"
+                pieces.append(piece)
+                if (i + 1) % 2 == 0:
+                    # Slow section: RIFE + retime, one merge encode (see
+                    # ffrife.interpolate's `speed` param).
+                    if source_fps is None:
+                        source_fps = probe_source_fps(source)
+                    ffrife.interpolate(source, piece, ffrife_config, start=seg_start, end=seg_end, vf=None, fps=source_fps * 2, speed=speed)
+                else:
+                    # Normal-speed section: plain cut, no interpolation needed.
+                    cmd = ["-ss", str(seg_start), "-to", str(seg_end), "-i", str(source), "-c:a", "copy"] + build_encode_args(config) + [str(piece)]
+                    run_ffmpeg(cmd, duration=seg_end - seg_start)
+
+            # concat *filter*, not the concat demuxer/-c copy: pieces have
+            # different internal frame rates (normal pieces at source fps,
+            # RIFE'd pieces at source_fps*2), and stream-copy concat doesn't
+            # reconcile that - see ffslow's own version of this comment.
+            concat_inputs = []
+            concat_filter = ""
+            for i, piece in enumerate(pieces):
+                concat_inputs += ["-i", str(piece)]
+                concat_filter += f"[{i}:v]"
+            concat_filter += f"concat=n={n}:v=1:a=0[out]"
+            map_label = "[out]"
+            if overlay:
+                concat_filter += f";[out]{overlay}[final]"
+                map_label = "[final]"
+            cmd = concat_inputs + ["-filter_complex", concat_filter, "-map", map_label] + build_encode_args(config) + [str(output_file)]
+            run_ffmpeg(cmd, duration=duration)
+        return
+
+    base_label = "[0:v]"
+    prefix = ""
+    if mode == "slow" and engine == "minterpolate":
+        print()
+        print("Interpolating using ffmpeg minterpolate...")
+        prefix = "[0:v]minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1[base];"
+        base_label = "[base]"
+    elif mode == "slow" and engine == "framerate":
+        print()
+        print("Interpolating using ffmpeg framerate...")
+        prefix = "[0:v]framerate=fps=60[base];"
+        base_label = "[base]"
+
+    fc, out_label = build_sectioned_filter_complex(boundaries, speed, mode, base_label)
+    fc = prefix + fc
+    map_label = out_label
+    if overlay:
+        fc += f";{out_label}{overlay}[final]"
+        map_label = "[final]"
+
+    # -ss/-to before -i: same input-side seek extract_verse uses, so
+    # `boundaries` stay relative to the verse's own start (0) rather than
+    # needing the caller to add start_time to each one.
+    cmd = ["-ss", str(start_time), "-to", str(end_time), "-i", str(source), "-filter_complex", fc, "-map", map_label]
+    cmd += build_encode_args(config) + [str(output_file)]
+    run_ffmpeg(cmd, duration=duration)
+
+def expand_verses(verses_str):
+    """'1, 2' / '1-3' / '1-3,5' -> sorted unique ints. Shared by parse_reference
+    (extract's free-form reference string) and cmd_find's verse argument
+    (which also accepts a single verse or a range/list, not just one int)."""
+    verses = []
+    for part in verses_str.replace(" ", "").split(","):
+        if "-" in part:
+            start, end = part.split("-")
+            verses.extend(list(range(int(start), int(end) + 1)))
+        else:
+            verses.append(int(part))
+    return sorted(set(verses))
+
+def format_verses_label(verses):
+    """Sorted unique ints -> a compact display string: '11', '11-13', or
+    '11,13,15' for a non-contiguous list. Used for log/print output only -
+    printing a raw list gives 'Psalm 16:[11]', which is what the readability
+    complaint about slverse's logs was pointing at."""
+    if not verses:
+        return ""
+    if len(verses) == 1:
+        return str(verses[0])
+    if verses == list(range(verses[0], verses[-1] + 1)):
+        return f"{verses[0]}-{verses[-1]}"
+    return ",".join(str(v) for v in verses)
+
+def parse_reference(ref_str):
+    match = re.match(r"(.+?)\s+(\d+):(.+)", ref_str)
+    if not match:
+        return None, None, []
+    book, chapter, verses_str = match.groups()
+    return book.strip(), int(chapter), expand_verses(verses_str)
+
+def parse_hms(ts):
+    """'HH:MM:SS.mmm' -> float seconds, as returned by GETPUBMEDIALINKS markers."""
+    parts = ts.split(":")
+    h, m, s = (["0", "0"] + parts)[-3:]
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+def markers_to_verse_times(markers):
+    """Verse-level timestamps come straight from JW's own API metadata
+    (GETPUBMEDIALINKS ... &booknum=N already returns per-verse markers), so
+    there's no need to download the video and ffprobe its embedded chapters
+    just to find out where a verse starts."""
+    result = {}
+    for m in markers or []:
+        try:
+            v = int(m["verseNumber"])
+            start = parse_hms(m["startTime"])
+            dur = parse_hms(m["duration"])
+            result[v] = {"start": start, "end": start + dur, "label": m.get("label", "")}
+        except (KeyError, ValueError, TypeError):
+            continue
+    return result
+
+def get_chapter_timestamps_ffprobe(input_file):
+    """Fallback for videos cached before marker storage existed, or any file
+    without markers available from the API."""
+    cmd = [FFPROBE_BIN, "-hide_banner", "-loglevel", "quiet", "-show_chapters", "-print_format", "json", str(input_file)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        chapters = {}
+        for ch in data.get("chapters", []):
+            title = ch.get("tags", {}).get("title", "")
+            parts = title.strip().split(":")
+            verse_num = parts[-1] if parts else title.strip()
+            try:
+                verse = int(re.sub(r'[^0-9]', '', verse_num))
+                chapters[verse] = {"start": float(ch["start_time"]), "end": float(ch["end_time"])}
+            except (KeyError, ValueError, TypeError):
+                pass
+        return chapters
+    except Exception as e:
+        print(f"Error reading chapters: {e}")
+        return {}
+
+def resolve_book_number(book_name, lang="E", state=None):
+    """Book names/numbers are static, so the study-bible metadata (one
+    network call per language) is cached in state.json instead of being
+    re-fetched on every extract/find."""
+    if book_name.isdigit():
+        return int(book_name)
+
+    metadata = state.get("_book_metadata", {}).get(lang) if state is not None else None
+    if metadata is None:
+        metadata = get_bible_metadata(lang)
+        if metadata is not None and state is not None:
+            state.setdefault("_book_metadata", {})[lang] = metadata
+    if not metadata:
+        return None
+    for b_id, b_data in metadata.get("editionData", {}).get("books", {}).items():
+        if book_name.lower() in b_data.get("standardSingularBookName", "").lower():
+            return int(b_id)
+        if book_name.lower() in b_data.get("officialAbbreviation", "").lower():
+            return int(b_id)
+    return None
+
+def verse_markers(file):
+    """GETPUBMEDIALINKS wraps the per-verse marker list in a dict alongside
+    book/chapter metadata: file['markers'] = {..., 'markers': [...]}."""
+    wrapper = file.get("markers")
+    if isinstance(wrapper, dict):
+        return wrapper.get("markers", []) or []
+    return []
+
+def find_track(data, lang, chapter):
+    for fmt in ("MP4", "M4V"):
+        for file in data.get("files", {}).get(lang, {}).get(fmt, []):
+            if file.get("label") == "720p" and file.get("track") == chapter:
+                return file
+    return None
+
+def index_book(lang, n):
+    """One language/book worth of index entries: {key: entry}."""
+    data = get_pub_media_links(lang, n)
+    if not data:
+        return {}
+    entries = {}
+    for fmt in ("MP4", "M4V"):
+        for file in data.get("files", {}).get(lang, {}).get(fmt, []):
+            if file.get("label") != "720p":
+                continue
+            url = file["file"]["url"]
+            checksum = file["file"]["checksum"]
+            booknum = file.get("booknum", n)
+            track = file.get("track")
+            key = f"{booknum}_{track}"
+            entries[key] = {
+                "url": url,
+                "checksum": checksum,
+                "book_num": booknum,
+                "chapter": track,
+                "markers": verse_markers(file),
+            }
+    return entries
+
+# --- Commands ---
+def cmd_setup(args, config):
+    if args.non_interactive:
+        setup_dependencies(config)
+        return
+
+    print("Let's get slverse set up. Press Enter to accept the suggested answer shown in [brackets].\n")
+    setup_dependencies(config)
+    jwlangs = load_jwlangs()
+
+    current = config.get("languages", DEFAULT_CONFIG["languages"])
+    print(f"\nCurrent language list: {', '.join(lang_display(c, jwlangs) for c in current.split(','))}")
+    ans = input(f"Which sign languages do you usually watch? Comma-separated codes (see https://www.jw.org/en/languages) [{current}]: ").strip()
+    if ans:
+        config["languages"] = ",".join(c.strip().upper() for c in ans.split(",") if c.strip())
+
+    ans = input(f"\nHow much disk space can slverse use to cache downloaded chapters, in GB? [{config.get('cache_max_gb', DEFAULT_CONFIG['cache_max_gb'])}]: ").strip()
+    if ans:
+        config["cache_max_gb"] = ans
+        config["cache_policy"] = "lru"
+
+    print("\n60fps playback options:")
+    print("  rife         - fastest and best quality, but needs a one-time download (uses your graphics card)")
+    print("  minterpolate - works right now with no extra download, but is slow (uses your processor)")
+    print("  none         - skip 60fps conversion")
+    ans = (input("Which one do you want? [rife]: ").strip().lower() or "rife")
+    if ans not in ("rife", "minterpolate", "framerate", "none"):
+        ans = "none"
+    config["interpolation_engine"] = ans
+    if ans == "rife":
+        # RIFE install/config lives entirely in the sibling ffrife tool
+        # (not JW-specific - see load_ffrife's docstring), so delegate to
+        # its own setup instead of duplicating the download logic here.
+        ffrife = load_ffrife()
+        ffrife.cmd_setup(ffrife.load_config())
+
+    hw = detect_hardware_encoder()
+    print(f"\nVideo encoder: {hw} (libx264 - measured smaller files at equal quality vs. GPU encoders for short clips;")
+    print("run 'slverse config set hardware_encoder videotoolbox' (or nvenc/qsv) if you'd rather trade file size for speed)")
+    config["hardware_encoder"] = hw
+
+    ans = input("\nAdd slverse to your PATH so you can type 'slverse' from any folder on this machine? [Y/n]: ").strip().lower()
+    if ans in ("", "y", "yes"):
+        add_to_path_profile()
+
+    save_config(config)
+    print("\nAll set. Run 'slverse config' anytime to see or change these settings.")
+    print("If you use slverse on more than one computer, run 'slverse setup' on each one — settings are per-machine.")
+
+def cmd_config(args, config):
+    if args.key and args.value:
+        config[args.key] = args.value
+        save_config(config)
+        print(f"Set {args.key} = {args.value}")
+    elif args.key:
+        print(f"{args.key} = {config.get(args.key)}")
+    else:
+        for k, v in config.items():
+            print(f"{k} = {v}")
+
+def cmd_langs(args, config):
+    jwlangs = load_jwlangs()
+    state = get_state()
+    meta = state.get("_meta", {})
+    print("Configured languages:")
+    for code in get_lang_list(config):
+        last = meta.get(code, {}).get("last_synced")
+        last_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "never synced"
+        print(f"  {lang_display(code, jwlangs):40} last synced: {last_str}")
+    if args.discover:
+        print("\nAll sign languages JW.org publishes NWT video in:")
+        for code in sorted(list_all_sign_languages()):
+            print(f"  {lang_display(code, jwlangs)}")
+
+def sync_one_lang(lang):
+    entries = {}
+    for n in range(1, 67):
+        entries.update(index_book(lang, n))
+        print(f"  {lang} book {n}: indexed", end="\r")
+    print(f"  {lang}: indexed {len(entries)} chapter(s) worth of tracks.       ")
+    return lang, entries
+
+def sync_languages(langs, config, state, quiet=False):
+    """Core of 'slverse sync', factored out so the auto-sync path (see
+    maybe_auto_sync) can reuse it without going through argparse. Mutates
+    `state` in place; caller owns save_state()."""
+    workers = int(config.get("sync_workers", DEFAULT_CONFIG["sync_workers"]) or 1)
+    printer = (lambda *a, **k: None) if quiet else print
+
+    printer(f"Syncing metadata for: {', '.join(langs)}")
+    results = {}
+    if len(langs) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for lang, entries in pool.map(sync_one_lang, langs):
+                results[lang] = entries
+    else:
+        lang, entries = sync_one_lang(langs[0])
+        results[lang] = entries
+
+    now = time.time()
+    for lang, entries in results.items():
+        existing = load_index(lang)
+        new_count = 0
+        for key, entry in entries.items():
+            prior = existing.get(key)
+            if not prior or prior.get("checksum") != entry["checksum"]:
+                entry["downloaded"] = prior.get("downloaded", False) if prior else False
+                existing[key] = entry
+                new_count += 1
+            else:
+                # keep markers/track fresh even when checksum matches
+                prior["markers"] = entry["markers"]
+        save_index(lang, existing)
+        state.setdefault("_meta", {}).setdefault(lang, {})["last_synced"] = now
+        printer(f"{lang}: {new_count} new/updated track(s).")
+
+def cmd_sync(args, config):
+    langs = get_lang_list(config, args.lang)
+    state = get_state()
+    sync_languages(langs, config, state)
+    save_state(state)
+
+def internet_available():
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request("https://b.jw-cdn.org", method="HEAD", headers={"User-Agent": "Mozilla/5.0"}),
+            timeout=3,
+        )
+        return True
+    except urllib.error.HTTPError:
+        # A real HTTP response (even an error status, e.g. this CDN 403s a
+        # bare root request) still proves the network path is up. Only
+        # connection-level failures (DNS, timeout, refused) mean "offline".
+        return True
+    except Exception:
+        return False
+
+def maybe_auto_sync(args, config):
+    """Once-a-day, best-effort background-ish refresh so non-technical users
+    get updated verse availability without ever running 'slverse sync'
+    themselves. Gated on a plain elapsed-time check (no network) on every
+    call, so the common case (already synced today) costs nothing."""
+    if getattr(args, "no_auto_sync", False):
+        return
+    if config.get("auto_sync", "true").strip().lower() not in ("true", "1", "yes"):
+        return
+
+    try:
+        interval_hours = float(config.get("auto_sync_interval_hours", DEFAULT_CONFIG["auto_sync_interval_hours"]))
+    except ValueError:
+        interval_hours = 24.0
+
+    state = get_state()
+    last_attempt = state.get("_auto_sync", {}).get("last_attempt", 0)
+    if time.time() - last_attempt < interval_hours * 3600:
+        return
+
+    # Mark the attempt regardless of outcome, so a flaky/offline connection
+    # doesn't retry (and pause) on every single command for the rest of the day.
+    state.setdefault("_auto_sync", {})["last_attempt"] = time.time()
+    save_state(state)
+
+    if not internet_available():
+        return
+
+    print("Checking for updated sign language availability (runs about once a day)...", file=sys.stderr)
+    langs = get_lang_list(config)
+    state = get_state()  # re-read: sync_languages below expects the latest on-disk state
+    sync_languages(langs, config, state, quiet=True)
+    save_state(state)
+
+def resolve_verse_window(lang, book_num, chapter, verses, config):
+    """Return (start, end, url, checksum, label) for a verse range, using the
+    saved per-language index when we have it and falling back to a live API
+    call (which also backfills the index) when we don't."""
+    key = f"{book_num}_{chapter}"
+    index = load_index(lang)
+    entry = index.get(key)
+
+    if not entry:
+        data = get_pub_media_links(lang, book_num)
+        if not data:
+            return None
+        file = find_track(data, lang, chapter)
+        if not file:
+            return None
+        entry = {
+            "url": file["file"]["url"],
+            "checksum": file["file"]["checksum"],
+            "book_num": book_num,
+            "chapter": chapter,
+            "markers": verse_markers(file),
+            "downloaded": False,
+        }
+        index[key] = entry
+        save_index(lang, index)
+
+    chapters_meta = markers_to_verse_times(entry.get("markers"))
+    valid_verses = [v for v in verses if v in chapters_meta]
+    if not valid_verses:
+        return None
+
+    start = chapters_meta[valid_verses[0]]["start"]
+    end = chapters_meta[valid_verses[-1]]["end"]
+    return start, end, entry["url"], entry.get("checksum"), valid_verses
+
+def resolve_retime_args(args, duration):
+    """Turn --slow/--fast's raw TIME strings into (mode, boundaries,
+    speed), validated against this window's actual `duration`. Returns
+    (None, None, None, None) when neither flag was passed. Boundaries are
+    seconds relative to the verse's own start (0), matching
+    extract_verse_sections."""
+    slow, fast, speed_arg = getattr(args, "slow", None), getattr(args, "fast", None), getattr(args, "speed", None)
+    if slow:
+        mode, raw = "slow", slow
+    elif fast:
+        mode, raw = "fast", fast
+    else:
+        return None, None, None, None
+
+    speed = speed_arg if speed_arg is not None else (0.5 if mode == "slow" else 3.0)
+    try:
+        boundaries = [parse_hms(t) for t in raw]
+    except ValueError:
+        return None, None, None, f"Could not parse --{mode} time(s): {raw}"
+    if boundaries != sorted(set(boundaries)) or any(b <= 0 or b >= duration for b in boundaries):
+        return None, None, None, f"--{mode} times must be strictly increasing and within (0, {duration:.2f}s) - got {raw}"
+    return mode, boundaries, speed, None
+
+def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state):
+    window = resolve_verse_window(lang, book_num, chapter, verses, config)
+    if not window:
+        return lang, None, f"Verses {verses} not found for {lang} (video may not exist for this chapter in this language yet)."
+    start_time, end_time, url, checksum, valid_verses = window
+    verses_str = format_verses_label(valid_verses)
+    out_filename = f"{book_name.replace(' ', '_')}_{chapter}_{'_'.join(map(str, valid_verses))}_{lang}.mp4"
+
+    if not args.write:
+        # Default: preview only, nothing written to disk - see preview_verse.
+        # Always plays straight from the source (remote URL or, if --cache
+        # was also passed, a locally cached chapter); no need for the
+        # cache/onthefly branching below since nothing is being encoded to
+        # keep.
+        preview_verse(url, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play)
+        return lang, None, None
+
+    mode, boundaries, speed, retime_error = resolve_retime_args(args, end_time - start_time)
+    if retime_error:
+        return lang, None, retime_error
+
+    if args.onthefly:
+        extract_mode = "onthefly"
+    elif args.cache:
+        extract_mode = "cache"
+    else:
+        extract_mode = config.get("extract_mode", DEFAULT_CONFIG["extract_mode"])
+
+    if extract_mode == "onthefly":
+        if mode:
+            extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed)
+        else:
+            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=True)
+    else:
+        cache_dir = Path(config["cache_dir"]) / lang
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        local_path = cache_dir / url.split("/")[-1]
+
+        if not local_path.exists():
+            if not download_file(url, local_path, expected_checksum=checksum):
+                return lang, None, f"Download failed for {lang} {book_name} {chapter}."
+        else:
+            print(f"[{lang}] Using cached video file.")
+
+        note_cache_use(state, local_path)
+        if mode:
+            extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed)
+        else:
+            extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False)
+
+        key = f"{book_num}_{chapter}"
+        index = load_index(lang)
+        index.setdefault(key, {})["downloaded"] = True
+        save_index(lang, index)
+
+        if config.get("cache_policy") == "delete_after_use":
+            os.remove(local_path)
+            state["_cache_access"].pop(str(local_path), None)
+            print(f"[{lang}] Cleaned up cached video file.")
+        else:
+            enforce_cache_budget(config, state, protect=local_path)
+
+    if args.play:
+        if command_exists("mpv"):
+            launch_mpv([out_filename])
+        else:
+            print(f"[{lang}] (--play needs mpv, which isn't installed)")
+
+    return lang, out_filename, None
+
+def cmd_extract(args, config):
+    langs = get_lang_list(config, args.lang) if (args.lang.lower() == "all" or "," in args.lang) else [args.lang.upper()]
+    ref = args.reference
+
+    book_name, chapter, verses = parse_reference(ref)
+    if not book_name:
+        print(f"Could not parse reference: {ref}. Use format 'Book Chapter:Verse(s)' (e.g., 'Rev 13:1, 2')")
+        return
+
+    state = get_state()
+    book_num = resolve_book_number(book_name, config.get("api_language", "E"), state=state)
+    if not book_num:
+        common = {"gen": 1, "ex": 2, "ps": 19, "psalms": 19, "prov": 20, "matt": 40, "rev": 66, "revelation": 66}
+        for k, v in common.items():
+            if k in book_name.lower():
+                book_num = v
+                break
+    if not book_num:
+        print(f"Could not resolve book number for {book_name}. Try the book number directly (e.g., '66 13:1, 2').")
+        return
+
+    if not args.write and len(langs) > 1:
+        print(f"Preview mode only plays one language at a time (got {', '.join(langs)}).")
+        print("Pass --write/-f to batch-export all of them, or give a single language to preview.")
+        return
+
+    if (args.slow or args.fast) and not args.write:
+        print("--slow/--fast need --write/-f (there's no live preview for sectioned retiming).")
+        return
+
+    verb = "Extracting" if args.write else "Previewing"
+    print(f"{verb} {book_name} {chapter}:{format_verses_label(verses)} for {', '.join(langs)}...")
+
+    results = []
+    if len(langs) > 1:
+        workers = int(config.get("extract_workers", DEFAULT_CONFIG["extract_workers"]) or 1)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(extract_one_lang, lang, book_name, book_num, chapter, verses, args, config, state) for lang in langs]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+    else:
+        results.append(extract_one_lang(langs[0], book_name, book_num, chapter, verses, args, config, state))
+
+    save_state(state)
+    print()
+    for lang, filename, error in results:
+        if error:
+            print(f"[{lang}] {error}")
+        elif filename:
+            print(f"[{lang}] Successfully created: {filename}")
+        else:
+            print(f"[{lang}] Preview finished (nothing written - pass --write/-f to save).")
+
+def cmd_find(args, config):
+    """Default output is a compact checkmark table grouped by language -
+    easiest to scan at a glance, and the format non-technical users actually
+    want. --verbose brings back the full URL/mpv-command block per match;
+    --json is for scripts (always the full lang x verse array, found or
+    not). 'verse' takes a single verse, a range (25-27), or a comma list,
+    the same syntax extract's reference string uses."""
+    state = get_state()
+    jwlangs = load_jwlangs()
+    book_num = resolve_book_number(args.book, config.get("api_language", "E"), state=state)
+    save_state(state)  # persist any newly-cached book-name metadata even if nothing matches below
+    if not book_num:
+        print(f"Could not resolve book: {args.book}")
+        return
+
+    try:
+        verses = expand_verses(args.verse)
+    except ValueError:
+        print(f"Could not parse verse(s): {args.verse}")
+        return
+
+    key = f"{book_num}_{args.chapter}"
+    results = []
+    for lang in synced_languages():
+        entry = load_index(lang).get(key)
+        times = markers_to_verse_times(entry.get("markers")) if entry else {}
+        jwentry = jwlangs.get(lang.upper())
+        for verse in verses:
+            marker = times.get(verse)
+            results.append({
+                "lang": lang,
+                "lang_name": jwentry[1] if jwentry else None,
+                "book": args.book,
+                "chapter": args.chapter,
+                "verse": verse,
+                "found": marker is not None,
+                "url": entry["url"] if (entry and marker) else None,
+                "start": marker["start"] if marker else None,
+                "end": marker["end"] if marker else None,
+                "label": marker.get("label") if marker else None,
+            })
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return
+
+    if not results:
+        print("No languages synced yet. Try 'slverse sync all' first.")
+        return
+    if not any(r["found"] for r in results):
+        verse_label = str(verses[0]) if len(verses) == 1 else f"{verses[0]}-{verses[-1]}"
+        print(f"No synced language has {args.book} {args.chapter}:{verse_label} yet.")
+        print("Try 'slverse sync all' first, or sync a specific language.")
+        return
+
+    by_lang = {}
+    for r in results:
+        by_lang.setdefault(r["lang"], []).append(r)
+
+    if args.verbose:
+        for lang, rows in by_lang.items():
+            found_rows = [r for r in rows if r["found"]]
+            if not found_rows:
+                continue
+            print(f"\n{lang_display(lang, jwlangs)}")
+            for r in found_rows:
+                print(f"  {r['label'] or ''}")
+                print(f"  {r['url']}")
+                start_str = f"{int(r['start']//3600):02d}:{int(r['start']%3600//60):02d}:{r['start']%60:06.3f}"
+                dur = r["end"] - r["start"]
+                print(f"  mpv --start={start_str} --length={dur:.3f} '{r['url']}'")
+    else:
+        for lang, rows in by_lang.items():
+            for r in rows:
+                mark = "✅" if r["found"] else "❌"
+                print(f"{mark} {lang_display(lang, jwlangs)} {r['book']} {r['chapter']}:{r['verse']}")
+            print()
+
+    if args.play:
+        if not command_exists("mpv"):
+            print("(--play needs mpv, which isn't installed)")
+        else:
+            for r in results:
+                if not r["found"]:
+                    continue
+                start_str = f"{int(r['start']//3600):02d}:{int(r['start']%3600//60):02d}:{r['start']%60:06.3f}"
+                dur = r["end"] - r["start"]
+                launch_mpv([f"--start={start_str}", f"--length={dur:.3f}", r["url"]], wait=False)
+
+def cmd_cache(args, config):
+    state = get_state()
+    cache_dir = Path(config["cache_dir"])
+
+    if args.action == "clean":
+        target = cache_dir / args.lang.upper() if args.lang else cache_dir
+        if target.exists():
+            shutil.rmtree(target)
+            print(f"Cache cleared: {target}")
+        else:
+            print("Nothing to clear.")
+        return
+
+    if args.action == "trim":
+        enforce_cache_budget(config, state)
+        save_state(state)
+        return
+
+    if args.action == "list":
+        if not cache_dir.exists():
+            print("Cache is empty.")
+            return
+        total = 0
+        for lang_dir in sorted(cache_dir.iterdir()):
+            if not lang_dir.is_dir():
+                continue
+            size = cache_dir_size(lang_dir)
+            total += size
+            print(f"  {lang_dir.name:8} {size/1e6:8.1f} MB")
+        max_gb = config.get("cache_max_gb", DEFAULT_CONFIG["cache_max_gb"])
+        print(f"Total: {total/1e9:.2f} GB (cap: {max_gb} GB, policy: {config.get('cache_policy')})")
+
+def parse_book_range(spec):
+    if not spec or spec.lower() == "all":
+        return set(range(1, 67))
+    result = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            result.update(range(int(a), int(b) + 1))
+        else:
+            result.add(int(part))
+    return result
+
+def bulk_one_lang(lang, books, args, config):
+    index = load_index(lang)
+    if not index:
+        print(f"[{lang}] not synced yet — syncing first...")
+        _, entries = sync_one_lang(lang)
+        save_index(lang, entries)
+        index = entries
+
+    targets = sorted(
+        (e["book_num"], e["chapter"], e) for e in index.values() if e.get("book_num") in books
+    )
+    if not targets:
+        print(f"[{lang}] nothing to do for the requested book range.")
+        return
+
+    out_dir = Path(args.out) if args.out else Path(config["cache_dir"]) / "bulk" / lang
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[{lang}] processing {len(targets)} chapter(s) into {out_dir}...")
+
+    engine = config.get("interpolation_engine", "none") if args.interpolate else "none"
+    bulk_config = dict(config, interpolation_engine=engine)
+
+    for book_num, chapter, entry in targets:
+        out_file = out_dir / f"{lang}_{book_num:02d}_{chapter:02d}.mp4"
+        if out_file.exists() and not args.overwrite:
+            continue
+
+        chapter_times = markers_to_verse_times(entry.get("markers"))
+        duration = max((v["end"] for v in chapter_times.values()), default=None) if chapter_times else None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_download = Path(tmp_dir) / "chapter.mp4"
+            if not download_file(entry["url"], tmp_download, expected_checksum=entry.get("checksum")):
+                print(f"[{lang}] {book_num}_{chapter}: download failed, skipping.")
+                continue
+            if engine == "none":
+                shutil.copy(tmp_download, out_file)
+            elif engine == "rife":
+                ffrife = load_ffrife()
+                ffrife.interpolate(str(tmp_download), str(out_file), ffrife_config_for(bulk_config), fps=60)
+            else:
+                minterp = "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1" if engine == "minterpolate" else "framerate=fps=60"
+                run_ffmpeg(["-i", str(tmp_download), "-vf", minterp, "-c:a", "copy"] + build_encode_args(bulk_config) + [str(out_file)], duration=duration)
+        print(f"[{lang}] {book_num}_{chapter}: done.")
+
+    print(f"[{lang}] bulk complete.")
+
+def cmd_bulk(args, config):
+    langs = get_lang_list(config, args.lang) if (args.lang.lower() == "all" or "," in args.lang) else [args.lang.upper()]
+    books = parse_book_range(args.books)
+    workers = int(config.get("sync_workers", DEFAULT_CONFIG["sync_workers"]) or 1)
+
+    if len(langs) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda lang: bulk_one_lang(lang, books, args, config), langs))
+    else:
+        bulk_one_lang(langs[0], books, args, config)
+
+# --- Main ---
+def main():
+    migrate_legacy_config_dir()
+    parser = argparse.ArgumentParser(description="slverse - JW Sign Language Video Tool")
+    subparsers = parser.add_subparsers(dest="command")
+
+    p_setup = subparsers.add_parser("setup", help="Interactive first-run setup (dependencies, languages, cache, 60fps, PATH)")
+    p_setup.add_argument("--non-interactive", action="store_true", help="Only install dependencies, skip the Q&A")
+
+    p_config = subparsers.add_parser("config", help="Manage configuration")
+    p_config.add_argument("action", choices=["set", "get", "list"], nargs="?", default="list")
+    p_config.add_argument("key", nargs="?")
+    p_config.add_argument("value", nargs="?")
+
+    p_langs = subparsers.add_parser("langs", help="Show configured languages and when each was last synced")
+    p_langs.add_argument("--discover", action="store_true", help="Also list every sign language JW.org publishes NWT video in")
+
+    p_sync = subparsers.add_parser("sync", help="Sync metadata (and verse markers) so extract can skip video downloads to look up timestamps")
+    p_sync.add_argument("lang", nargs="?", default="all", help="Sign language code, comma list, or 'all' for your configured list (default: all)")
+
+    p_extract = subparsers.add_parser("extract", help="Extract and overlay verses from a chapter")
+    p_extract.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
+    p_extract.add_argument("reference", help="Bible reference (e.g., 'Rev 13:1, 2')")
+    p_extract.add_argument("-f", "--write", action="store_true", help="Encode and save the output file. Default is preview-only: play the verse with its overlay (delogo box shown, not applied) and write nothing.")
+    p_extract.add_argument("-m", "--play", action="store_true", help="With --write, also play the finished file via mpv. Without --write, preview via mpv instead of ffplay.")
+    p_extract.add_argument("--interpolate", action="store_true", help="Force interpolation on output")
+    p_extract.add_argument("--onthefly", action="store_true", help="Stream-extract from the source URL; never store the full chapter on disk (default)")
+    p_extract.add_argument("--cache", action="store_true", help="Download and keep the full chapter in the local cache instead of streaming on the fly")
+    p_extract.add_argument("--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
+    p_extract_retime = p_extract.add_mutually_exclusive_group()
+    p_extract_retime.add_argument("--slow", nargs="+", metavar="TIME", help="Split the verse at TIME(s) (seconds or HH:MM:SS, relative to the verse's own start) into alternating normal/slow sections (2nd, 4th, ... retimed). Needs --write. Video-only output (matches the standalone ffslow tool).")
+    p_extract_retime.add_argument("--fast", nargs="+", metavar="TIME", help="Same as --slow but alternating normal/fast sections (1st, 3rd, ... retimed) - matches the standalone fffast tool.")
+    p_extract.add_argument("--speed", type=parse_speed, metavar="N", help="Retime multiplier for --slow/--fast - decimal (0.5), fraction (1/3), or percent (150%%). Default: 0.5 for --slow, 3 for --fast.")
+
+    p_find = subparsers.add_parser("find", help="Search already-synced languages for who has a given verse")
+    p_find.add_argument("book", help="Book name or number")
+    p_find.add_argument("chapter", type=int)
+    p_find.add_argument("verse", help="Single verse, a range (25-27), or a comma list (1,3,5)")
+    p_find.add_argument("--play", action="store_true", help="Also stream-preview each match with mpv")
+    p_find.add_argument("-v", "--verbose", action="store_true", help="Show full match details (URL, mpv command) instead of the compact checkmark list")
+    p_find.add_argument("--json", action="store_true", help="Machine-readable JSON instead of the checkmark list (always includes every synced language, found or not)")
+    p_find.add_argument("--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
+
+    p_cache = subparsers.add_parser("cache", help="Manage cache")
+    p_cache.add_argument("action", choices=["clean", "list", "trim"])
+    p_cache.add_argument("--lang", help="Limit 'clean' to one language")
+
+    p_bulk = subparsers.add_parser("bulk", help="Precompute whole chapters (optionally interpolated) ahead of time, instead of extracting on demand")
+    p_bulk.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
+    p_bulk.add_argument("--books", default="all", help="Book number range, e.g. '40-66' or '66' (default: all 66)")
+    p_bulk.add_argument("--interpolate", action="store_true", help="Interpolate each chapter to 60fps using the configured engine")
+    p_bulk.add_argument("--out", help="Output directory (default: <cache_dir>/bulk/<lang>)")
+    p_bulk.add_argument("--overwrite", action="store_true", help="Reprocess chapters even if the output file already exists")
+    p_bulk.add_argument("--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
+
+    args = parser.parse_args()
+    config = load_config()
+
+    global FFMPEG_BIN, FFPROBE_BIN, FFPLAY_BIN
+    FFMPEG_BIN = resolve_ffmpeg_binary(config)
+    FFPROBE_BIN = resolve_ffprobe_binary(config)
+    FFPLAY_BIN = resolve_ffplay_binary(config)
+
+    if args.command == "setup":
+        cmd_setup(args, config)
+    elif args.command == "config":
+        if args.action == "set" and args.key and args.value:
+            cmd_config(args, config)
+        elif args.action == "list":
+            cmd_config(argparse.Namespace(key=None, value=None), config)
+        else:
+            print("Usage: slverse config set <key> <value>")
+    elif args.command == "langs":
+        cmd_langs(args, config)
+    elif args.command == "sync":
+        cmd_sync(args, config)
+    elif args.command == "extract":
+        maybe_auto_sync(args, config)
+        if args.interpolate and config.get("interpolation_engine") == "none":
+            config["interpolation_engine"] = "minterpolate"
+        cmd_extract(args, config)
+    elif args.command == "find":
+        maybe_auto_sync(args, config)
+        cmd_find(args, config)
+    elif args.command == "cache":
+        cmd_cache(args, config)
+    elif args.command == "bulk":
+        maybe_auto_sync(args, config)
+        cmd_bulk(args, config)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()

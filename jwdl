@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""jwdl - JW Music Downloader"""
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "jwdl"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+DEFAULT_BASE_DIR = Path.home() / "Music" / "Watchtower Music"
+AUDIO_DESC_SUFFIX = "(With Audio Descriptions)"
+API_URL = "https://b.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS"
+USER_AGENT = "jwdl (jwkit; https://github.com/majal/jwkit)"
+REQUEST_TIMEOUT = 30
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF = 2
+
+# pub code -> folder name under the base music dir.
+# Folder names intentionally match years of prior downloads byte-for-byte
+# (curly quotes, em dashes) so re-running against an existing library never
+# creates a second, differently-named copy of the same collection.
+PUBS = {
+    "osg": "Original Songs",
+    "pkon": "Become Jehovah’s Friend—Songs",
+    "sjjm": "“Sing out Joyfully”—Meetings",
+    "sjjc": "“Sing out Joyfully”—Vocals",
+    "sjji": "“Sing out Joyfully”—Instrumentals",
+    "pksjj": "“Sing out Joyfully”—Children",
+    "cywst": "“Commit Your Way to Jehovah”—Soundtrack",
+    "gnjst1": "The Good News According to Jesus—Soundtrack 1",
+    "gnjst2": "The Good News According to Jesus—Soundtrack 2",
+    "gnjst3": "The Good News According to Jesus—Soundtrack 3",
+    "imc": "International Music",
+}
+
+ILLEGAL_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
+LEADING_DOT_RE = re.compile(r"^[^.]+")
+
+
+def echo_y(msg):
+    print(f"\033[93m{msg}\033[0m")
+
+
+def echo_g(msg):
+    print(f"\033[92m{msg}\033[0m")
+
+
+def echo_r(msg):
+    print(f"\033[91m{msg}\033[0m")
+
+
+def load_config():
+    config = {"base_dir": str(DEFAULT_BASE_DIR), "pubs": {}, "workers": 4}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                user_config = json.load(f)
+            config.update({k: v for k, v in user_config.items() if k != "pubs"})
+            config["pubs"] = user_config.get("pubs", {})
+        except (json.JSONDecodeError, OSError) as e:
+            echo_r(f"Warning: could not read {CONFIG_FILE}: {e}")
+    return config
+
+
+def resolve_pubs(config):
+    """Built-in pubs plus any extra {pub_code: folder_name} from config,
+    so a newly-released JW music group can be added without a code change."""
+    pubs = dict(PUBS)
+    pubs.update(config.get("pubs", {}))
+    return pubs
+
+
+def format_title(title):
+    # Mirror the original bash sed pipeline exactly, so filenames for
+    # already-downloaded tracks keep matching (straight quotes -> curly).
+    title = title.replace("'", "’")
+    if title.startswith('"'):
+        title = "“" + title[1:]
+    title = title.replace('. "', '. “')
+    if title.endswith('"'):
+        title = title[:-1] + "”"
+    return title
+
+
+def sanitize(name):
+    return ILLEGAL_CHARS_RE.sub("_", name)
+
+
+def build_filename(url, title):
+    base_match = LEADING_DOT_RE.match(os.path.basename(url))
+    base = base_match.group(0) if base_match else os.path.basename(url)
+    raw = f"{base} ({format_title(title)}).mp3"
+    return sanitize(raw)
+
+
+def is_audio_description(title):
+    return title.endswith(AUDIO_DESC_SUFFIX)
+
+
+def fetch_pub_media(pub, lang):
+    url = f"{API_URL}?output=json&pub={pub}&fileformat=MP3%2CAAC&alllangs=0&langwritten={lang}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    last_err = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                data = json.load(resp)
+            if isinstance(data, list):
+                reason = data[0].get("title", "unknown error") if data else "empty response"
+                raise ValueError(f"pub '{pub}' not found ({reason})")
+            files = data.get("files", {}).get(lang, {}).get("MP3", [])
+            return files
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
+            last_err = e
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+    raise RuntimeError(f"Failed to fetch media list for pub '{pub}': {last_err}")
+
+
+def download_track(entry, dest_dir, dry_run, include_audio_descriptions):
+    title = entry.get("title", "")
+    if not include_audio_descriptions and is_audio_description(title):
+        return "skipped-ad", title
+
+    file_info = entry.get("file", {})
+    url = file_info.get("url", "")
+    if not url.lower().endswith(".mp3"):
+        return "skipped-format", title
+
+    filename = build_filename(url, title)
+    dest_path = dest_dir / filename
+    expected_size = entry.get("filesize")
+
+    if dest_path.exists() and (expected_size is None or dest_path.stat().st_size == expected_size):
+        return "skipped-exists", filename
+
+    if dry_run:
+        return "would-download", filename
+
+    expected_checksum = file_info.get("checksum")
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp, open(tmp_path, "wb") as f:
+                f.write(resp.read())
+
+            if expected_checksum:
+                digest = hashlib.md5(tmp_path.read_bytes()).hexdigest()
+                if digest != expected_checksum:
+                    raise ValueError(f"checksum mismatch (got {digest}, expected {expected_checksum})")
+
+            os.replace(tmp_path, dest_path)
+            return "downloaded", filename
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+            else:
+                return "error", f"{filename}: {e}"
+
+    return "error", filename
+
+
+def download_pub(pub, dest_dir, lang, dry_run, include_audio_descriptions, workers):
+    echo_y(f"Processing pub: {pub}, lang: {lang} ...")
+    entries = fetch_pub_media(pub, lang)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    counts = {}
+    errors = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(download_track, entry, dest_dir, dry_run, include_audio_descriptions)
+            for entry in entries
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            status, detail = future.result()
+            counts[status] = counts.get(status, 0) + 1
+            if status == "downloaded":
+                echo_g(f"  downloaded: {detail}")
+            elif status == "would-download":
+                print(f"  would download: {detail}")
+            elif status == "error":
+                errors.append(detail)
+                echo_r(f"  error: {detail}")
+
+    summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+    print(f"  {pub}: {summary or 'nothing to do'}")
+    return errors
+
+
+def cmd_list(pubs):
+    print("Available pub codes:\n")
+    for code, folder in pubs.items():
+        print(f"  {code:<8} {folder}")
+    print("\n  all      download all of the above")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="jwdl - download JW music (MP3) to a local library")
+    parser.add_argument("pub", nargs="?", help="pub code (see 'jwdl list'), or 'all'")
+    parser.add_argument("lang", nargs="?", default="E", help="language code (default: E)")
+    parser.add_argument("--dir", type=Path, help="override the destination directory for a single pub")
+    parser.add_argument("--base-dir", type=Path, help="override the base Watchtower Music directory")
+    parser.add_argument(
+        "--include-audio-descriptions",
+        action="store_true",
+        help="also download the audio-description ('for the blind') variants, excluded by default",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
+    parser.add_argument("--workers", type=int, help="parallel downloads per pub (default: 4)")
+    args = parser.parse_args()
+
+    config = load_config()
+    pubs = resolve_pubs(config)
+    base_dir = args.base_dir or Path(config["base_dir"])
+    workers = args.workers or config.get("workers", 4)
+
+    if not args.pub or args.pub == "list":
+        cmd_list(pubs)
+        return 0
+
+    if args.pub != "all" and args.pub not in pubs:
+        echo_r(f"Unknown pub code: {args.pub}\n")
+        cmd_list(pubs)
+        return 2
+
+    targets = list(pubs.items()) if args.pub == "all" else [(args.pub, pubs[args.pub])]
+
+    all_errors = []
+    for pub, folder in targets:
+        dest_dir = args.dir if (args.dir and len(targets) == 1) else base_dir / folder
+        errors = download_pub(pub, dest_dir, args.lang, args.dry_run, args.include_audio_descriptions, workers)
+        all_errors.extend(errors)
+        print()
+
+    if all_errors:
+        echo_r(f"Finished with {len(all_errors)} error(s).")
+        return 1
+
+    echo_g("Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
