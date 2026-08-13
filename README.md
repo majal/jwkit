@@ -66,7 +66,7 @@ Full docs: [docs/ffrife.md](docs/ffrife.md)
 
 ### [`jwdl`](./jwdl)
 
-`jwdl` downloads JW music (MP3) and periodicals (PDF: the Watchtower and the meeting workbook) from jw.org, one folder per collection.
+`jwdl` downloads JW music, periodicals, and videos from jw.org, one folder per collection.
 
 Full docs: [docs/jwdl.md](docs/jwdl.md)
 

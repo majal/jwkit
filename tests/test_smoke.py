@@ -60,3 +60,13 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("w", result.stdout)
         self.assertIn("mwb", result.stdout)
+
+    def test_jwdl_video_browse_root(self) -> None:
+        result = self.run_script("jwdl", "video")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VODStudio", result.stdout)
+
+    def test_jwdl_video_unknown_category_is_clean_error(self) -> None:
+        result = self.run_script("jwdl", "video", "DefinitelyNotARealCategory")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Unknown video category", result.stdout)
