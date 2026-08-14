@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,30 @@ class FfrifeEncodeArgsTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.ffrife = load_script_module("ffrife")
 
+    def setUp(self) -> None:
+        # See SlverseEncodeArgsTest's own setUp in tests/test_slverse.py for
+        # why this is stubbed rather than left to the real ffmpeg installed
+        # on the test machine - same shared _jwkit_common module/cache, same
+        # reasoning.
+        common = self.ffrife._jwkit_common
+        self._orig_has_encoder = common.ffmpeg_has_encoder
+        self._orig_resolved_cache = dict(common._RESOLVED_ENCODER_CACHE)
+        self._orig_warned = set(common._ENCODER_FALLBACK_WARNED)
+        common._RESOLVED_ENCODER_CACHE.clear()
+        common._ENCODER_FALLBACK_WARNED.clear()
+        common.ffmpeg_has_encoder = lambda ffmpeg_bin, name: name in {
+            "libx264", "libx265", "libsvtav1", "h264_videotoolbox", "hevc_videotoolbox",
+        }
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        common = self.ffrife._jwkit_common
+        common.ffmpeg_has_encoder = self._orig_has_encoder
+        common._RESOLVED_ENCODER_CACHE.clear()
+        common._RESOLVED_ENCODER_CACHE.update(self._orig_resolved_cache)
+        common._ENCODER_FALLBACK_WARNED.clear()
+        common._ENCODER_FALLBACK_WARNED.update(self._orig_warned)
+
     def test_default_cpu_matches_jwsl(self) -> None:
         config = {"hardware_encoder": "cpu", "video_codec": "h264", "video_crf": "20", "video_preset": "slow"}
         args = self.ffrife.build_encode_args(config)
@@ -59,8 +84,45 @@ class FfrifeEncodeArgsTest(unittest.TestCase):
 
     def test_auto_quality_is_codec_specific(self) -> None:
         for codec, crf in (("h264", "20"), ("hevc", "23"), ("av1", "30")):
-            args = self.ffrife.build_encode_args({"hardware_encoder": "cpu", "video_codec": codec, "video_crf": "auto", "video_preset": "slow"})
+            args = self.ffrife.build_encode_args({"hardware_encoder": "cpu", "video_codec": codec, "video_crf": "auto", "video_preset": "slow"}, notice=False)
             self.assertIn(crf, args)
+
+    def test_av1_unavailable_falls_back_to_hevc(self) -> None:
+        common = self.ffrife._jwkit_common
+        common.ffmpeg_has_encoder = lambda ffmpeg_bin, name: name == "libx265"
+        args = self.ffrife.build_encode_args({"hardware_encoder": "cpu", "video_codec": "av1", "video_crf": "auto", "video_preset": "slow"}, notice=False)
+        self.assertIn("libx265", args)
+
+
+class FfrifeGenericConfigOverrideTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_every_non_excluded_key_gets_a_flag(self) -> None:
+        parser = argparse.ArgumentParser()
+        self.ffrife.add_generic_config_overrides(parser)
+        dests = {action.dest for action in parser._actions}
+        expected = set(self.ffrife.DEFAULT_CONFIG) - self.ffrife.GENERIC_OVERRIDE_EXCLUDED_KEYS
+        self.assertTrue(expected.issubset(dests))
+
+    def test_apply_overrides_only_provided_values(self) -> None:
+        parser = argparse.ArgumentParser()
+        self.ffrife.add_generic_config_overrides(parser)
+        args = parser.parse_args(["--rife-binary-path", "/custom/rife"])
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        self.ffrife.apply_generic_config_overrides(args, config)
+        self.assertEqual(config["rife_binary_path"], "/custom/rife")
+
+    def test_ffmpeg_binary_override_applies_before_resolution(self) -> None:
+        # main() applies generic overrides before resolve_ffmpeg_binary() -
+        # regression guard for the ordering bug where --ffmpeg-binary was
+        # applied to config only *after* FFMPEG_BIN had already been
+        # resolved from the pre-override config, silently ignoring it.
+        args = self.ffrife.build_parser().parse_args(["run", "in.mp4", "-o", "out.mp4", "--ffmpeg-binary", "/custom/ffmpeg"])
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        self.ffrife.apply_generic_config_overrides(args, config)
+        self.assertEqual(config["ffmpeg_binary"], "/custom/ffmpeg")
 
 
 class FfrifeProgressBarTest(unittest.TestCase):

@@ -245,6 +245,36 @@ class SlverseEncodeArgsTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.slverse = load_script_module("slverse")
 
+    def setUp(self) -> None:
+        # build_encode_args now probes real `ffmpeg -encoders` (via the
+        # shared _jwkit_common.resolve_video_encoder) to decide whether the
+        # requested codec/hardware combo is actually available - stub that
+        # probe rather than depending on whatever ffmpeg happens to be
+        # installed on the machine running the tests. Also clear its
+        # resolution cache: it's keyed on (ffmpeg_bin, hw, codec) and shared
+        # module-wide (real `import _jwkit_common`, not a fresh load per
+        # test), so a stale entry from a different fake availability set
+        # would otherwise leak across tests.
+        common = self.slverse._jwkit_common
+        self._orig_has_encoder = common.ffmpeg_has_encoder
+        self._orig_resolved_cache = dict(common._RESOLVED_ENCODER_CACHE)
+        self._orig_warned = set(common._ENCODER_FALLBACK_WARNED)
+        common._RESOLVED_ENCODER_CACHE.clear()
+        common._ENCODER_FALLBACK_WARNED.clear()
+        self.available_encoders = {
+            "libx264", "libx265", "libsvtav1", "h264_videotoolbox", "hevc_videotoolbox",
+        }  # everything the "current default hardware" tests below expect - no av1_videotoolbox, matching real VideoToolbox before M5 Pro/Max
+        common.ffmpeg_has_encoder = lambda ffmpeg_bin, name: name in self.available_encoders
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        common = self.slverse._jwkit_common
+        common.ffmpeg_has_encoder = self._orig_has_encoder
+        common._RESOLVED_ENCODER_CACHE.clear()
+        common._RESOLVED_ENCODER_CACHE.update(self._orig_resolved_cache)
+        common._ENCODER_FALLBACK_WARNED.clear()
+        common._ENCODER_FALLBACK_WARNED.update(self._orig_warned)
+
     def test_default_cpu_matches_legacy_proven_settings(self) -> None:
         config = {"hardware_encoder": "cpu", "video_codec": "h264", "video_crf": "20", "video_preset": "slow"}
         args = self.slverse.build_encode_args(config)
@@ -267,6 +297,42 @@ class SlverseEncodeArgsTest(unittest.TestCase):
         config = {"hardware_encoder": "cpu", "video_codec": "hevc", "video_crf": "20", "video_preset": "slow"}
         args = self.slverse.build_encode_args(config)
         self.assertIn("libx265", args)
+
+    def test_av1_selects_libsvtav1_on_cpu(self) -> None:
+        config = {"hardware_encoder": "cpu", "video_codec": "av1", "video_crf": "auto", "video_preset": "slow"}
+        args = self.slverse.build_encode_args(config)
+        self.assertIn("libsvtav1", args)
+        self.assertIn("30", args)  # av1's own auto-crf default
+
+    def test_av1_on_videotoolbox_falls_back_to_software_av1(self) -> None:
+        # No av1_videotoolbox in self.available_encoders (matches real
+        # VideoToolbox before the 2026 M5 Pro/Max) - av1 is still achievable
+        # via software, so this must NOT silently downgrade to h264 (the
+        # pre-fix behavior) or hevc; it should stay av1 via libsvtav1.
+        config = {"hardware_encoder": "videotoolbox", "video_codec": "av1", "video_crf": "auto", "video_preset": "slow"}
+        args = self.slverse.build_encode_args(config, notice=False)
+        self.assertIn("libsvtav1", args)
+        self.assertIn("-crf", args)  # software path, not videotoolbox's -q:v
+
+    def test_av1_unavailable_anywhere_falls_back_to_hevc_then_h264(self) -> None:
+        common = self.slverse._jwkit_common
+        common.ffmpeg_has_encoder = lambda ffmpeg_bin, name: name == "libx265"
+        config = {"hardware_encoder": "cpu", "video_codec": "av1", "video_crf": "auto", "video_preset": "slow"}
+        args = self.slverse.build_encode_args(config, notice=False)
+        self.assertIn("libx265", args)
+        self.assertIn("23", args)  # hevc's own auto-crf default, not av1's
+
+        common.ffmpeg_has_encoder = lambda ffmpeg_bin, name: name == "libx264"
+        common._RESOLVED_ENCODER_CACHE.clear()
+        args = self.slverse.build_encode_args(config, notice=False)
+        self.assertIn("libx264", args)
+        self.assertIn("20", args)
+
+    def test_hevc_never_falls_back_upward_to_av1(self) -> None:
+        config = {"hardware_encoder": "cpu", "video_codec": "hevc", "video_crf": "auto", "video_preset": "slow"}
+        args = self.slverse.build_encode_args(config, notice=False)
+        self.assertIn("libx265", args)
+        self.assertNotIn("libsvtav1", args)
 
 
 class SlverseCacheBudgetTest(unittest.TestCase):
@@ -1150,6 +1216,49 @@ class SlverseConfigCommandTest(unittest.TestCase):
             self.slverse.cmd_config(args, config)
         self.assertEqual(config["cache_max_gb"], "10")
         self.assertEqual(saved["cache_max_gb"], "10")
+
+
+class SlverseGenericConfigOverrideTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_every_non_excluded_key_gets_a_flag(self) -> None:
+        parser = argparse.ArgumentParser()
+        self.slverse.add_generic_config_overrides(parser)
+        dests = {action.dest for action in parser._actions}
+        expected = set(self.slverse.DEFAULT_CONFIG) - self.slverse.GENERIC_OVERRIDE_EXCLUDED_KEYS
+        self.assertTrue(expected.issubset(dests))
+
+    def test_excluded_keys_have_no_generic_flag(self) -> None:
+        # These already have a dedicated, differently-shaped flag
+        # (--encoder/--codec/--keep-end-transition/etc.) - a second one
+        # would be a confusing duplicate, not a bug fix.
+        parser = argparse.ArgumentParser()
+        self.slverse.add_generic_config_overrides(parser)
+        dests = {action.dest for action in parser._actions}
+        self.assertEqual(dests & self.slverse.GENERIC_OVERRIDE_EXCLUDED_KEYS, set())
+
+    def test_apply_overrides_only_provided_values(self) -> None:
+        parser = argparse.ArgumentParser()
+        self.slverse.add_generic_config_overrides(parser)
+        args = parser.parse_args(["--delogo-engine", "inpaint", "--overlay-x", "100"])
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        original_alpha = config["overlay_alpha"]
+        self.slverse.apply_generic_config_overrides(args, config)
+        self.assertEqual(config["delogo_engine"], "inpaint")
+        self.assertEqual(config["overlay_x"], "100")
+        self.assertEqual(config["overlay_alpha"], original_alpha)  # untouched: not passed
+
+    def test_apply_overrides_is_a_noop_for_args_without_the_dest(self) -> None:
+        # Every real caller (main()) applies this once, unconditionally,
+        # before command dispatch - including for subcommands (setup,
+        # config, langs, sync, find, cache, inspect) whose own parsers never
+        # call add_generic_config_overrides, so their args simply lack these
+        # attributes. Must not raise.
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        self.slverse.apply_generic_config_overrides(argparse.Namespace(), config)
+        self.assertEqual(config, self.slverse.DEFAULT_CONFIG)
 
 
 if __name__ == "__main__":

@@ -112,7 +112,7 @@ DEFAULT_CONFIG = {
     "cache_max_gb": "5",
     "extract_mode": "cache",  # cache by default: reuse a verified chapter; --onthefly is the explicit streaming escape hatch
     "hardware_encoder": "cpu",  # nvenc, videotoolbox, qsv, cpu
-    "video_codec": "h264",  # h264, hevc, av1
+    "video_codec": "av1",  # h264, hevc, av1 - royalty-free and meaningfully smaller than hevc at matched quality; falls back to hevc then h264 automatically if this machine/ffmpeg build can't actually encode it (see build_encode_args)
     "video_crf": "auto",  # codec-specific balanced quality: h264=20, hevc=23, av1=30
     "video_preset": "slow",
     "interpolation_engine": "none",  # none, minterpolate, rife, framerate - "rife" delegates to the sibling ffrife tool; see its own config for rife_binary_path/rife_fallback_engine
@@ -765,48 +765,13 @@ def run_ffmpeg(args, duration=None, slow_after=4.0):
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 
-def nvenc_quality_from_crf(crf):
-    # nvenc has no crf; -cq on the same 0-51 scale is the closest analogue.
-    return crf
-
 def videotoolbox_quality_from_crf(crf):
-    # videotoolbox has no crf; -q:v is a 0-100 "higher is better" scale with
-    # no fixed formula, so this is a rough inverse mapping, not an exact
-    # match. The previous "100 - crf*3" curve put crf 20 (a fairly
-    # high-quality setting) at q:v 40 - visibly blocky, since 40 sits in
-    # videotoolbox's mediocre-quality range. A flat "100 - crf" keeps crf 20
-    # at q:v 80, much closer to what -crf 20 -preset slow actually looks
-    # like on libx264.
-    try:
-        crf_val = float(crf)
-    except ValueError:
-        crf_val = 20
-    return max(1, min(100, round(100 - crf_val)))
+    return _jwkit_common.videotoolbox_quality_from_crf(crf)
 
-def build_encode_args(config):
-    hw = config.get("hardware_encoder", "cpu")
-    codec = config.get("video_codec", "h264")
-    crf = config.get("video_crf", "auto")
-    if str(crf).strip().lower() == "auto":
-        crf = {"h264": "20", "hevc": "23", "av1": "30"}.get(codec, "20")
-    preset = config.get("video_preset", "slow")
-
-    if hw == "nvenc":
-        vcodec = {"hevc": "hevc_nvenc", "av1": "av1_nvenc"}.get(codec, "h264_nvenc")
-        args = ["-c:v", vcodec, "-preset", preset, "-cq", str(nvenc_quality_from_crf(crf))]
-    elif hw == "videotoolbox":
-        vcodec = "hevc_videotoolbox" if codec == "hevc" else "h264_videotoolbox"
-        args = ["-c:v", vcodec, "-q:v", str(videotoolbox_quality_from_crf(crf))]
-    elif hw == "qsv":
-        vcodec = "hevc_qsv" if codec == "hevc" else "h264_qsv"
-        args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
-    else:
-        vcodec = {"hevc": "libx265", "av1": "libsvtav1"}.get(codec, "libx264")
-        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", ("6" if codec == "av1" and preset == "slow" else preset)]
-        if codec == "av1":
-            args += ["-svtav1-params", "tune=0"]
-
-    return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+def build_encode_args(config, notice=True):
+    # Shared with ffrife - see _jwkit_common.build_encode_args for the
+    # av1->hevc->h264 hardware/software fallback chain.
+    return _jwkit_common.build_encode_args(FFMPEG_BIN, config, notice=notice)
 
 def output_metadata_args(book_name, chapter, verses, lang, source_url, checksum, edit_note="normal-speed full verse window", title_edit=""):
     title = f"{book_name} {chapter}:{verses} {lang}" + (f" ({title_edit})" if title_edit else "")
@@ -1963,6 +1928,38 @@ def parse_clip_window(value):
         raise argparse.ArgumentTypeError("START and END must be non-negative")
     return start, end
 
+# DEFAULT_CONFIG keys that already have their own differently-named/shaped
+# per-run flag (an inverse boolean, a shorter alias, a dedicated type) -
+# excluded from the generic --<key> override loop below so there's exactly
+# one flag per option, not two doing overlapping things.
+GENERIC_OVERRIDE_EXCLUDED_KEYS = {
+    "hardware_encoder", "video_codec", "video_crf", "video_preset",  # --encoder/--codec/--crf/--preset
+    "trim_end_transition",   # --keep-end-transition
+    "trim_mid_transitions",  # --trim-mid-transitions
+    "extract_mode",          # --onthefly/--cache
+}
+
+def add_generic_config_overrides(parser):
+    """Add a --<dashed-key> flag for every DEFAULT_CONFIG key not already
+    covered by a dedicated flag (see GENERIC_OVERRIDE_EXCLUDED_KEYS) -
+    overrides that one setting for this run only, without touching
+    config.toml. Keeps the CLI surface in sync with DEFAULT_CONFIG
+    automatically as new config keys are added, instead of hand-adding a
+    flag one at a time (see apply_generic_config_overrides for the other
+    half of this)."""
+    for key in DEFAULT_CONFIG:
+        if key in GENERIC_OVERRIDE_EXCLUDED_KEYS:
+            continue
+        parser.add_argument(f"--{key.replace('_', '-')}", dest=key, help=CONFIG_HELP.get(key, ""))
+
+def apply_generic_config_overrides(args, config):
+    for key in DEFAULT_CONFIG:
+        if key in GENERIC_OVERRIDE_EXCLUDED_KEYS:
+            continue
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+
 def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state):
     window = resolve_verse_window(
         lang, book_num, chapter, verses, config,
@@ -2437,6 +2434,7 @@ def main():
         p.add_argument("--codec", choices=["h264", "hevc", "av1"], help="Video codec for this run (default: configured video_codec)")
         p.add_argument("--crf", help="Video quality for this run; use 'auto' for the codec default")
         p.add_argument("--preset", help="FFmpeg encoder preset for this run (e.g. slow, medium, fast)")
+    add_generic_config_overrides(p_extract)
 
     p_find = subparsers.add_parser("find", help="Search already-synced languages for who has a given verse")
     p_find.add_argument("book", help="Book name or number")
@@ -2465,10 +2463,18 @@ def main():
     p_bulk.add_argument("--codec", choices=["h264", "hevc", "av1"], help="Video codec for this run (default: configured video_codec)")
     p_bulk.add_argument("--crf", help="Video quality for this run; use 'auto' for the codec default")
     p_bulk.add_argument("--preset", help="FFmpeg encoder preset for this run (e.g. slow, medium, fast)")
+    add_generic_config_overrides(p_bulk)
 
     args = parser.parse_args()
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     config = load_config()
+    # Applied before binary/font/retry resolution below (not per-command) so
+    # overrides like --ffmpeg-binary or --download-max-attempts actually
+    # take effect for this run, rather than resolving against the
+    # pre-override config. A no-op for subcommands that don't register
+    # these flags at all - getattr(args, key, None) just finds nothing to
+    # apply.
+    apply_generic_config_overrides(args, config)
 
     global FFMPEG_BIN, FFPROBE_BIN, FFPLAY_BIN, FONT_MAIN_WEIGHT, FONT_ESTIMATOR_WEIGHT, MAX_ATTEMPTS, RETRY_BACKOFF
     FFMPEG_BIN = resolve_ffmpeg_binary(config)

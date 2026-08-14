@@ -21,6 +21,125 @@ DEFAULT_JWKIT_CONFIG = {
 }
 
 
+_ENCODER_LIST_CACHE = {}
+_RESOLVED_ENCODER_CACHE = {}
+_ENCODER_FALLBACK_WARNED = set()
+
+_CODEC_TIERS = ["av1", "hevc", "h264"]
+_HW_ENCODER_NAMES = {
+    "nvenc": {"h264": "h264_nvenc", "hevc": "hevc_nvenc", "av1": "av1_nvenc"},
+    "videotoolbox": {"h264": "h264_videotoolbox", "hevc": "hevc_videotoolbox", "av1": "av1_videotoolbox"},
+    "qsv": {"h264": "h264_qsv", "hevc": "hevc_qsv", "av1": "av1_qsv"},
+}
+# libsvtav1 before libaom-av1: several times faster at comparable quality
+# for the short clips these tools produce (see docs/slverse.md's codec
+# comparison note).
+_SW_ENCODER_NAMES = {"h264": ["libx264"], "hevc": ["libx265"], "av1": ["libsvtav1", "libaom-av1"]}
+
+
+def _ffmpeg_encoders(ffmpeg_bin):
+    if ffmpeg_bin not in _ENCODER_LIST_CACHE:
+        try:
+            result = subprocess.run([ffmpeg_bin, "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=10)
+            _ENCODER_LIST_CACHE[ffmpeg_bin] = result.stdout
+        except Exception:
+            _ENCODER_LIST_CACHE[ffmpeg_bin] = ""
+    return _ENCODER_LIST_CACHE[ffmpeg_bin]
+
+
+def ffmpeg_has_encoder(ffmpeg_bin, encoder_name):
+    return encoder_name in _ffmpeg_encoders(ffmpeg_bin)
+
+
+def resolve_video_encoder(ffmpeg_bin, hw, codec):
+    """Walk the codec tier downward from `codec` (av1 -> hevc -> h264),
+    trying the configured hardware encoder at each tier first and falling
+    back to software - so "encode in av1" degrades gracefully on a
+    machine/ffmpeg build that can't actually do av1 (e.g. Apple Silicon
+    before M5 Pro/Max has no av1_videotoolbox - VideoToolbox's AV1 *decode*
+    landed with A17 Pro/M3, but AV1 *encode* didn't until 2026's M5
+    Pro/Max), instead of silently landing on h264 (the old behavior) or
+    hard-failing. Never falls back UPWARD - requesting hevc never lands on
+    av1. Returns (actual_codec, vcodec_name, used_hw); actual_codec differs
+    from `codec` only when nothing at or below its tier was available.
+    Cached per (ffmpeg_bin, hw, codec) - deterministic for one process, and
+    this may be called once per language in a parallel multi-language run."""
+    cache_key = (ffmpeg_bin, hw, codec)
+    if cache_key in _RESOLVED_ENCODER_CACHE:
+        return _RESOLVED_ENCODER_CACHE[cache_key]
+
+    start = _CODEC_TIERS.index(codec) if codec in _CODEC_TIERS else len(_CODEC_TIERS) - 1
+    resolved = None
+    for tier_codec in _CODEC_TIERS[start:]:
+        hw_name = _HW_ENCODER_NAMES.get(hw, {}).get(tier_codec)
+        if hw_name and ffmpeg_has_encoder(ffmpeg_bin, hw_name):
+            resolved = (tier_codec, hw_name, True)
+            break
+        sw_name = next((name for name in _SW_ENCODER_NAMES[tier_codec] if ffmpeg_has_encoder(ffmpeg_bin, name)), None)
+        if sw_name:
+            resolved = (tier_codec, sw_name, False)
+            break
+    if resolved is None:
+        # Nothing detected at all (e.g. the -encoders probe itself failed) -
+        # land on plain libx264 rather than ever leaving build_encode_args
+        # with no -c:v.
+        resolved = ("h264", "libx264", False)
+    _RESOLVED_ENCODER_CACHE[cache_key] = resolved
+    return resolved
+
+
+def nvenc_quality_from_crf(crf):
+    # nvenc has no crf; -cq on the same 0-51 scale is the closest analogue.
+    return crf
+
+
+def videotoolbox_quality_from_crf(crf):
+    # videotoolbox has no crf; -q:v is a 0-100 "higher is better" scale with
+    # no fixed formula, so this is a rough inverse mapping, not an exact
+    # match. A flat "100 - crf" keeps crf 20 at q:v 80, close to what
+    # -crf 20 -preset slow actually looks like on libx264.
+    try:
+        crf_val = float(crf)
+    except ValueError:
+        crf_val = 20
+    return max(1, min(100, round(100 - crf_val)))
+
+
+def build_encode_args(ffmpeg_bin, config, notice=True):
+    """Shared by slverse and ffrife (identical encode-quality logic, kept in
+    one place instead of two copies that could drift). `notice` prints a
+    one-line, once-per-(ffmpeg_bin,hw,codec) heads-up when the requested
+    codec wasn't actually available and something lower in the tier was
+    used instead - silence it for callers that already show their own
+    status (e.g. a caller printing per-language progress)."""
+    hw = config.get("hardware_encoder", "cpu")
+    requested_codec = config.get("video_codec", "av1")
+    actual_codec, vcodec, used_hw = resolve_video_encoder(ffmpeg_bin, hw, requested_codec)
+
+    warn_key = (ffmpeg_bin, hw, requested_codec)
+    if notice and actual_codec != requested_codec and warn_key not in _ENCODER_FALLBACK_WARNED:
+        _ENCODER_FALLBACK_WARNED.add(warn_key)
+        print(f"({requested_codec} isn't available via hardware_encoder={hw} on this machine - encoding as {actual_codec} instead)")
+
+    crf = config.get("video_crf", "auto")
+    if str(crf).strip().lower() == "auto":
+        crf = {"h264": "20", "hevc": "23", "av1": "30"}.get(actual_codec, "20")
+    preset = config.get("video_preset", "slow")
+
+    if used_hw and hw == "nvenc":
+        args = ["-c:v", vcodec, "-preset", preset, "-cq", str(nvenc_quality_from_crf(crf))]
+    elif used_hw and hw == "videotoolbox":
+        args = ["-c:v", vcodec, "-q:v", str(videotoolbox_quality_from_crf(crf))]
+    elif used_hw and hw == "qsv":
+        args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
+    else:
+        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", ("6" if actual_codec == "av1" and preset == "slow" else preset)]
+        if actual_codec == "av1" and vcodec == "libsvtav1":
+            args += ["-svtav1-params", "tune=0"]
+
+    return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+
+
 class ProgressETA:
     """Small shared rolling-rate ETA estimator for jwkit progress displays."""
     def __init__(self, total, window_seconds=30.0, warmup_seconds=10.0):
