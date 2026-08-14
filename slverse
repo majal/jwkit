@@ -113,7 +113,7 @@ DEFAULT_CONFIG = {
     "extract_mode": "cache",  # cache by default: reuse a verified chapter; --onthefly is the explicit streaming escape hatch
     "hardware_encoder": "cpu",  # nvenc, videotoolbox, qsv, cpu
     "video_codec": "h264",  # h264, hevc, av1
-    "video_crf": "20",
+    "video_crf": "auto",  # codec-specific balanced quality: h264=20, hevc=23, av1=30
     "video_preset": "slow",
     "interpolation_engine": "none",  # none, minterpolate, rife, framerate - "rife" delegates to the sibling ffrife tool; see its own config for rife_binary_path/rife_fallback_engine
     "languages": "ASL,FSL,BVL,INI,SPE",
@@ -761,7 +761,9 @@ def videotoolbox_quality_from_crf(crf):
 def build_encode_args(config):
     hw = config.get("hardware_encoder", "cpu")
     codec = config.get("video_codec", "h264")
-    crf = config.get("video_crf", "20")
+    crf = config.get("video_crf", "auto")
+    if str(crf).strip().lower() == "auto":
+        crf = {"h264": "20", "hevc": "23", "av1": "30"}.get(codec, "20")
     preset = config.get("video_preset", "slow")
 
     if hw == "nvenc":
@@ -775,9 +777,17 @@ def build_encode_args(config):
         args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
     else:
         vcodec = {"hevc": "libx265", "av1": "libsvtav1"}.get(codec, "libx264")
-        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", preset]
+        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", ("6" if codec == "av1" and preset == "slow" else preset)]
+        if codec == "av1":
+            args += ["-svtav1-params", "tune=0"]
 
     return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+
+def output_metadata_args(book_name, chapter, verses, lang, source_url, checksum):
+    title = f"{book_name} {chapter}:{verses} ({lang})"
+    return ["-metadata", f"title={title}", "-metadata", f"artist=JW.org ({lang})",
+            "-metadata", "encoder=jwkit slverse", "-metadata", f"comment=Source: {source_url}",
+            "-metadata", f"source_checksum={checksum or ''}"]
 
 def google_fonts_ttf_url(family, weight):
     """Resolve the current .ttf URL for a Google Fonts family/weight by
@@ -998,7 +1008,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
         print(f"Source: {source_url}")
     launch_ffplay(ffplay_args)
 
-def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False, source_labels=None, kept_segments=None, fade_outs=None):
+def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False, source_labels=None, kept_segments=None, fade_outs=None, metadata_args=None):
     """Single-pass: trim + overlay + (for framerate/minterpolate) the fps
     filter all happen in ONE ffmpeg encode, straight from `source`. Used to
     be two full lossy re-encode generations (extract-with-overlay, then a
@@ -1027,7 +1037,7 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
         if len(segments) > 1:
             print("(trim_mid_transitions doesn't support interpolation_engine=rife yet - mid-range transitions will play through untouched.)")
         ffrife = load_ffrife()
-        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=overlay, fps=60)
+        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=overlay, fps=60, metadata_args=metadata_args)
         return
 
     vf_chain = list(filter(None, [overlay]))
@@ -1055,11 +1065,11 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
         cmd += ["-filter_complex", fc, "-map", out_label]
         if audio:
             cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]
-        cmd += build_encode_args(config) + [str(output_file)]
+        cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]
     else:
         if vf_chain:
             cmd += ["-vf", ",".join(vf_chain)]
-        cmd += ["-c:a", "copy"] + build_encode_args(config) + [str(output_file)]
+        cmd += ["-c:a", "copy"] + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
     run_ffmpeg(cmd, duration=duration)
 
 def parse_speed(value):
@@ -1809,6 +1819,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None)
     verses_str = format_verses_label(valid_verses)
     out_filename = f"{book_name.replace(' ', '_')}_{chapter}_{'_'.join(map(str, valid_verses))}_{lang}.mp4"
+    metadata_args = output_metadata_args(book_name, chapter, verses_str, lang, url, checksum)
 
     if not args.write:
         # Default: preview only, nothing written to disk deliberately - the
@@ -1855,7 +1866,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         if mode:
             extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels)
         else:
-            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs)
+            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
     else:
         cache_dir = Path(config["cache_dir"]) / lang
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1871,7 +1882,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         if mode:
             extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels)
         else:
-            extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs)
+            extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
 
         key = f"{book_num}_{chapter}"
         index = load_index(lang)
