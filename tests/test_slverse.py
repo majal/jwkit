@@ -601,6 +601,70 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         self.assertNotIn("Psalm 16:11", seen)
         self.assertIn("w=220", result)  # 200 + 10 + delogo_width_pad(10)
 
+    def test_mid_transition_fade_dips_and_recovers(self) -> None:
+        # A mid-range transition (source plays on into the next verse) isn't
+        # a fade to black - the source's own caption fades out, holds blank,
+        # then fades back in for the next verse (confirmed by sampling real
+        # frames around a Revelation 13:2->3 transition). Our overlay has to
+        # follow that same down/hold/up shape, not fade out and then snap
+        # straight back to full opacity.
+        result = self.slverse.build_overlay_filter(
+            "ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False,
+            fade_outs=[(10.0, 13.0, False)],
+        )
+        self.assertIn("if(between(t\\,10.000\\,13.000)", result)
+        self.assertIn("if(lt(t\\,11.000)", result)  # end of the down-ramp (first third)
+        self.assertIn("if(lt(t\\,12.000)", result)  # start of the up-ramp (last third)
+
+    def test_final_transition_fade_is_one_way(self) -> None:
+        # The extracted range's own trailing transition (only present with
+        # --keep-end-transition / trim_end_transition=false) has nothing to
+        # recover into - the clip just ends - so it stays a plain fade-out.
+        result = self.slverse.build_overlay_filter(
+            "ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False,
+            fade_outs=[(10.0, 13.0, True)],
+        )
+        self.assertIn("if(between(t\\,10.000\\,13.000)", result)
+        self.assertNotIn("if(lt(t", result)
+
+
+class SlverseOverlayFadeOutsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def config(self, **overrides):
+        cfg = dict(self.slverse.DEFAULT_CONFIG)
+        cfg.update(overrides)
+        return cfg
+
+    def _stub_index(self, key, markers) -> None:
+        self.slverse.load_index = lambda lang: {key: {"markers": markers}}
+
+    def test_mid_verse_transition_tagged_not_final(self) -> None:
+        # Real Revelation 13:2-3 marker data (see docs/proposals/delogo-inpainting.md's
+        # empirical Rev 13:2->3 sampling and the fix this backs).
+        self._stub_index("66_13", [
+            {"verseNumber": 2, "startTime": "00:00:45.979", "duration": "00:00:30.897", "endTransitionDuration": "00:00:01.134", "label": "Revelation 13:2"},
+            {"verseNumber": 3, "startTime": "00:01:16.876", "duration": "00:00:19.519", "endTransitionDuration": "00:00:00.000", "label": "Revelation 13:3"},
+        ])
+        fades = self.slverse.overlay_fade_outs("ASL", 66, 13, [2, 3], 45.979, 96.395, self.config())
+        self.assertEqual(len(fades), 1)
+        left, right, is_final = fades[0]
+        self.assertAlmostEqual(left, 29.763, places=3)
+        self.assertAlmostEqual(right, 30.897, places=3)
+        self.assertFalse(is_final)
+
+    def test_trailing_transition_tagged_final_when_kept(self) -> None:
+        self._stub_index("19_16", [
+            {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:06.940", "label": "Psalm 16:11"},
+        ])
+        fades = self.slverse.overlay_fade_outs(
+            "ASL", 19, 16, [11], 149.415, 149.415 + 33.800, self.config(trim_end_transition="false"),
+        )
+        self.assertEqual(len(fades), 1)
+        self.assertTrue(fades[0][2])
+
 
 class SlverseExtractPreviewTest(unittest.TestCase):
     @classmethod
@@ -997,6 +1061,11 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         )
         self.slverse.load_ffrife = lambda: fake_ffrife
         self.slverse.build_overlay_filter = lambda *a, **k: "drawtext=text='stub'"  # font/measure logic covered elsewhere
+        # RIFE exactly doubles frame count, so the merge fps has to be 2x
+        # the *source's own* fps to preserve duration (a fixed 60 silently
+        # drifts whenever the source isn't exactly 30fps) - see extract_verse's
+        # own comment. Stubbed here rather than hitting real ffprobe.
+        self.slverse.probe_source_fps = lambda source: 25.0
         config = {"interpolation_engine": "rife", "default_target_lang": "FSL"}
 
         self.slverse.extract_verse("http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config, remote=True)
@@ -1008,6 +1077,7 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         self.assertEqual(kwargs["start"], 10.0)
         self.assertEqual(kwargs["end"], 20.0)
         self.assertEqual(kwargs["vf"], "drawtext=text='stub'")
+        self.assertEqual(kwargs["fps"], 50.0)
 
 
 class SlverseLaunchMpvTest(unittest.TestCase):

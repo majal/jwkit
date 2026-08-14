@@ -974,11 +974,32 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     label_alpha = config.get("overlay_source_label_alpha", DEFAULT_CONFIG["overlay_source_label_alpha"])
     def fading_alpha(base):
         # JW supplies endTransitionDuration for paragraph/chapter ends.  Make
-        # our replacement caption disappear with that fade rather than remain
-        # visibly static over a blackening source frame.
+        # our replacement caption follow that same rhythm instead of sitting
+        # static over a blackening/re-lightening source frame.
+        #
+        # A *mid*-range transition (source keeps playing into the next verse)
+        # isn't just a fade-out: the source's own burned-in caption fades
+        # out, holds blank, then fades back in for the next verse - confirmed
+        # by sampling real frames around a Revelation 13:2->3 transition.
+        # Roughly thirds of the window each (down / hold / up) matched what
+        # was actually on screen; snapping straight back to full opacity the
+        # instant the window ends (the old behavior) reads as a visible pop
+        # next to the source's own smooth re-entry. A *final*-verse trailing
+        # transition (only ever present with --keep-end-transition, or
+        # trim_end_transition=false) has nothing to fade back in for - the
+        # clip just ends into JW's copyright endscreen - so that one stays a
+        # plain one-way fade-out.
         expr = str(base)
-        for fade_start, fade_end in reversed(fade_outs or []):
-            expr = f"if(between(t\\,{fade_start:.3f}\\,{fade_end:.3f})\\,{base}*({fade_end:.3f}-t)/{fade_end - fade_start:.3f}\\,{expr})"
+        for fade_start, fade_end, is_final in reversed(fade_outs or []):
+            if is_final:
+                expr = f"if(between(t\\,{fade_start:.3f}\\,{fade_end:.3f})\\,{base}*({fade_end:.3f}-t)/{fade_end - fade_start:.3f}\\,{expr})"
+                continue
+            third = (fade_end - fade_start) / 3
+            down_end, up_start = fade_start + third, fade_end - third
+            down = f"{base}*({down_end:.3f}-t)/{third:.3f}"
+            up = f"{base}*(t-{up_start:.3f})/{third:.3f}"
+            dip = f"if(lt(t\\,{down_end:.3f})\\,{down}\\,if(lt(t\\,{up_start:.3f})\\,0\\,{up}))"
+            expr = f"if(between(t\\,{fade_start:.3f}\\,{fade_end:.3f})\\,{dip}\\,{expr})"
         return expr
     width_pad = int(config.get("delogo_width_pad", DEFAULT_CONFIG["delogo_width_pad"]))
     height_pad = int(config.get("delogo_height_pad", DEFAULT_CONFIG["delogo_height_pad"]))
@@ -1159,7 +1180,16 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
         if len(segments) > 1:
             print("(trim_mid_transitions doesn't support interpolation_engine=rife yet - mid-range transitions will play through untouched.)")
         ffrife = load_ffrife()
-        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=overlay, fps=60, metadata_args=metadata_args)
+        # RIFE always exactly doubles frame count - merging at a fixed 60fps
+        # only preserves duration when the source is exactly 30fps. JW's own
+        # sources are commonly 30000/1001 (29.97fps), so a hardcoded 60
+        # drifts the whole clip (and every overlay fade timestamp in it) by
+        # ~0.1%: a real, cumulative desync, not just an off-by-a-frame
+        # rounding issue. 2x the source's own fps is the only value that
+        # keeps output duration - and therefore fade timing - correct (see
+        # probe_source_fps's docstring / extract_verse_sections' own use of
+        # this same pattern for --slow).
+        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=overlay, fps=probe_source_fps(source) * 2, metadata_args=metadata_args)
         return
 
     vf_chain = list(filter(None, [overlay]))
@@ -1879,20 +1909,26 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
     return start, end, entry["url"], entry.get("checksum"), valid_verses, source_labels, kept_segments
 
 def overlay_fade_outs(lang, book_num, chapter, valid_verses, start, end, config, keep_end_transition=False, trim_mid_transitions=None, source_timeline=False):
-    """Metadata-derived fade-out intervals, relative to this output window."""
+    """Metadata-derived (fade_start, fade_end, is_final) fade intervals,
+    relative to this output window (or the source timeline if
+    source_timeline). is_final marks the extracted range's own trailing
+    transition (fading to JW's copyright endscreen, only present at all when
+    it's being kept rather than trimmed) - see fading_alpha for why that one
+    gets a different envelope than a mid-range verse-to-verse transition."""
     meta = markers_to_verse_times(load_index(lang).get(f"{book_num}_{chapter}", {}).get("markers", []))
     trim_end = str(config.get("trim_end_transition", DEFAULT_CONFIG["trim_end_transition"])).strip().lower() != "false" and not keep_end_transition
     trim_mid = str(config.get("trim_mid_transitions", DEFAULT_CONFIG["trim_mid_transitions"])).strip().lower() == "true" if trim_mid_transitions is None else trim_mid_transitions
     fades = []
     for v in valid_verses:
+        is_final = v == valid_verses[-1]
         transition = meta.get(v, {}).get("end_transition", 0)
-        if not transition or (v == valid_verses[-1] and trim_end) or (v != valid_verses[-1] and trim_mid):
+        if not transition or (is_final and trim_end) or (not is_final and trim_mid):
             continue
         fade_end = meta[v]["end"]
         fade_start = fade_end - transition
         if fade_end > start and fade_start < end:
             left, right = max(fade_start, start), min(fade_end, end)
-            fades.append((left, right) if source_timeline else (left - start, right - start))
+            fades.append((left, right, is_final) if source_timeline else (left - start, right - start, is_final))
     return fades
 
 def resolve_retime_args(args, duration):
@@ -2318,7 +2354,9 @@ def bulk_one_lang(lang, books, args, config):
                 shutil.copy(tmp_download, out_file)
             elif engine == "rife":
                 ffrife = load_ffrife()
-                ffrife.interpolate(str(tmp_download), str(out_file), ffrife_config_for(bulk_config), fps=60)
+                # See extract_verse's own comment: fixed 60fps only preserves
+                # duration when the source happens to be exactly 30fps.
+                ffrife.interpolate(str(tmp_download), str(out_file), ffrife_config_for(bulk_config), fps=probe_source_fps(tmp_download) * 2)
             else:
                 minterp = "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1" if engine == "minterpolate" else "framerate=fps=60"
                 run_ffmpeg(["-i", str(tmp_download), "-vf", minterp, "-c:a", "copy"] + build_encode_args(bulk_config) + [str(out_file)], duration=duration)
