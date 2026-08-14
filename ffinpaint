@@ -27,6 +27,9 @@ DEFAULT_CONFIG = {
 FFMPEG_BIN = "ffmpeg"
 FFPROBE_BIN = "ffprobe"
 
+# Resolved once at startup by main() -> _jwkit_common.resolve_color_enabled.
+COLOR = _jwkit_common.Colorizer(False)
+
 def load_config():
     config = DEFAULT_CONFIG.copy()
     if CONFIG_FILE.exists():
@@ -103,11 +106,17 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     setup = sub.add_parser("setup"); setup.add_argument("--root"); setup.add_argument("--checkpoint")
     run = sub.add_parser("run"); run.add_argument("input"); run.add_argument("-o", "--output", required=True); run.add_argument("--box", required=True); run.add_argument("--start", type=float); run.add_argument("--end", type=float)
+    for p in (setup, run):
+        color_group = p.add_mutually_exclusive_group()
+        color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colored output for this run")
+        color_group.add_argument("--no-color", dest="color", action="store_false", help="Disable colored output for this run")
     args = parser.parse_args(argv)
+    global COLOR
+    COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color))
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     config = load_config()
     if args.command == "setup":
-        print("E2FGVI-HQ is CC BY-NC 4.0. Install it and its weights only if that license permits your use.")
+        print(COLOR.yellow("E2FGVI-HQ is CC BY-NC 4.0. Install it and its weights only if that license permits your use."))
         config["e2fgvi_root"] = args.root or input("Path to your E2FGVI checkout: ").strip()
         config["e2fgvi_checkpoint"] = args.checkpoint or input("Path to E2FGVI-HQ-CVPR22.pth: ").strip()
         if not configured(config): raise SystemExit("That checkout/test.py or checkpoint was not found.")

@@ -374,5 +374,30 @@ class JwdlFetchVideoCategoryTest(unittest.TestCase):
         self.assertEqual(result["name"], "Latest Videos")
 
 
+class JwdlColorOutputTest(unittest.TestCase):
+    """echo_y/echo_g/echo_r used to hardcode ANSI escape codes
+    unconditionally, regardless of whether stdout was a real terminal -
+    now they go through the shared Colorizer like every other jwkit tool."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    def test_echo_helpers_respect_color_enabled(self) -> None:
+        self.jwdl.COLOR = self.jwdl._jwkit_common.Colorizer(True)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.jwdl.echo_g("ok")
+        self.assertIn("\033[32m", out.getvalue())
+
+    def test_echo_helpers_plain_when_disabled(self) -> None:
+        self.jwdl.COLOR = self.jwdl._jwkit_common.Colorizer(False)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.jwdl.echo_r("bad")
+        self.assertNotIn("\033[", out.getvalue())
+        self.assertIn("bad", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

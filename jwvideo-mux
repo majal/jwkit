@@ -46,6 +46,9 @@ KNOWN_LANGUAGES = {
 # (register-jwplay-launcher.sh on macOS/duti, xdg-mime on Linux) distinct from generic shell scripts.
 LAUNCHER_EXTENSION = ".jwplay"
 
+# Resolved once at startup by main() -> _jwkit_common.resolve_color_enabled.
+COLOR = _jwkit_common.Colorizer(False)
+
 
 def update_and_load_langs() -> dict:
     langs_dict = dict(KNOWN_LANGUAGES)
@@ -120,7 +123,7 @@ def get_lang_meta(code: str) -> tuple[str, str]:
     return (code.lower()[:3], code_upper)
 
 def color_print(msg: str, color_code: str = ""):
-    rendered = msg if not color_code else f"\033[{color_code}m{msg}\033[0m"
+    rendered = msg if not (color_code and COLOR.enabled) else f"\033[{color_code}m{msg}\033[0m"
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     print(rendered.encode(encoding, errors="replace").decode(encoding))
 
@@ -1486,8 +1489,13 @@ def main():
     parser.add_argument("--adaptive-mpv-library", action="store_true", help="Export a space-saving mpv library (shared common video segments + per-language localized segments/audio/subs/EDL/manifest) instead of muxing; does not alter or delete source media. If analysis finds no real localized differences for any language, falls back to an ordinary single-file mux (one shared video track) written directly to the output directory instead of building an unnecessary EDL library.")
     parser.add_argument("--launchers-in-video-folder", action="store_true", help=f"With --adaptive-mpv-library, write the {LAUNCHER_EXTENSION} launchers inside the per-video library folder (the old default) instead of the output directory (the unit root). Default is the unit root, one level up, so every video's launchers for a unit are visible without opening each video's own subfolder; launcher names there already carry the video's own docid/title (see build_docid_output_name), so multiple videos in one unit never collide.")
     parser.add_argument("--normalize-mismatched-aspect", action="store_true", help="With --adaptive-mpv-library, when a language's localized clips are a different resolution/aspect ratio than the reference (e.g. a 16:9 insert against a 4:3 reference), center-crop and re-encode just those short localized clips to the reference's exact aspect ratio and resolution so mpv never visibly resizes mid-presentation. The shared common/reference segments are never re-encoded -- only the mismatched language's own short localized clips are.")
+    color_group = parser.add_mutually_exclusive_group()
+    color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colored output for this run (overrides the shared color_output config and auto-detection)")
+    color_group.add_argument("--no-color", dest="color", action="store_false", help="Disable colored output for this run")
 
     args = parser.parse_args()
+    global COLOR
+    COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color))
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     check_dependencies()
     
