@@ -50,7 +50,7 @@ For the interactive setup (which sign languages you watch, cache size, etc.), ru
 
 jwkit also updates itself automatically — once a day at most, and only when you actually run a command, so it never does anything in the background. `slverse setup` asks whether you want this on (it's on by default); turn it off any time by editing `auto_update = false` into `~/.config/jwkit/config.toml`. You can still update by hand with `jwkit-update` (installed alongside the tools), or by re-running the install command above — both are safe to repeat.
 
-To remove only the copy installed by Quick Install (not this source checkout, your `~/.config/jwkit` settings/downloads, or Python, `ffmpeg`, and Git), run:
+To uninstall, run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/majal/jwkit/main/uninstall.sh | bash
@@ -61,6 +61,8 @@ On Windows:
 ```powershell
 irm https://raw.githubusercontent.com/majal/jwkit/main/uninstall.ps1 | iex
 ```
+
+It removes the Quick Install copy and its PATH entry, plus only dependencies that Quick Install recorded as installing itself. It keeps this source checkout, all `~/.config/jwkit` settings/downloads, and dependencies that were already present. Older installs without a dependency record remain conservative and keep dependencies.
 
 If a step needs your password (installing Homebrew on macOS, or `sudo` on Linux) or a Windows Store component (`winget`), that's your system's own installer asking, not jwkit. See [Your Local Setup](#your-local-setup) below if you'd rather do each step by hand, or if the quick install hits something it can't resolve on its own.
 

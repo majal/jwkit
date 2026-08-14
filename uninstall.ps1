@@ -21,6 +21,12 @@ if ((Test-Path $JwkitHome) -and $JwkitHome -ne $DefaultHome) {
     if (-not $hasFootprint) { Stop-Uninstall "refusing to remove custom JWKIT_HOME without an installer footprint: $JwkitHome" }
 }
 
+$statePath = Join-Path $JwkitHome ".jwkit-install-state.json"
+$installedPackageIds = @()
+if (Test-Path $statePath) {
+    try { $installedPackageIds = @((Get-Content $statePath -Raw | ConvertFrom-Json).dependencies) } catch { }
+}
+
 $currentUserPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
 if ($currentUserPath) {
     $target = $JwkitHome.TrimEnd("\\", "/")
@@ -39,4 +45,11 @@ if (Test-Path $JwkitHome) {
     Write-Host "No installed jwkit copy found at $JwkitHome"
 }
 
-Write-Host "Kept Python, ffmpeg, git, and all ~/.config/jwkit settings and downloads."
+foreach ($packageId in $installedPackageIds) {
+    if ($packageId) {
+        Write-Host "Removing installer-added dependency: $packageId"
+        try { winget uninstall --id $packageId -e --accept-source-agreements } catch { Write-Host "Could not remove $packageId; leaving it installed." -ForegroundColor Yellow }
+    }
+}
+
+Write-Host "Kept all ~/.config/jwkit settings and downloads. Existing dependencies not recorded as installer-added were kept."

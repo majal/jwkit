@@ -29,6 +29,27 @@ is_installer_owned() {
     done
 }
 
+remove_recorded_dependencies() {
+    local state_file="$1" manager dependency
+    [ -f "$state_file" ] || return 0
+    manager="$(awk -F= '$1 == "dependency_manager" { print $2; exit }' "$state_file")"
+    case "$manager" in
+        brew|apt-get|dnf|pacman|apk) ;;
+        *) note "Kept dependencies: no recognized installer record."; return 0 ;;
+    esac
+    while IFS= read -r dependency; do
+        [ -n "$dependency" ] || continue
+        note "Removing installer-added dependency: $dependency"
+        case "$manager" in
+            brew) brew uninstall "$dependency" || note "Could not remove $dependency; leaving it installed." ;;
+            apt-get) sudo apt-get remove -y "$dependency" || note "Could not remove $dependency; leaving it installed." ;;
+            dnf) sudo dnf remove -y "$dependency" || note "Could not remove $dependency; leaving it installed." ;;
+            pacman) sudo pacman -Rns --noconfirm "$dependency" || note "Could not remove $dependency; leaving it installed." ;;
+            apk) sudo apk del "$dependency" || note "Could not remove $dependency; leaving it installed." ;;
+        esac
+    done < <(awk -F= '$1 == "dependency" { print $2 }' "$state_file")
+}
+
 remove_path_block() {
     local rc="$1" tmp
     [ -f "$rc" ] || return 0
@@ -57,6 +78,11 @@ if [ -e "$JWKIT_HOME" ] && ! is_installer_owned; then
     die "refusing to remove custom JWKIT_HOME without an installer footprint: $JWKIT_HOME"
 fi
 
+state_copy="$(mktemp "${TMPDIR:-/tmp}/jwkit-install-state.XXXXXX")"
+if [ -f "$JWKIT_HOME/.jwkit-install-state" ]; then
+    cp "$JWKIT_HOME/.jwkit-install-state" "$state_copy"
+fi
+
 for rc in "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" "$HOME/.bashrc"; do
     remove_path_block "$rc"
 done
@@ -68,4 +94,6 @@ else
     note "No installed jwkit copy found at $JWKIT_HOME"
 fi
 
-note "Kept Python, ffmpeg, git, and all ~/.config/jwkit settings and downloads."
+remove_recorded_dependencies "$state_copy"
+rm -f "$state_copy"
+note "Kept all ~/.config/jwkit settings and downloads. Existing dependencies not recorded as installer-added were kept."

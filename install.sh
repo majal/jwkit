@@ -12,6 +12,8 @@ JWKIT_HOME="${JWKIT_HOME:-$HOME/.jwkit}"
 REPO_URL="https://github.com/majal/jwkit"
 TARBALL_URL="${REPO_URL}/archive/refs/heads/main.tar.gz"
 TOOLS=(ffrife jwdl jwvideo-mux slverse)
+INSTALLED_DEPENDENCIES=()
+DEPENDENCY_MANAGER=""
 
 c_bold()   { printf '\033[1m%s\033[0m\n' "$1"; }
 c_green()  { printf '\033[32m%s\033[0m\n' "$1"; }
@@ -58,6 +60,8 @@ ensure_macos_deps() {
     if [ "${#missing[@]}" -gt 0 ]; then
         c_yellow "Installing via Homebrew: ${missing[*]}"
         brew install "${missing[@]}"
+        DEPENDENCY_MANAGER="brew"
+        INSTALLED_DEPENDENCIES+=("${missing[@]}")
     else
         c_green "Already have python3, ffmpeg, and git."
     fi
@@ -79,17 +83,22 @@ ensure_linux_deps() {
     if command_exists apt-get; then
         sudo apt-get update -y
         sudo apt-get install -y "${missing[@]}"
+        DEPENDENCY_MANAGER="apt-get"
     elif command_exists dnf; then
         sudo dnf install -y "${missing[@]}"
+        DEPENDENCY_MANAGER="dnf"
     elif command_exists pacman; then
         sudo pacman -Sy --noconfirm "${missing[@]}"
+        DEPENDENCY_MANAGER="pacman"
     elif command_exists apk; then
         sudo apk add "${missing[@]}"
+        DEPENDENCY_MANAGER="apk"
     else
         c_red "Couldn't detect apt/dnf/pacman/apk. Please install manually: ${missing[*]}"
         c_red "Then re-run this installer."
         exit 1
     fi
+    INSTALLED_DEPENDENCIES+=("${missing[@]}")
 }
 
 os="$(uname -s)"
@@ -140,6 +149,20 @@ fi
 for tool in "${TOOLS[@]}"; do
     [ -f "$JWKIT_HOME/$tool" ] && chmod +x "$JWKIT_HOME/$tool"
 done
+
+# Record only packages this installer added.  This lets uninstall.sh clean up a
+# standalone install without guessing whether an existing dependency is used
+# by another project.  Keep prior entries when an install is re-run.
+if [ -n "$DEPENDENCY_MANAGER" ] && [ "${#INSTALLED_DEPENDENCIES[@]}" -gt 0 ]; then
+    state_file="$JWKIT_HOME/.jwkit-install-state"
+    state_tmp="${state_file}.tmp.$$"
+    {
+        [ -f "$state_file" ] && cat "$state_file"
+        printf 'dependency_manager=%s\n' "$DEPENDENCY_MANAGER"
+        printf 'dependency=%s\n' "${INSTALLED_DEPENDENCIES[@]}"
+    } | awk '!seen[$0]++' >"$state_tmp"
+    mv "$state_tmp" "$state_file"
+fi
 
 # --- PATH ---
 step "Adding jwkit to your PATH"
