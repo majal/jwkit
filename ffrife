@@ -274,7 +274,6 @@ def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     shown = False
     samples = []
     last_print = 0.0
-    last_print = 0.0
     for line in proc.stdout:
         line = line.strip()
         if not line.startswith("out_time="):
@@ -361,6 +360,7 @@ def run_rife(rife_path, in_frames, out_frames, target_count, slow_after=4.0):
     start = time.time()
     shown = False
     samples = []
+    last_print = 0.0
     try:
         while proc.poll() is None:
             time.sleep(0.5)
