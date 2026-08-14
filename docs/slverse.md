@@ -174,11 +174,13 @@ Same, but sped up 2.5x instead, with an explicit `--speed` (accepts a decimal, a
 ./slverse extract FSL "Rev 13:1" --write --fast 3 5 --speed 2.5
 ```
 
-Time every video encoder this machine's ffmpeg build actually has (real hardware encoders included) against a real cached sample or a synthetic one, and apply the recommendation:
+Time every video encoder this machine's ffmpeg build actually has (real hardware encoders included) against a real cached sample or a synthetic one, sweeping 3 crf values per codec for a real size/quality tradeoff view (`--quick` for one value per codec instead, faster but coarser), and apply the recommendation:
 
 ```bash
 ./slverse benchmark --apply
 ```
+
+The winner is the smallest file among everything at SSIM ≥ 0.98 - but ties within 15% of the smallest go to whichever is fastest, so a barely-smaller-but-3x-slower option doesn't win on noise-level size differences (see `docs/ffrife.md`'s codec comparison for a real example this changed the outcome on).
 
 ## Important Behavior / Defaults
 

@@ -235,6 +235,26 @@ class JwkitCommonBenchmarkTest(unittest.TestCase):
         best = self.common.recommend_from_benchmark(results, ssim_floor=0.98)
         self.assertEqual(best["codec"], "av1")  # smallest among those clearing 0.98, not the absolute smallest
 
+    def test_recommend_prefers_faster_option_on_a_near_tie(self) -> None:
+        # Real-world case this fixes: a crf sweep landed hevc barely
+        # (12%) smaller than av1 but 3x slower to encode - picking hevc
+        # anyway (the old "absolute smallest wins" behavior) trades a lot
+        # of encode time for a noise-level size difference.
+        results = [
+            {"hw": "cpu", "codec": "hevc", "crf": "26", "ok": True, "ssim": 0.9961, "size_bytes": 400_000, "vcodec": "libx265", "seconds": 4.5, "error": None},
+            {"hw": "cpu", "codec": "av1", "crf": "30", "ok": True, "ssim": 0.9963, "size_bytes": 450_000, "vcodec": "libsvtav1", "seconds": 1.5, "error": None},
+        ]
+        best = self.common.recommend_from_benchmark(results, ssim_floor=0.98)
+        self.assertEqual(best["codec"], "av1")
+
+    def test_recommend_still_picks_the_smaller_one_outside_tolerance(self) -> None:
+        results = [
+            {"hw": "cpu", "codec": "hevc", "crf": "20", "ok": True, "ssim": 0.998, "size_bytes": 400_000, "vcodec": "libx265", "seconds": 5.0, "error": None},
+            {"hw": "cpu", "codec": "av1", "crf": "18", "ok": True, "ssim": 0.999, "size_bytes": 800_000, "vcodec": "libsvtav1", "seconds": 1.0, "error": None},  # 2x bigger, well outside 15% tolerance
+        ]
+        best = self.common.recommend_from_benchmark(results, ssim_floor=0.98)
+        self.assertEqual(best["codec"], "hevc")
+
     def test_recommend_falls_back_to_highest_ssim_when_none_clear_floor(self) -> None:
         results = [
             {"hw": "cpu", "codec": "h264", "ok": True, "ssim": 0.90, "size_bytes": 5_000_000, "vcodec": "libx264", "seconds": 1, "error": None},
@@ -249,17 +269,57 @@ class JwkitCommonBenchmarkTest(unittest.TestCase):
 
     def test_format_benchmark_table_sorts_by_size_and_lists_failures(self) -> None:
         results = [
-            {"hw": "cpu", "codec": "h264", "ok": True, "ssim": 0.99, "size_bytes": 5_000_000, "vcodec": "libx264", "seconds": 1.0, "error": None},
-            {"hw": "cpu", "codec": "av1", "ok": True, "ssim": 0.98, "size_bytes": 2_000_000, "vcodec": "libsvtav1", "seconds": 2.0, "error": None},
-            {"hw": "nvenc", "codec": "h264", "ok": False, "ssim": None, "size_bytes": None, "vcodec": "h264_nvenc", "seconds": None, "error": "No such device\nmore detail"},
+            {"hw": "cpu", "codec": "h264", "crf": "20", "ok": True, "ssim": 0.99, "size_bytes": 5_000_000, "vcodec": "libx264", "seconds": 1.0, "error": None},
+            {"hw": "cpu", "codec": "av1", "crf": "30", "ok": True, "ssim": 0.98, "size_bytes": 2_000_000, "vcodec": "libsvtav1", "seconds": 2.0, "error": None},
+            {"hw": "nvenc", "codec": "h264", "crf": "20", "ok": False, "ssim": None, "size_bytes": None, "vcodec": "h264_nvenc", "seconds": None, "error": "No such device\nmore detail"},
         ]
         table = self.common.format_benchmark_table(results)
-        lines = table.splitlines()
-        self.assertLess(lines.index("cpu          av1        2.0s     2.00MB   0.9800"),
-                         lines.index("cpu          h264       1.0s     5.00MB   0.9900"))
+        lines = [line for line in table.splitlines() if line.strip()]
+        av1_line = next(line for line in lines if "av1" in line)
+        h264_ok_line = next(line for line in lines if "cpu" in line and "h264" in line)
+        self.assertLess(lines.index(av1_line), lines.index(h264_ok_line))
+        self.assertIn("2.00MB", av1_line)
+        self.assertIn("0.9800", av1_line)
+        self.assertIn("5.00MB", h264_ok_line)
+        self.assertIn("0.9900", h264_ok_line)
         self.assertIn("unavailable", table)
         self.assertIn("No such device", table)
         self.assertNotIn("more detail", table)  # only the first line of a multi-line error is shown
+
+    def test_run_encoder_benchmark_sweeps_multiple_crf_values(self) -> None:
+        candidates = [("cpu", "av1", "libsvtav1", False)]
+        calls = []
+
+        def fake_run(cmd, check=True, capture_output=False, timeout=None):
+            calls.append(cmd)
+            output = cmd[-1]
+            with open(output, "wb") as f:
+                f.write(b"fake")
+            return mock.Mock(stderr="")
+
+        with mock.patch.object(self.common.subprocess, "run", fake_run), \
+             mock.patch.object(self.common, "measure_ssim", return_value=0.98):
+            results = self.common.run_encoder_benchmark(
+                "ffmpeg", "sample.mp4", candidates=candidates, crf_map={"av1": ["24", "27", "30"]},
+            )
+        self.assertEqual(sorted(r["crf"] for r in results), ["24", "27", "30"])
+        self.assertTrue(all(r["ok"] for r in results))
+
+    def test_run_encoder_benchmark_accepts_single_crf_string_for_backward_compat(self) -> None:
+        candidates = [("cpu", "h264", "libx264", False)]
+
+        def fake_run(cmd, check=True, capture_output=False, timeout=None):
+            with open(cmd[-1], "wb") as f:
+                f.write(b"fake")
+            return mock.Mock(stderr="")
+
+        with mock.patch.object(self.common.subprocess, "run", fake_run), \
+             mock.patch.object(self.common, "measure_ssim", return_value=0.99):
+            results = self.common.run_encoder_benchmark(
+                "ffmpeg", "sample.mp4", candidates=candidates, crf_map={"h264": "20"},
+            )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["crf"], "20")
 
 
 if __name__ == "__main__":

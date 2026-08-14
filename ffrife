@@ -502,15 +502,22 @@ def cmd_setup(config):
     else:
         print("Skipping - run 'ffrife setup' again anytime.")
 
+BENCHMARK_CRF_SWEEP = {"h264": ["18", "20", "23"], "hevc": ["20", "23", "26"], "av1": ["24", "27", "30"]}
+BENCHMARK_CRF_QUICK = {"h264": "20", "hevc": "23", "av1": "30"}
+
 def cmd_benchmark(args, config):
     """Times every video encoder this machine's ffmpeg build actually has
-    against a sample clip, measuring size and SSIM - see
-    _jwkit_common.run_encoder_benchmark. Same engine slverse's own
-    'benchmark' command uses; this one takes --sample directly since ffrife
-    (unlike slverse) has no cache of its own content to pull a
-    representative clip from automatically."""
+    against a sample clip, at a few crf values per codec (BENCHMARK_CRF_SWEEP
+    - a real size/quality tradeoff view, not one guessed point), measuring
+    size and SSIM - see _jwkit_common.run_encoder_benchmark. Same engine
+    slverse's own 'benchmark' command uses; this one takes --sample
+    directly since ffrife (unlike slverse) has no cache of its own content
+    to pull a representative clip from automatically. --quick skips the
+    sweep (one crf per codec) for a faster, coarser answer."""
     ffmpeg_bin = resolve_ffmpeg_binary(config)
+    ffprobe_bin = resolve_ffprobe_binary(config)
     sample = getattr(args, "sample", None)
+    crf_map = BENCHMARK_CRF_QUICK if getattr(args, "quick", False) else BENCHMARK_CRF_SWEEP
     with tempfile.TemporaryDirectory(prefix="ffrife-bench-") as tmp_dir:
         if not sample:
             sample = str(Path(tmp_dir) / "bench_sample.mp4")
@@ -521,8 +528,31 @@ def cmd_benchmark(args, config):
                  "-c:v", "libx264", "-crf", "12", "-preset", "fast", sample],
                 check=True, timeout=60,
             )
+        else:
+            # A whole downloaded chapter (minutes long) as --sample would
+            # multiply every one of the crf sweep's ~15 encodes by its own
+            # full length instead of a few seconds - trim to a short
+            # representative slice first, the same way slverse's own
+            # find_or_generate_bench_sample does for its cached content.
+            try:
+                duration = float(subprocess.run(
+                    [ffprobe_bin, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", sample],
+                    capture_output=True, text=True, timeout=15, check=True,
+                ).stdout.strip())
+            except Exception:
+                duration = 0.0
+            if duration > 12:
+                trimmed = str(Path(tmp_dir) / "bench_sample.mp4")
+                offset = max(0.0, (duration - 8) / 2)
+                subprocess.run(
+                    [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-ss", str(offset), "-t", "8", "-i", sample,
+                     "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-an", trimmed],
+                    check=True, timeout=60,
+                )
+                print(f"--sample is {duration:.0f}s long - using an 8s slice from its middle instead of the whole thing.")
+                sample = trimmed
         print("Trying every encoder this machine's ffmpeg supports - this can take a minute or two:\n")
-        results = _jwkit_common.run_encoder_benchmark(ffmpeg_bin, sample, log=lambda m: print(f"  {m}"))
+        results = _jwkit_common.run_encoder_benchmark(ffmpeg_bin, sample, crf_map=crf_map, log=lambda m: print(f"  {m}"))
 
     print()
     print(_jwkit_common.format_benchmark_table(results))
@@ -530,9 +560,13 @@ def cmd_benchmark(args, config):
     if not best:
         print("\nNo encoder on this machine actually worked - keeping current settings.")
         return None
-    print(f"\n{COLOR.bold(COLOR.green('Recommended:'))} hardware_encoder={best['hw']}, video_codec={best['codec']} (smallest file at SSIM >= 0.98, or highest SSIM available if none cleared that)")
+    print(f"\n{COLOR.bold(COLOR.green('Recommended:'))} hardware_encoder={best['hw']}, video_codec={best['codec']}, video_crf={best['crf']} (smallest file at SSIM >= 0.98, or highest SSIM available if none cleared that)")
     if getattr(args, "apply", False):
         config["hardware_encoder"], config["video_codec"] = best["hw"], best["codec"]
+        # See slverse's own cmd_benchmark comment: "auto" instead of the
+        # literal crf when it's just that codec's normal default, so
+        # video_crf stays correctly adaptive if the codec ever changes.
+        config["video_crf"] = "auto" if best["crf"] == _jwkit_common.AUTO_CRF_BY_CODEC.get(best["codec"]) else best["crf"]
         save_config(config)
         print("Applied and saved.")
     return best
@@ -580,7 +614,8 @@ def build_parser():
 
     p_benchmark = subparsers.add_parser("benchmark", help="Time this machine's video encoders for speed/size/quality and suggest the best default")
     p_benchmark.add_argument("--sample", help="Real clip to benchmark against (default: a synthetic test clip)")
-    p_benchmark.add_argument("--apply", action="store_true", help="Save the recommended hardware_encoder/video_codec to config instead of just printing them")
+    p_benchmark.add_argument("--apply", action="store_true", help="Save the recommended hardware_encoder/video_codec/video_crf to config instead of just printing them")
+    p_benchmark.add_argument("--quick", action="store_true", help="Skip the crf sweep (one crf per codec) for a faster, coarser answer")
 
     p_run = subparsers.add_parser("run", help="Interpolate a file (also the default when no subcommand is given)")
     p_run.add_argument("input", help="Local path or remote URL")
