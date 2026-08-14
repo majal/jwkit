@@ -101,3 +101,22 @@ class FfinpaintInpaintTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as out_dir:
                 with self.assertRaises(RuntimeError):
                     self.ffinpaint.inpaint("in.mp4", Path(out_dir) / "out.mp4", (10, 10, 20, 20), self.config)
+
+
+class FfinpaintColorFlagTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.ffinpaint = load_script_module("ffinpaint")
+
+    def test_color_flag_parses_on_both_subcommands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.ffinpaint.CONFIG_FILE = Path(tmp) / "config.toml"
+            with self.assertRaises(SystemExit):
+                self.ffinpaint.main(["setup", "--color", "--root", "/nope", "--checkpoint", "/nope"])
+        self.assertTrue(self.ffinpaint.COLOR.enabled)
+
+    def test_no_color_flag_disables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.ffinpaint.CONFIG_FILE = Path(tmp) / "config.toml"
+            with self.assertRaises(SystemExit):
+                self.ffinpaint.main(["setup", "--no-color", "--root", "/nope", "--checkpoint", "/nope"])
+        self.assertFalse(self.ffinpaint.COLOR.enabled)

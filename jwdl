@@ -21,6 +21,9 @@ CONFIG_DIR = Path.home() / ".config" / "jwkit" / "jwdl"
 _LEGACY_CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "jwdl"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+# Resolved once at startup by main() -> _jwkit_common.resolve_color_enabled.
+COLOR = _jwkit_common.Colorizer(False)
+
 
 def migrate_legacy_config_dir():
     """One-time move from the pre-unification ~/.config/maj-scripts/jwdl
@@ -77,15 +80,15 @@ LEADING_DOT_RE = re.compile(r"^[^.]+")
 
 
 def echo_y(msg):
-    print(f"\033[93m{msg}\033[0m")
+    print(COLOR.yellow(msg))
 
 
 def echo_g(msg):
-    print(f"\033[92m{msg}\033[0m")
+    print(COLOR.green(msg))
 
 
 def echo_r(msg):
-    print(f"\033[91m{msg}\033[0m")
+    print(COLOR.red(msg))
 
 
 def load_config():
@@ -569,6 +572,20 @@ def run_video(argv, config):
 
 
 def main():
+    global COLOR
+    # Filtered out of sys.argv (rather than registered on a parser) since
+    # 'periodicals'/'video' below dispatch to their own sub-parsers off raw
+    # sys.argv slices before any single top-level parser ever sees them -
+    # this way both flags work regardless of which command family runs.
+    color_override = None
+    if "--no-color" in sys.argv:
+        sys.argv.remove("--no-color")
+        color_override = False
+    elif "--color" in sys.argv:
+        sys.argv.remove("--color")
+        color_override = True
+    COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=color_override))
+
     migrate_legacy_config_dir()
     config = load_config()
 
@@ -594,6 +611,8 @@ def main():
     )
     parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
     parser.add_argument("--workers", type=int, help="parallel downloads per pub (default: 4)")
+    parser.add_argument("--color", action="store_true", help="force colored output for this run (works with 'periodicals'/'video' too - already applied before this parser runs)")
+    parser.add_argument("--no-color", action="store_true", help="disable colored output for this run (works with 'periodicals'/'video' too - already applied before this parser runs)")
     args = parser.parse_args()
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
 
