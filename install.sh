@@ -21,6 +21,15 @@ step()     { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+safe_install_dir() {
+    case "$JWKIT_HOME" in
+        ""|/|"$HOME")
+            c_red "Refusing unsafe JWKIT_HOME: ${JWKIT_HOME:-<empty>}"
+            exit 1
+            ;;
+    esac
+}
+
 on_error() {
     c_red "Something went wrong partway through setup."
     c_red "You can re-run this installer any time - it's safe to repeat."
@@ -29,6 +38,7 @@ on_error() {
 trap on_error ERR
 
 step "Setting up jwkit"
+safe_install_dir
 
 # --- Dependencies ---
 ensure_macos_deps() {
@@ -99,13 +109,29 @@ if command_exists git; then
     if [ -d "$JWKIT_HOME/.git" ]; then
         c_yellow "Updating existing install at $JWKIT_HOME"
         git -C "$JWKIT_HOME" fetch -q origin main
-        git -C "$JWKIT_HOME" reset -q --hard origin/main
+        if ! git -C "$JWKIT_HOME" diff --quiet ||
+           ! git -C "$JWKIT_HOME" diff --cached --quiet ||
+           [ -n "$(git -C "$JWKIT_HOME" ls-files --others --exclude-standard)" ]; then
+            c_yellow "Local changes found; leaving the existing install untouched."
+            c_yellow "Commit, stash, or remove them, then run jwkit-update again."
+        elif ! git -C "$JWKIT_HOME" merge --ff-only origin/main; then
+            c_yellow "Could not fast-forward the existing install; leaving it untouched."
+            c_yellow "Resolve its Git state, then run jwkit-update again."
+        fi
     else
-        rm -rf "$JWKIT_HOME"
+        if [ -e "$JWKIT_HOME" ]; then
+            c_red "Install path exists but is not a jwkit Git checkout: $JWKIT_HOME"
+            c_red "Choose an empty JWKIT_HOME or move the existing directory yourself."
+            exit 1
+        fi
         git clone -q "${REPO_URL}.git" "$JWKIT_HOME"
     fi
 else
-    rm -rf "$JWKIT_HOME"
+    if [ -e "$JWKIT_HOME" ]; then
+        c_red "Install path already exists and Git is unavailable: $JWKIT_HOME"
+        c_red "Install Git, or choose an empty JWKIT_HOME."
+        exit 1
+    fi
     mkdir -p "$JWKIT_HOME"
     curl -fsSL "$TARBALL_URL" | tar -xz -C "$JWKIT_HOME" --strip-components=1
 fi
@@ -136,7 +162,18 @@ case "$(basename "${SHELL:-bash}")" in
         add_path_block "$HOME/.zshrc"
         ;;
     bash)
-        add_path_block "$HOME/.bash_profile"
+        # Bash reads only the first existing login file.  Do not create a
+        # .bash_profile when .profile already owns the user's login setup.
+        login_rc=""
+        for login_rc in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+            if [ -e "$login_rc" ]; then
+                add_path_block "$login_rc"
+                break
+            fi
+        done
+        if [ -z "$login_rc" ] || [ ! -e "$login_rc" ]; then
+            add_path_block "$HOME/.profile"
+        fi
         add_path_block "$HOME/.bashrc"
         ;;
     *)
@@ -156,7 +193,7 @@ chmod +x "$JWKIT_HOME/jwkit-update"
 step "All set!"
 c_green "jwkit is installed at $JWKIT_HOME"
 echo ""
-echo "Open a new terminal window (or run: source ~/.zshrc), then try:"
+echo "Open a new terminal window, then try:"
 c_bold "  slverse --help"
 c_bold "  jwdl list"
 echo ""
