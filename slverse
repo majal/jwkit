@@ -110,7 +110,7 @@ DEFAULT_CONFIG = {
     "cache_dir": str(DEFAULT_CACHE_DIR),
     "cache_policy": "lru",  # keep_all, lru, delete_after_use
     "cache_max_gb": "5",
-    "extract_mode": "onthefly",  # onthefly (stream, no disk use), cache (download chapter, reuse for later verses)
+    "extract_mode": "cache",  # cache by default: reuse a verified chapter; --onthefly is the explicit streaming escape hatch
     "hardware_encoder": "cpu",  # nvenc, videotoolbox, qsv, cpu
     "video_codec": "h264",  # h264, hevc, av1
     "video_crf": "20",
@@ -159,7 +159,7 @@ CONFIG_HELP = {
     "cache_dir": "Where cached full-chapter downloads live",
     "cache_policy": "keep_all, lru, delete_after_use - what happens to a cached chapter after use",
     "cache_max_gb": "Cache size cap in GB - oldest-used chapters evicted first once hit (cache_policy=lru)",
-    "extract_mode": "onthefly (stream, no disk use) or cache (download chapter, reuse for later verses)",
+    "extract_mode": "cache (default, reuse downloaded chapters) or onthefly (explicit streaming, no disk use)",
     "hardware_encoder": "cpu, nvenc, videotoolbox, or qsv",
     "video_codec": "h264, hevc, or av1",
     "video_crf": "Encode quality (lower = higher quality/larger file)",
