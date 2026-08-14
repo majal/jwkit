@@ -41,6 +41,8 @@ Every tool calls `_jwkit_common.maybe_auto_update(jwkit_root)` right after its o
 
 Root-level one-liner installers for non-technical users (`curl | bash` on macOS/Linux, `irm | iex` on Windows) — see the Quick Install section of `README.md`. They install missing dependencies (Python, `ffmpeg`, `git` via Homebrew/apt/dnf/pacman/winget), download jwkit to `~/.jwkit` (`%USERPROFILE%\.jwkit` on Windows), add it to `PATH`, and drop a `jwkit-update` command that re-runs the same script.
 
+`uninstall.sh` / `uninstall.ps1` remove that installed copy and the matching PATH entry only. They deliberately preserve the source checkout, `~/.config/jwkit` configuration/downloads, and dependencies because the installer cannot safely claim those as jwkit-owned.
+
 - Both scripts hardcode a `TOOLS`/`$Tools` list of the top-level commands to make runnable (`slverse`, `ffrife`, `jwdl`, `jwvideo-mux`). **Add new tools to that list in both scripts** when they're added to the repo, or the installer won't make them executable/shimmed.
 - `install.sh` is tested locally by overriding `HOME` to a scratch directory (`HOME=/tmp/fake bash install.sh`) so it never touches a real shell profile during testing.
 - `install.ps1` is **not verified on a real Windows machine** as of 2026-08-13 — it was written to the same patterns as `install.sh` (idempotent, guarded PATH edits, friendly error trap) but there was no Windows environment available to test it in. Treat changes to it with extra care and prefer a real Windows test before relying on it.

@@ -11,6 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
+UNINSTALLER = ROOT / "uninstall.sh"
 MARKER = "# jwkit PATH (added by jwkit's install.sh)"
 
 
@@ -95,3 +96,28 @@ class InstallPathTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Refusing unsafe JWKIT_HOME", result.stderr)
+
+    def test_uninstaller_removes_only_default_install_and_path_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            install_dir = home / ".jwkit"
+            install_dir.mkdir()
+            (install_dir / "jwdl").touch()
+            config = home / ".config" / "jwkit" / "config.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text("auto_update = false\n")
+            profile = home / ".profile"
+            profile.write_text(f"before\n{MARKER}\nexport PATH=\"{install_dir}:$PATH\"\nafter\n")
+
+            subprocess.run(
+                ["bash", str(UNINSTALLER)],
+                check=True,
+                env=os.environ | {"HOME": str(home), "JWKIT_HOME": str(install_dir)},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertFalse(install_dir.exists())
+            self.assertEqual(config.read_text(), "auto_update = false\n")
+            self.assertEqual(profile.read_text(), "before\nafter\n")
