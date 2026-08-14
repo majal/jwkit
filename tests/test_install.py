@@ -84,6 +84,52 @@ class InstallPathTests(unittest.TestCase):
 
             self.assertNotIn("Local changes found", result.stdout)
 
+    def test_install_state_file_does_not_block_an_upgrade(self) -> None:
+        # Real bug: any install that added at least one dependency writes
+        # .jwkit-install-state inside the git-tracked JWKIT_HOME. Before this
+        # fix, that file wasn't excluded from the "any local changes?" check,
+        # so it looked like an untracked local change forever after - the
+        # installer would refuse to fast-forward on every subsequent run,
+        # permanently breaking jwkit-update for exactly the users most
+        # likely to have needed the installer's dependency step in the
+        # first place.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            install_dir = home / ".jwkit"
+            (install_dir / ".git").mkdir(parents=True)
+            for name in ("ffinpaint", "ffrife", "jwdl", "jwvideo-mux", "slverse"):
+                (install_dir / name).touch()
+            (install_dir / ".jwkit-install-state").write_text("dependency_manager=brew\ndependency=ffmpeg\n")
+
+            fake_bin = home / "fake-bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/bin/sh\n"
+                "for arg in \"$@\"; do\n"
+                "  [ \"$arg\" = ls-files ] && { echo .jwkit-install-state; exit 0; }\n"
+                "done\n"
+                "exit 0\n"
+            )
+            fake_git.chmod(0o755)
+
+            result = subprocess.run(
+                ["bash", str(INSTALLER)],
+                check=True,
+                env=os.environ | {
+                    "HOME": str(home),
+                    "JWKIT_HOME": str(install_dir),
+                    "SHELL": "/bin/bash",
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                },
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertNotIn("Local changes found", result.stdout)
+            self.assertEqual((install_dir / ".jwkit-install-state").read_text(), "dependency_manager=brew\ndependency=ffmpeg\n")
+
     def test_rejects_filesystem_root_as_install_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = subprocess.run(
