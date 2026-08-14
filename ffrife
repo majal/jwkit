@@ -167,18 +167,18 @@ def print_progress(downloaded, total, width=30):
         sys.stdout.write(f"\r{downloaded/1e6:.1f} MB downloaded")
     sys.stdout.flush()
 
-def print_time_progress(current_s, total_s, label="", width=30, eta_seconds=None):
+def print_time_progress(current_s, total_s, label="", width=30, eta_seconds=None, done=False):
     frac = (current_s / total_s) if total_s else 0.0
     prefix = f"{label} " if label else ""
-    eta = f", ETA {int(eta_seconds // 60)}m {int(eta_seconds % 60):02d}s" if eta_seconds is not None else ""
-    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current_s:.1f}/{total_s:.1f}s{eta})")
+    suffix = " ✓ Done" if done else (f", ETA {int(eta_seconds // 60)}m {int(eta_seconds % 60):02d}s" if eta_seconds is not None else "")
+    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current_s:.1f}/{total_s:.1f}s{suffix})\033[K")
     sys.stdout.flush()
 
-def print_count_progress(current, total, label="", width=30, eta_seconds=None):
+def print_count_progress(current, total, label="", width=30, eta_seconds=None, done=False):
     frac = (current / total) if total else 0.0
     prefix = f"{label} " if label else ""
-    eta = f", ETA {int(eta_seconds // 60)}m {int(eta_seconds % 60):02d}s" if eta_seconds is not None else ""
-    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current}/{total} frames{eta})")
+    suffix = " ✓ Done" if done else (f", ETA {int(eta_seconds // 60)}m {int(eta_seconds % 60):02d}s" if eta_seconds is not None else "")
+    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current}/{total} frames{suffix})\033[K")
     sys.stdout.flush()
 
 def parse_hms(ts):
@@ -292,7 +292,7 @@ def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     proc.stdout.close()
     proc.wait()
     if shown:
-        print_time_progress(duration, duration, label=f"{label} ✓")
+        print_time_progress(duration, duration, label=label, done=True)
         print()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
@@ -382,7 +382,7 @@ def run_rife(rife_path, in_frames, out_frames, target_count, slow_after=4.0):
                 proc.kill()
                 proc.wait()
     if shown:
-        print_count_progress(target_count, target_count, label="RIFE ✓")
+        print_count_progress(target_count, target_count, label="RIFE", done=True)
         print()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, [rife_path])
