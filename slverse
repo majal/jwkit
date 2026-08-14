@@ -722,7 +722,7 @@ def run_ffmpeg(args, duration=None, slow_after=4.0):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
     start = time.time()
     shown = False
-    eta_estimator, last_print = _jwkit_common.ProgressETA(duration), 0.0
+    eta_estimator, last_print, last_eta, eta_display = _jwkit_common.ProgressETA(duration), 0.0, 0.0, None
     for line in proc.stdout:
         line = line.strip()
         if not line.startswith("out_time="):
@@ -734,12 +734,14 @@ def run_ffmpeg(args, duration=None, slow_after=4.0):
         if not shown and time.time() - start > slow_after:
             shown = True
         now = time.time(); eta = eta_estimator.update(current, now)
-        if shown and now - last_print >= 5.0:
-            print_time_progress(current, duration, label="Encoding", eta_seconds=eta)
+        if now - last_eta >= 5.0: eta_display, last_eta = eta, now
+        if shown and now - last_print >= 1.0:
+            print_time_progress(current, duration, label="Encoding", eta_seconds=eta_display)
             last_print = now
     proc.stdout.close()
     proc.wait()
     if shown:
+        print_time_progress(duration, duration, label="Encoding", eta_seconds=0)
         print()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
