@@ -255,14 +255,27 @@ def focus_process(pid):
         if result.returncode == 0:
             return
 
-def launch_mpv(args, wait=True):
+def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, geometry=None):
     """Spawn mpv with `args` and try to bring it to the front on every OS.
     --force-window=immediate plus mpv's own --focus-on=open default (mpv
     0.34+) cover Linux/Windows window managers reasonably well; see
-    focus_process for the macOS-specific piece. --no-keep-open matches old
-    ffv's mpv_opts (mpv's own default is already --keep-open=no, so this
-    is belt-and-suspenders, not a behavior change)."""
-    cmd = ["mpv", "--no-config", "--fullscreen=yes", "--force-window=immediate", "--no-keep-open"] + list(args)
+    focus_process for the macOS-specific piece.
+
+    keep_open=True (the default) means the window sits on the last frame
+    instead of closing itself once playback ends, so you can seek back and
+    review it - matches mpv's own factory default; the old --no-keep-open
+    here was old ffv's choice, not something we need to keep. fullscreen/
+    paused/geometry are the extra knobs cmd_find's multi-language --play
+    uses to open several matches windowed, paused, and cascaded instead of
+    each one grabbing the whole screen in turn."""
+    cmd = ["mpv", "--no-config", "--force-window=immediate"]
+    cmd.append("--fullscreen=yes" if fullscreen else "--fullscreen=no")
+    cmd.append("--keep-open=yes" if keep_open else "--no-keep-open")
+    if paused:
+        cmd.append("--pause")
+    if geometry:
+        cmd.append(f"--geometry={geometry}")
+    cmd += list(args)
     proc = subprocess.Popen(cmd)
     focus_process(proc.pid)
     if wait:
@@ -273,8 +286,11 @@ def launch_ffplay(args, wait=True):
     """Same idea as launch_mpv but for ffplay, used by the default preview
     path (see preview_verse) - ffplay is SDL-based and usually grabs focus
     fine on its own, but macOS's bare-CLI-binary activation gap applies to
-    it exactly the same way it does to mpv."""
-    cmd = [FFPLAY_BIN, "-hide_banner", "-loglevel", "error", "-autoexit"] + list(args)
+    it exactly the same way it does to mpv. No -autoexit: the window sits
+    on the last frame instead of closing itself, so you can seek back
+    (left/right arrow, etc - ffplay's own default keys) and review it;
+    close the window yourself (q, or the window close button) when done."""
+    cmd = [FFPLAY_BIN, "-hide_banner", "-loglevel", "error"] + list(args)
     proc = subprocess.Popen(cmd)
     focus_process(proc.pid)
     if wait:
@@ -1609,12 +1625,29 @@ def cmd_find(args, config):
         if not command_exists("mpv"):
             print("(--play needs mpv, which isn't installed)")
         else:
-            for r in results:
-                if not r["found"]:
-                    continue
+            to_play = [r for r in results if r["found"]]
+            multi = len(to_play) > 1
+            if multi:
+                print(f"\nOpening {len(to_play)} preview windows, one per language, all paused - unpause each to review it.")
+            for i, r in enumerate(to_play):
                 start_str = f"{int(r['start']//3600):02d}:{int(r['start']%3600//60):02d}:{r['start']%60:06.3f}"
                 dur = r["end"] - r["start"]
-                launch_mpv([f"--start={start_str}", f"--length={dur:.3f}", r["url"]], wait=False)
+                # Multiple matches: windowed (not fullscreen, so several can
+                # be visible at once) and cascaded so they don't stack
+                # exactly on top of each other; a single match keeps the
+                # old fullscreen-and-autoplay behavior. Every mpv window
+                # here is spawned via subprocess.Popen with wait=False, so
+                # this loop never blocks - true on macOS/Linux/Windows
+                # alike, since a Popen child outlives its parent's normal
+                # exit on all three without any extra detachment flags.
+                geometry = f"480x270+{40 + (i % 5) * 60}+{40 + (i % 5) * 60}" if multi else None
+                launch_mpv(
+                    [f"--start={start_str}", f"--length={dur:.3f}", r["url"]],
+                    wait=False,
+                    fullscreen=not multi,
+                    paused=multi,
+                    geometry=geometry,
+                )
 
 def cmd_cache(args, config):
     state = get_state()
