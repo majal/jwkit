@@ -859,7 +859,7 @@ def measure_text_size(text, font_path, fontsize):
             pass
     return round(len(text) * fontsize * 0.55), round(fontsize * 1.3)
 
-def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box, source_labels=None):
+def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box, source_labels=None, fade_outs=None):
     """delogo (blur out the source video's own burned-in reference caption)
     + drawtext (the correct reference, in the caption position old ffv
     used) + a small label of which sign language this clip came from -
@@ -913,6 +913,14 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     fontsize = int(config.get("overlay_fontsize", DEFAULT_CONFIG["overlay_fontsize"]))
     alpha = config.get("overlay_alpha", DEFAULT_CONFIG["overlay_alpha"])
     label_alpha = config.get("overlay_source_label_alpha", DEFAULT_CONFIG["overlay_source_label_alpha"])
+    def fading_alpha(base):
+        # JW supplies endTransitionDuration for paragraph/chapter ends.  Make
+        # our replacement caption disappear with that fade rather than remain
+        # visibly static over a blackening source frame.
+        expr = str(base)
+        for fade_start, fade_end in reversed(fade_outs or []):
+            expr = f"if(between(t\\,{fade_start:.3f}\\,{fade_end:.3f})\\,{base}*({fade_end:.3f}-t)/{fade_end - fade_start:.3f}\\,{expr})"
+        return expr
     width_pad = int(config.get("delogo_width_pad", DEFAULT_CONFIG["delogo_width_pad"]))
     height_pad = int(config.get("delogo_height_pad", DEFAULT_CONFIG["delogo_height_pad"]))
 
@@ -938,16 +946,16 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     if not skip_reference:
         show = 1 if show_box else 0
         delogo = f"delogo=x={x - 5}:y={y - 5}:w={w + 10 + width_pad}:h={h + 5 + height_pad}:show={show}"
-        drawtext = f"drawtext=text='{esc(label_text)}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y}:alpha={alpha}"
+        drawtext = f"drawtext=text='{esc(label_text)}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y}:alpha='{fading_alpha(alpha)}'"
         filters += [delogo, drawtext]
 
     if show_label:
-        drawtext_ll = f"drawtext=text='{lang_u}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y + h - 5}:alpha={label_alpha}"
+        drawtext_ll = f"drawtext=text='{lang_u}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y + h - 5}:alpha='{fading_alpha(label_alpha)}'"
         filters.append(drawtext_ll)
 
     return ",".join(filters) if filters else None
 
-def preview_verse(source, start_time, end_time, book_name, chapter, verse_label, lang, config, use_mpv=False, source_url=None, source_labels=None):
+def preview_verse(source, start_time, end_time, book_name, chapter, verse_label, lang, config, use_mpv=False, source_url=None, source_labels=None, fade_outs=None):
     """Default 'slverse extract' behavior (no --write): play the verse with
     its overlay applied live - including a visible box where delogo would
     remove the source caption - without writing anything to disk. Mirrors
@@ -955,7 +963,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
     (fastest - no encode at all), while mpv can't take -vf on a remote/
     local source directly, so --play/-m instead makes a quick ultrafast
     temp clip first, the same tradeoff the old script made."""
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True, source_labels=source_labels)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True, source_labels=source_labels, fade_outs=fade_outs)
     duration = end_time - start_time
 
     from_cache = source_url is not None and str(source) != str(source_url)
@@ -990,7 +998,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
         print(f"Source: {source_url}")
     launch_ffplay(ffplay_args)
 
-def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False, source_labels=None, kept_segments=None):
+def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False, source_labels=None, kept_segments=None, fade_outs=None):
     """Single-pass: trim + overlay + (for framerate/minterpolate) the fps
     filter all happen in ONE ffmpeg encode, straight from `source`. Used to
     be two full lossy re-encode generations (extract-with-overlay, then a
@@ -1010,7 +1018,7 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     has_audio_stream - so this is usually moot in practice). Not combined
     with the rife engine here - ffrife owns its own PNG extraction and
     doesn't know about kept_segments."""
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, fade_outs=fade_outs)
     engine = config.get("interpolation_engine", "none")
     duration = end_time - start_time
     segments = kept_segments or [(0.0, duration)]
@@ -1662,7 +1670,7 @@ def clamp_offset_window(natural_start, natural_end, offset_start, offset_end, la
         print(f"{prefix}--offset-start/--offset-end overshot this verse's own {natural_duration:.3f}s window - clamped to {start - natural_start:.3f}s..{end - natural_start:.3f}s (relative to its natural start).")
     return start, end
 
-def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_transition=False, trim_mid_transitions=None, offset_start=0.0, offset_end=0.0):
+def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_transition=False, trim_mid_transitions=None, offset_start=0.0, offset_end=0.0, clip_window=None):
     """Return (start, end, url, checksum, valid_verses, source_labels,
     kept_segments) for a verse range, using the saved per-language index
     when we have it and falling back to a live API call (which also
@@ -1724,6 +1732,9 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
         if end_transition > 0 and end - end_transition > start:
             end -= end_transition
 
+    if clip_window:
+        offset_start, clip_end = clip_window
+        offset_end = clip_end - (end - start)
     if offset_start or offset_end:
         start, end = clamp_offset_window(start, end, offset_start, offset_end, lang=lang)
 
@@ -1734,6 +1745,22 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
 
     source_labels = [chapters_meta[v]["label"] for v in valid_verses if chapters_meta[v].get("label")]
     return start, end, entry["url"], entry.get("checksum"), valid_verses, source_labels, kept_segments
+
+def overlay_fade_outs(lang, book_num, chapter, valid_verses, start, end, config, keep_end_transition=False, trim_mid_transitions=None):
+    """Metadata-derived fade-out intervals, relative to this output window."""
+    meta = markers_to_verse_times(load_index(lang).get(f"{book_num}_{chapter}", {}).get("markers", []))
+    trim_end = str(config.get("trim_end_transition", DEFAULT_CONFIG["trim_end_transition"])).strip().lower() != "false" and not keep_end_transition
+    trim_mid = str(config.get("trim_mid_transitions", DEFAULT_CONFIG["trim_mid_transitions"])).strip().lower() == "true" if trim_mid_transitions is None else trim_mid_transitions
+    fades = []
+    for v in valid_verses:
+        transition = meta.get(v, {}).get("end_transition", 0)
+        if not transition or (v == valid_verses[-1] and trim_end) or (v != valid_verses[-1] and trim_mid):
+            continue
+        fade_end = meta[v]["end"]
+        fade_start = fade_end - transition
+        if fade_end > start and fade_start < end:
+            fades.append((max(fade_start, start) - start, min(fade_end, end) - start))
+    return fades
 
 def resolve_retime_args(args, duration):
     """Turn --slow/--fast's raw TIME strings into (mode, boundaries,
@@ -1758,6 +1785,15 @@ def resolve_retime_args(args, duration):
         return None, None, None, f"--{mode} times must be strictly increasing and within (0, {duration:.2f}s) - got {raw}"
     return mode, boundaries, speed, None
 
+def parse_clip_window(value):
+    try:
+        start, end = (float(part) for part in value.split(":", 1))
+    except (ValueError, AttributeError):
+        raise argparse.ArgumentTypeError("must be START:END seconds relative to the verse window")
+    if start < 0 or end < 0:
+        raise argparse.ArgumentTypeError("START and END must be non-negative")
+    return start, end
+
 def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state):
     window = resolve_verse_window(
         lang, book_num, chapter, verses, config,
@@ -1765,10 +1801,12 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         trim_mid_transitions=True if getattr(args, "trim_mid_transitions", False) else None,
         offset_start=getattr(args, "offset_start", None) or 0.0,
         offset_end=getattr(args, "offset_end", None) or 0.0,
+        clip_window=getattr(args, "clip_window", None),
     )
     if not window:
         return lang, None, f"Verses {verses} not found for {lang} (video may not exist for this chapter in this language yet)."
     start_time, end_time, url, checksum, valid_verses, source_labels, kept_segments = window
+    fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None)
     verses_str = format_verses_label(valid_verses)
     out_filename = f"{book_name.replace(' ', '_')}_{chapter}_{'_'.join(map(str, valid_verses))}_{lang}.mp4"
 
@@ -1796,7 +1834,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
                     source = str(cached)
                 # else: download failed (offline, CDN hiccup, etc) - fall
                 # back to streaming straight from the URL for this preview.
-        preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url, source_labels=source_labels)
+        preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url, source_labels=source_labels, fade_outs=fade_outs)
         return lang, None, None
 
     mode, boundaries, speed, retime_error = resolve_retime_args(args, end_time - start_time)
@@ -1817,7 +1855,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         if mode:
             extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels)
         else:
-            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments)
+            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs)
     else:
         cache_dir = Path(config["cache_dir"]) / lang
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1833,7 +1871,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         if mode:
             extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels)
         else:
-            extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False, source_labels=source_labels, kept_segments=kept_segments)
+            extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs)
 
         key = f"{book_num}_{chapter}"
         index = load_index(lang)
@@ -2161,6 +2199,7 @@ def main():
     p_extract.add_argument("--trim-mid-transitions", action="store_true", help="Also cut mid-range paragraph transitions inside a multi-verse range this once, overriding trim_mid_transitions for this run only")
     p_extract.add_argument("-s", "--offset-start", type=float, metavar="SECONDS", help="Nudge the verse range's own start by this many seconds (either sign) - e.g. 5.302 to skip the first 5.302s and play to the natural end")
     p_extract.add_argument("-e", "--offset-end", type=float, metavar="SECONDS", help="Nudge the verse range's own end by this many seconds (either sign) - e.g. -3 to end 3s early")
+    p_extract.add_argument("--window", dest="clip_window", type=parse_clip_window, metavar="START:END", help="Keep one relative slice of the natural verse window, e.g. --window 3.567:10.003")
     p_extract_retime = p_extract.add_mutually_exclusive_group()
     p_extract_retime.add_argument("--slow", nargs="+", metavar="TIME", help="Split the verse at TIME(s) (seconds or HH:MM:SS, relative to the verse's own start) into alternating normal/slow sections (2nd, 4th, ... retimed). Needs --write. Video-only output (matches the standalone ffslow tool).")
     p_extract_retime.add_argument("--fast", nargs="+", metavar="TIME", help="Same as --slow but alternating normal/fast sections (1st, 3rd, ... retimed) - matches the standalone fffast tool.")
