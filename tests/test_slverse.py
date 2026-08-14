@@ -965,6 +965,11 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         self.assertTrue(hasattr(ffrife, "interpolate"))
         self.assertTrue(hasattr(ffrife, "install_rife"))
 
+    def test_delogo_box_and_drawtext_split(self) -> None:
+        overlay = "delogo=x=88:y=49:w=240:h=60:show=0,drawtext=text='Psalm'"
+        self.assertEqual(self.slverse.delogo_box_from_filter(overlay), (88, 49, 240, 60))
+        self.assertEqual(self.slverse.without_delogo(overlay), "drawtext=text='Psalm'")
+
     def test_load_ffrife_is_cached(self) -> None:
         first = self.slverse.load_ffrife()
         second = self.slverse.load_ffrife()

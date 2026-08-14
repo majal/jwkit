@@ -28,7 +28,7 @@
 
 ## What It Doesn't Do (Yet)
 
-- **Full delogo alternative for moving foreground.** `delogo` is a static rectangle blur, so an ASL signer's hand passing in front of the caption gets blurred along with it — there's no motion-awareness. Genuinely fixing that needs temporal-aware AI video inpainting (e.g. [ProPainter](https://github.com/sczhou/ProPainter) or [E2FGVI](https://github.com/MCG-NJU/E2FGVI)) that can tell "background caption to remove" apart from "foreground hand to keep" frame-to-frame. That's a real dependency (Python/PyTorch, GPU-recommended) on the scale of the existing `rife-ncnn-vulkan` integration, not a quick filter swap — not bundled yet. If you want to experiment with one of those tools directly on an extracted clip in the meantime, `slverse`'s job (accurate windowing + accurate replacement text) still saves you the manual timestamping.
+- **Lossless inpaint + RIFE relay.** Optional E2FGVI-HQ inpainting is available through [`ffinpaint`](ffinpaint.md), but the unmodified upstream runner emits MP4, so it cannot yet share RIFE's lossless PNG relay. The integration is opt-in because E2FGVI-HQ is CC BY-NC 4.0 and needs a separately installed GPU/PyTorch checkout.
 
 ## Supported Platforms
 
@@ -85,6 +85,7 @@ Nearly every behavior is a config key, not a fixed default meant for one setup. 
 | `show_source_lang_label` | `true` | The small "which SL this came from" label under the reference — independent of `overlay_source_label_alpha`, which only controls its opacity. |
 | `mpv_show_osc` | `true` | mpv's on-screen controller that appears on mouse movement, for every mpv window `slverse` opens. `slverse` always passes `--no-config` to mpv (for reproducibility across machines), so a personal `mpv.conf` that already disables this doesn't apply — set `false` here instead to match a "nothing shows on hover" setup. This is a per-user preference, not something worth defaulting off for everyone. |
 | `delogo_width_pad` / `delogo_height_pad` | `10` / `10` | Extra px of safety margin beyond the auto-measured source caption size. |
+| `delogo_engine` | `blur` | `blur` is the normal fast filter; `auto` detects likely foreground occlusion and calls configured `ffinpaint`; `inpaint` always tries it. |
 | `font_family` / `font_weight_main` / `font_weight_estimator` | `noto-sans-display` / `600` / `400` | Overlay typography — see `FONT_FAMILIES` in the script for the other Google Fonts options. |
 | `download_max_attempts` / `download_retry_backoff` | `3` / `2` | Retry behavior for chapter/font downloads. |
 

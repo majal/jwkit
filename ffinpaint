@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Optional, user-installed video inpainting bridge for jwkit.
+
+This tool deliberately does not download, vendor, or redistribute model code
+or weights.  E2FGVI-HQ is CC BY-NC 4.0; an operator who is permitted to use
+it installs it separately, then points this bridge at that checkout.
+"""
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _jwkit_common
+
+CONFIG_DIR = Path.home() / ".config" / "jwkit" / "ffinpaint"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+DEFAULT_CONFIG = {
+    "backend": "e2fgvi-hq",
+    "e2fgvi_root": "",
+    "e2fgvi_checkpoint": "",
+    "fallback": "blur",
+}
+FFMPEG_BIN = "ffmpeg"
+FFPROBE_BIN = "ffprobe"
+
+def load_config():
+    config = DEFAULT_CONFIG.copy()
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.split("=", 1)
+                config[key.strip()] = value.strip().strip("\"'")
+    return config
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text("".join(f'{key} = "{value}"\n' for key, value in config.items()))
+
+def configured(config):
+    root = Path(config.get("e2fgvi_root", ""))
+    checkpoint = Path(config.get("e2fgvi_checkpoint", ""))
+    return root.is_dir() and (root / "test.py").is_file() and checkpoint.is_file()
+
+def write_mask(path, width, height, box):
+    """Write a binary PGM mask; Pillow in E2FGVI accepts it as an L image."""
+    x, y, w, h = box
+    x, y = max(0, x), max(0, y)
+    x2, y2 = min(width, x + w), min(height, y + h)
+    row = bytearray(width)
+    for i in range(x, x2):
+        row[i] = 255
+    with path.open("wb") as out:
+        out.write(f"P5\n{width} {height}\n255\n".encode())
+        for line in range(height):
+            out.write(row if y <= line < y2 else bytes(width))
+
+def probe_size(source):
+    result = subprocess.run([FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,r_frame_rate", "-of", "json", str(source)], check=True, capture_output=True, text=True)
+    stream = json.loads(result.stdout)["streams"][0]
+    num, den = stream.get("r_frame_rate", "30/1").split("/", 1)
+    return int(stream["width"]), int(stream["height"]), float(num) / float(den)
+
+def inpaint(source, output, box, config, start=None, end=None):
+    """Run a locally installed E2FGVI-HQ checkout. Returns False if absent.
+
+    The upstream runner accepts a lossless frame directory and frame-wise
+    masks.  It writes MP4 itself, so callers should apply their final overlay
+    in one subsequent encode.  This is intentionally explicit rather than
+    pretending the unmodified upstream runner can provide PNG output.
+    """
+    if not configured(config):
+        return False
+    root = Path(config["e2fgvi_root"])
+    checkpoint = Path(config["e2fgvi_checkpoint"])
+    width, height, fps = probe_size(source)
+    with tempfile.TemporaryDirectory(prefix="ffinpaint-") as tmp:
+        tmp = Path(tmp); frames = tmp / "frames"; masks = tmp / "masks"
+        frames.mkdir(); masks.mkdir()
+        extract = []
+        if start is not None: extract += ["-ss", str(start)]
+        if end is not None: extract += ["-to", str(end)]
+        extract += ["-i", str(source), "-vsync", "0", str(frames / "%08d.png")]
+        subprocess.run([FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y"] + extract, check=True)
+        frame_paths = sorted(frames.glob("*.png"))
+        if not frame_paths:
+            raise RuntimeError("ffmpeg produced no frames for inpainting")
+        for index, _ in enumerate(frame_paths, 1):
+            write_mask(masks / f"{index:08d}.pgm", width, height, box)
+        cmd = [sys.executable, str(root / "test.py"), "--model", "e2fgvi_hq", "--video", str(frames), "--mask", str(masks), "--ckpt", str(checkpoint), "--savefps", str(round(fps))]
+        subprocess.run(cmd, cwd=tmp, check=True)
+        generated = tmp / "results" / "frames_results.mp4"
+        if not generated.exists():
+            raise RuntimeError("E2FGVI-HQ did not create its expected result video")
+        shutil.copyfile(generated, output)
+    return True
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Run an opt-in, locally installed E2FGVI-HQ backend.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    setup = sub.add_parser("setup"); setup.add_argument("--root"); setup.add_argument("--checkpoint")
+    run = sub.add_parser("run"); run.add_argument("input"); run.add_argument("-o", "--output", required=True); run.add_argument("--box", required=True); run.add_argument("--start", type=float); run.add_argument("--end", type=float)
+    args = parser.parse_args(argv)
+    _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
+    config = load_config()
+    if args.command == "setup":
+        print("E2FGVI-HQ is CC BY-NC 4.0. Install it and its weights only if that license permits your use.")
+        config["e2fgvi_root"] = args.root or input("Path to your E2FGVI checkout: ").strip()
+        config["e2fgvi_checkpoint"] = args.checkpoint or input("Path to E2FGVI-HQ-CVPR22.pth: ").strip()
+        if not configured(config): raise SystemExit("That checkout/test.py or checkpoint was not found.")
+        save_config(config); return
+    box = tuple(int(part) for part in args.box.split(","))
+    if len(box) != 4: raise SystemExit("--box must be x,y,w,h")
+    if not inpaint(args.input, args.output, box, config, args.start, args.end):
+        raise SystemExit("E2FGVI-HQ is not configured; run 'ffinpaint setup'.")
+
+if __name__ == "__main__": main()

@@ -116,6 +116,8 @@ DEFAULT_CONFIG = {
     "video_crf": "auto",  # codec-specific balanced quality: h264=20, hevc=23, av1=30
     "video_preset": "slow",
     "interpolation_engine": "none",  # none, minterpolate, rife, framerate - "rife" delegates to the sibling ffrife tool; see its own config for rife_binary_path/rife_fallback_engine
+    "delogo_engine": "blur",  # blur, auto, inpaint; optional inpainting is delegated to ffinpaint
+    "delogo_inpaint_fallback": "blur",  # blur or error when auto/inpaint has no configured backend
     "languages": "ASL,FSL,BVL,INI,SPE",
     "sync_workers": "4",
     "extract_workers": "3",
@@ -165,6 +167,8 @@ CONFIG_HELP = {
     "video_crf": "Encode quality (lower = higher quality/larger file)",
     "video_preset": "ffmpeg encoder preset (e.g. slow, medium, fast)",
     "interpolation_engine": "none, minterpolate, framerate, or rife (delegates to the sibling ffrife tool)",
+    "delogo_engine": "blur (default), auto (detect occlusion), or inpaint (requires the optional ffinpaint backend)",
+    "delogo_inpaint_fallback": "blur (default) or error if the optional inpainting backend is unavailable",
     "languages": "Default language list for 'all' and for 'sync'/'langs'",
     "sync_workers": "Parallel workers for 'sync all'",
     "extract_workers": "Parallel workers for 'extract all'/'bulk'",
@@ -450,6 +454,7 @@ def resolve_ffprobe_binary(config):
     return candidates[0] if candidates else "ffprobe"
 
 _FFRIFE_MODULE = None
+_FFINPAINT_MODULE = None
 
 def load_ffrife():
     """Import the sibling `ffrife` script as a module (same pattern
@@ -470,6 +475,20 @@ def load_ffrife():
         module.FFPROBE_BIN = FFPROBE_BIN
         _FFRIFE_MODULE = module
     return _FFRIFE_MODULE
+
+def load_ffinpaint():
+    """Lazily import the optional sibling inpainting bridge."""
+    global _FFINPAINT_MODULE
+    if _FFINPAINT_MODULE is None:
+        script_path = Path(__file__).resolve().parent / "ffinpaint"
+        loader = SourceFileLoader("ffinpaint", str(script_path))
+        spec = importlib.util.spec_from_loader("ffinpaint", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        module.FFMPEG_BIN = FFMPEG_BIN
+        module.FFPROBE_BIN = FFPROBE_BIN
+        _FFINPAINT_MODULE = module
+    return _FFINPAINT_MODULE
 
 def ffrife_config_for(config):
     """Bridges slverse's own encode-quality settings into ffrife's config
@@ -1038,6 +1057,58 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
         print(f"Source: {source_url}")
     launch_ffplay(ffplay_args)
 
+def delogo_box_from_filter(overlay):
+    """Return x/y/w/h from our own delogo filter, if this overlay has one."""
+    if not overlay:
+        return None
+    match = re.search(r"delogo=x=(\d+):y=(\d+):w=(\d+):h=(\d+)", overlay)
+    return tuple(map(int, match.groups())) if match else None
+
+def without_delogo(overlay):
+    """Keep drawtext filters after an inpainting backend removed the caption."""
+    return ",".join(part for part in (overlay or "").split(",") if not part.startswith("delogo=")) or None
+
+def detect_delogo_occlusion(source, box, start_time, end_time, samples=5):
+    """Cheap foreground test for the flat-background SL caption region.
+
+    It compares each box pixel to the median colour of a thin surrounding
+    border in the same decoded frame.  This deliberately has no image/Python
+    dependency: ffmpeg returns RGB bytes directly.  A positive result is a
+    conservative prompt to use an already configured temporal backend, not a
+    claim that every deviation is a hand.
+    """
+    x, y, w, h = box; pad = 8
+    left, top = max(0, x - pad), max(0, y - pad)
+    cw, ch = w + (x - left) + pad, h + (y - top) + pad
+    if cw <= w or ch <= h or end_time <= start_time:
+        return False
+    hits = 0
+    for i in range(samples):
+        timestamp = start_time + (end_time - start_time) * (i + 0.5) / samples
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-ss", str(timestamp), "-i", str(source), "-frames:v", "1", "-vf", f"crop={cw}:{ch}:{left}:{top},format=rgb24", "-f", "rawvideo", "pipe:1"]
+        try:
+            raw = subprocess.run(cmd, check=True, capture_output=True, timeout=15).stdout
+        except Exception:
+            return False
+        if len(raw) != cw * ch * 3:
+            continue
+        inside, border = [], []
+        ix, iy = x - left, y - top
+        for py in range(ch):
+            for px in range(cw):
+                value = raw[(py * cw + px) * 3:(py * cw + px) * 3 + 3]
+                if ix <= px < ix + w and iy <= py < iy + h:
+                    inside.append(value)
+                else:
+                    border.append(value)
+        if not border:
+            continue
+        reference = tuple(sorted(pixel[c] for pixel in border)[len(border) // 2] for c in range(3))
+        deviating = sum(sum(abs(pixel[c] - reference[c]) for c in range(3)) > 75 for pixel in inside)
+        if deviating / max(1, len(inside)) > 0.025:
+            hits += 1
+    return hits >= max(1, samples // 3)
+
 def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False, source_labels=None, kept_segments=None, fade_outs=None, metadata_args=None):
     """Single-pass: trim + overlay + (for framerate/minterpolate) the fps
     filter all happen in ONE ffmpeg encode, straight from `source`. Used to
@@ -1062,6 +1133,27 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     engine = config.get("interpolation_engine", "none")
     duration = end_time - start_time
     segments = kept_segments or [(0.0, duration)]
+
+    delogo_engine = str(config.get("delogo_engine", "blur")).lower()
+    box = delogo_box_from_filter(overlay)
+    wants_inpaint = delogo_engine == "inpaint" or (delogo_engine == "auto" and box and detect_delogo_occlusion(source, box, start_time, end_time))
+    if wants_inpaint and box and len(segments) == 1 and engine == "none":
+        ffinpaint = load_ffinpaint()
+        with tempfile.TemporaryDirectory(prefix="slverse-inpaint-") as tmp_dir:
+            inpainted = Path(tmp_dir) / "inpainted.mp4"
+            if ffinpaint.inpaint(source, inpainted, box, ffinpaint.load_config(), start_time, end_time):
+                # E2FGVI's unmodified upstream runner emits MP4, so this is
+                # the final overlay encode.  RIFE composition remains safely
+                # on the blur path until an upstream PNG-output API exists.
+                cmd = ["-i", str(inpainted)]
+                text_overlay = without_delogo(overlay)
+                if text_overlay: cmd += ["-vf", text_overlay]
+                cmd += ["-c:a", "copy"] + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
+                run_ffmpeg(cmd, duration=duration)
+                return
+        if str(config.get("delogo_inpaint_fallback", "blur")).lower() == "error":
+            raise RuntimeError("Inpainting was selected but ffinpaint is not configured; run 'ffinpaint setup'.")
+        print("(inpainting backend is not configured; using the normal delogo blur)")
 
     if engine == "rife":
         if len(segments) > 1:

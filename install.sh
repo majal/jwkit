@@ -11,7 +11,7 @@ set -euo pipefail
 JWKIT_HOME="${JWKIT_HOME:-$HOME/.jwkit}"
 REPO_URL="https://github.com/majal/jwkit"
 TARBALL_URL="${REPO_URL}/archive/refs/heads/main.tar.gz"
-TOOLS=(ffrife jwdl jwvideo-mux slverse)
+TOOLS=(ffinpaint ffrife jwdl jwvideo-mux slverse)
 INSTALLED_DEPENDENCIES=()
 DEPENDENCY_MANAGER=""
 
