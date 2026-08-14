@@ -7,7 +7,9 @@ Currently just the on-run auto-update check. Not jw.org-specific and not
 tied to any one tool, so new shared cross-tool concerns belong here too.
 """
 import json
+import re
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -105,6 +107,24 @@ def videotoolbox_quality_from_crf(crf):
     return max(1, min(100, round(100 - crf_val)))
 
 
+def _encode_args_for(hw, codec, vcodec, used_hw, crf, preset):
+    """The actual -c:v/... argument shape for one specific, already-resolved
+    (hw, codec, vcodec) combo - factored out of build_encode_args so
+    run_encoder_benchmark can build args for combos it's explicitly testing
+    without going through resolve_video_encoder's fallback-chain logic."""
+    if used_hw and hw == "nvenc":
+        args = ["-c:v", vcodec, "-preset", preset, "-cq", str(nvenc_quality_from_crf(crf))]
+    elif used_hw and hw == "videotoolbox":
+        args = ["-c:v", vcodec, "-q:v", str(videotoolbox_quality_from_crf(crf))]
+    elif used_hw and hw == "qsv":
+        args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
+    else:
+        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", ("6" if codec == "av1" and preset == "slow" else preset)]
+        if codec == "av1" and vcodec == "libsvtav1":
+            args += ["-svtav1-params", "tune=0"]
+    return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+
+
 def build_encode_args(ffmpeg_bin, config, notice=True):
     """Shared by slverse and ffrife (identical encode-quality logic, kept in
     one place instead of two copies that could drift). `notice` prints a
@@ -126,18 +146,120 @@ def build_encode_args(ffmpeg_bin, config, notice=True):
         crf = {"h264": "20", "hevc": "23", "av1": "30"}.get(actual_codec, "20")
     preset = config.get("video_preset", "slow")
 
-    if used_hw and hw == "nvenc":
-        args = ["-c:v", vcodec, "-preset", preset, "-cq", str(nvenc_quality_from_crf(crf))]
-    elif used_hw and hw == "videotoolbox":
-        args = ["-c:v", vcodec, "-q:v", str(videotoolbox_quality_from_crf(crf))]
-    elif used_hw and hw == "qsv":
-        args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
-    else:
-        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", ("6" if actual_codec == "av1" and preset == "slow" else preset)]
-        if actual_codec == "av1" and vcodec == "libsvtav1":
-            args += ["-svtav1-params", "tune=0"]
+    return _encode_args_for(hw, actual_codec, vcodec, used_hw, crf, preset)
 
-    return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+
+def benchmark_candidates(ffmpeg_bin):
+    """Every (hw, codec, vcodec, used_hw) combo actually listed by this
+    ffmpeg build - the starting point for run_encoder_benchmark. A listed
+    encoder isn't a guarantee it'll work (h264_nvenc can be compiled in
+    without an NVIDIA GPU/driver actually present) - the benchmark itself
+    is the real test; this only avoids wasting time on combos ffmpeg
+    doesn't even know about."""
+    combos = []
+    for codec in _CODEC_TIERS:
+        for name in _SW_ENCODER_NAMES[codec]:
+            if ffmpeg_has_encoder(ffmpeg_bin, name):
+                combos.append(("cpu", codec, name, False))
+                break  # one software encoder per codec is enough (libsvtav1 over libaom-av1)
+    for hw, codec_map in _HW_ENCODER_NAMES.items():
+        for codec, name in codec_map.items():
+            if ffmpeg_has_encoder(ffmpeg_bin, name):
+                combos.append((hw, codec, name, True))
+    return combos
+
+
+def measure_ssim(ffmpeg_bin, encoded_path, reference_path):
+    """SSIM of `encoded_path` against `reference_path` (expected lossless
+    or near-lossless) via ffmpeg's own ssim filter - the same metric used
+    to validate the fade-timing/codec-default work this benchmark
+    generalizes. Returns None if the filter didn't produce a parseable
+    score (e.g. mismatched resolution/duration)."""
+    cmd = [ffmpeg_bin, "-hide_banner", "-i", str(encoded_path), "-i", str(reference_path),
+           "-lavfi", "[0:v][1:v]ssim", "-f", "null", "-"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception:
+        return None
+    match = re.search(r"All:([\d.]+)", result.stderr)
+    return float(match.group(1)) if match else None
+
+
+def run_encoder_benchmark(ffmpeg_bin, sample_path, candidates=None, crf_map=None, preset="slow", log=None):
+    """Time + size + SSIM (vs. a lossless re-encode of the sample itself)
+    for every candidate (hw, codec, vcodec, used_hw) combo - real numbers
+    for real hardware, rather than one machine's one-time manual benchmark
+    baked in as everyone's default (see slverse's old detect_hardware_encoder
+    docstring, which this generalizes). `log(message)` is called once per
+    candidate as it's tried, if given, for progress feedback on what can be
+    a slow (tens of seconds to a few minutes) operation.
+
+    Returns a list of dicts: {hw, codec, vcodec, ok, seconds, size_bytes,
+    ssim, error}. A candidate that fails to encode at all (hw claimed but
+    not actually usable - the real "is this GPU/driver actually there"
+    test) gets ok=False and an error string instead of raising."""
+    candidates = candidates if candidates is not None else benchmark_candidates(ffmpeg_bin)
+    crf_map = crf_map or {"h264": "20", "hevc": "23", "av1": "30"}
+    results = []
+    with tempfile.TemporaryDirectory(prefix="jwkit-bench-") as tmp_dir:
+        tmp = Path(tmp_dir)
+        reference = tmp / "reference.mp4"
+        subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", str(sample_path),
+             "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(reference)],
+            check=True, timeout=120,
+        )
+        for hw, codec, vcodec, used_hw in candidates:
+            if log:
+                log(f"{hw}/{codec} ({vcodec})...")
+            crf = crf_map.get(codec, "23")
+            args = _encode_args_for(hw, codec, vcodec, used_hw, crf, preset)
+            output = tmp / f"{hw}_{codec}.mp4"
+            start = time.time()
+            try:
+                subprocess.run(
+                    [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", str(sample_path)] + args + [str(output)],
+                    check=True, capture_output=True, timeout=300,
+                )
+            except Exception as exc:
+                results.append({"hw": hw, "codec": codec, "vcodec": vcodec, "ok": False,
+                                 "seconds": None, "size_bytes": None, "ssim": None, "error": str(exc)})
+                continue
+            seconds = time.time() - start
+            size_bytes = output.stat().st_size if output.exists() else 0
+            ssim = measure_ssim(ffmpeg_bin, output, reference) if size_bytes else None
+            results.append({"hw": hw, "codec": codec, "vcodec": vcodec, "ok": True,
+                             "seconds": seconds, "size_bytes": size_bytes, "ssim": ssim, "error": None})
+    return results
+
+
+def format_benchmark_table(results):
+    """Human-readable table for run_encoder_benchmark's results, successes
+    sorted smallest-file-first (what most people optimize for once quality
+    clears a reasonable bar), failures listed after."""
+    ok = sorted((r for r in results if r["ok"]), key=lambda r: r["size_bytes"])
+    failed = [r for r in results if not r["ok"]]
+    lines = [f"{'hw':<12} {'codec':<6} {'time':>8} {'size':>10} {'ssim':>8}"]
+    for r in ok:
+        lines.append(f"{r['hw']:<12} {r['codec']:<6} {r['seconds']:>7.1f}s {r['size_bytes']/1e6:>8.2f}MB {r['ssim']:>8.4f}" if r["ssim"] is not None
+                      else f"{r['hw']:<12} {r['codec']:<6} {r['seconds']:>7.1f}s {r['size_bytes']/1e6:>8.2f}MB {'n/a':>8}")
+    for r in failed:
+        lines.append(f"{r['hw']:<12} {r['codec']:<6} {'unavailable':>8}   ({r['error'].splitlines()[0][:60]})")
+    return "\n".join(lines)
+
+
+def recommend_from_benchmark(results, ssim_floor=0.98):
+    """Smallest file among combos clearing ssim_floor (0.98 - broadly
+    considered visually-lossless-to-very-high-quality territory), falling
+    back to the highest-SSIM combo if none clear it. Returns a result dict
+    or None if every candidate failed outright."""
+    ok = [r for r in results if r["ok"] and r["ssim"] is not None]
+    if not ok:
+        return None
+    above_floor = [r for r in ok if r["ssim"] >= ssim_floor]
+    pool = above_floor or ok
+    key = (lambda r: r["size_bytes"]) if above_floor else (lambda r: -r["ssim"])
+    return min(pool, key=key)
 
 
 class ProgressETA:

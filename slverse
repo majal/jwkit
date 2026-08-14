@@ -397,21 +397,25 @@ def launch_ffplay(args, wait=True):
     return proc
 
 def detect_hardware_encoder():
-    """Defaults to 'cpu' (libx264) everywhere. Measured directly on this
-    machine's Apple Silicon GPU for a 31s 720p verse clip: videotoolbox at
-    the quality setting matching crf 20 produced an 8.0MB file (SSIM
-    0.99786 against the source), while libx264 crf 20 preset slow produced
-    a 3.1MB file - close to the 2.9MB source itself - at SSIM 0.99752,
-    a difference too small to see. Encode time was nearly identical either
-    way (3.6s vs 3.0s for that clip) - GPU's speed advantage isn't
-    meaningful at these short clip lengths, so there's no real tradeoff:
-    CPU gets a ~2.6x smaller file for immeasurably different quality.
-    Matching bitrate explicitly (700kbps VBR) instead of crf made GPU
-    *worse* than CPU at the same size (SSIM 0.99633 vs 0.99723) - x264's
-    rate-distortion efficiency beats videotoolbox's at a fixed bitrate too.
-    videotoolbox/nvenc remain available via 'slverse config set
-    hardware_encoder videotoolbox' for anyone who wants GPU speed for bulk
-    processing many chapters, where CPU's per-clip cost adds up."""
+    """The safe, no-cost fallback default when someone skips 'slverse
+    benchmark' (or setup's offer to run it) - always 'cpu', never an actual
+    per-machine measurement. Originally WAS a live conclusion, on one
+    machine: measured directly on Apple Silicon GPU for a 31s 720p verse
+    clip, videotoolbox at the quality setting matching crf 20 produced an
+    8.0MB file (SSIM 0.99786 against the source) vs. libx264 crf 20 preset
+    slow's 3.1MB (SSIM 0.99752, a difference too small to see) at nearly
+    identical encode time (3.6s vs 3.0s) - CPU got a ~2.6x smaller file for
+    immeasurably different quality, and matching bitrate explicitly instead
+    of crf made GPU *worse* than CPU at the same size too. That result does
+    NOT generalize to every machine (different GPU vendors/generations,
+    different ffmpeg builds, different content all change the real
+    answer) - it was baked in here as a fixed default anyway, which is
+    exactly the gap 'slverse benchmark' (run_encoder_benchmark in
+    _jwkit_common.py) closes: real timed/sized/SSIM-measured results for
+    the actual machine running it, not one machine's one-time finding
+    inherited by everyone. cpu remains a reasonable default when nobody's
+    run the real benchmark, since it's never dramatically wrong and never
+    depends on GPU drivers being present."""
     return "cpu"
 
 def ffmpeg_has_filter(ffmpeg_bin, filter_name):
@@ -1644,10 +1648,17 @@ def cmd_setup(args, config):
         ffrife = load_ffrife()
         ffrife.cmd_setup(ffrife.load_config())
 
-    hw = detect_hardware_encoder()
-    print(f"\nVideo encoder: {hw} (libx264 - measured smaller files at equal quality vs. GPU encoders for short clips;")
-    print("run 'slverse config set hardware_encoder videotoolbox' (or nvenc/qsv) if you'd rather trade file size for speed)")
-    config["hardware_encoder"] = hw
+    print("\nVideo encoder: this machine's best choice (CPU vs. GPU, and which codec) depends on its own hardware -")
+    print("a quick live benchmark tries every encoder this ffmpeg build supports and times/sizes/measures each one.")
+    ans = input("Run it now? Takes about a minute. [y/N]: ").strip().lower()
+    if ans in ("y", "yes"):
+        best = cmd_benchmark(argparse.Namespace(apply=False), config)
+        if best:
+            config["hardware_encoder"], config["video_codec"] = best["hw"], best["codec"]
+    else:
+        hw = detect_hardware_encoder()
+        print(f"\nVideo encoder: {hw} (safe default; run 'slverse benchmark' anytime to test what's actually best on this machine)")
+        config["hardware_encoder"] = hw
 
     ans = input("\nAdd slverse to your PATH so you can type 'slverse' from any folder on this machine? [Y/n]: ").strip().lower()
     if ans in ("", "y", "yes"):
@@ -1684,6 +1695,65 @@ def cmd_config(args, config):
             help_text = CONFIG_HELP.get(k, "")
             suffix = f"  # {help_text}" if help_text else ""
             print(f"{k:<{width}} = {v}{suffix}")
+
+def find_or_generate_bench_sample(config, tmp_dir):
+    """A short clip for 'slverse benchmark' to test encoders against.
+    Prefers a real cached chapter (representative of actual Sign Language
+    content - flat backgrounds, a moving signer - which compresses very
+    differently than a generic test pattern) over synthesizing one, since
+    the whole point of a live benchmark is to reflect what THIS machine
+    will actually encode, on THIS kind of content. Falls back to a
+    synthetic clip when nothing's cached yet (e.g. a brand new setup,
+    before anything's ever been extracted). Returns (sample_path,
+    source_description_or_None)."""
+    cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"]))
+    candidate = next(cache_dir.rglob("*.mp4"), None) if cache_dir.exists() else None
+    sample = Path(tmp_dir) / "bench_sample.mp4"
+    if candidate:
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-ss", "5", "-t", "8", "-i", str(candidate),
+               "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-an", str(sample)]
+        try:
+            subprocess.run(cmd, check=True, timeout=60)
+            if sample.exists() and sample.stat().st_size > 0:
+                return sample, str(candidate)
+        except Exception:
+            pass
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+           "-i", "testsrc2=size=1280x720:rate=30:duration=8",
+           "-c:v", "libx264", "-crf", "12", "-preset", "fast", str(sample)]
+    subprocess.run(cmd, check=True, timeout=60)
+    return sample, None
+
+def cmd_benchmark(args, config):
+    """Times every video encoder this machine's ffmpeg build actually has
+    (real hardware encoders included, tried and skipped gracefully if
+    claimed-but-not-actually-usable - e.g. nvenc compiled in without an
+    NVIDIA GPU present) against a real sample, measuring size and SSIM.
+    Generalizes the one-time manual benchmark detect_hardware_encoder's own
+    docstring documents for this machine specifically - every machine gets
+    its own real numbers instead of inheriting one machine's conclusion."""
+    with tempfile.TemporaryDirectory(prefix="slverse-bench-") as tmp_dir:
+        sample, source_desc = find_or_generate_bench_sample(config, tmp_dir)
+        if source_desc:
+            print(f"Benchmarking against a real sample from: {source_desc}")
+        else:
+            print("Nothing cached yet - benchmarking against a synthetic test clip (run this again once you've extracted something for a more representative result).")
+        print("Trying every encoder this machine's ffmpeg supports - this can take a minute or two:\n")
+        results = _jwkit_common.run_encoder_benchmark(FFMPEG_BIN, sample, log=lambda m: print(f"  {m}"))
+
+    print()
+    print(_jwkit_common.format_benchmark_table(results))
+    best = _jwkit_common.recommend_from_benchmark(results)
+    if not best:
+        print("\nNo encoder on this machine actually worked - keeping current settings.")
+        return None
+    print(f"\nRecommended: hardware_encoder={best['hw']}, video_codec={best['codec']} (smallest file at SSIM >= 0.98, or highest SSIM available if none cleared that)")
+    if getattr(args, "apply", False):
+        config["hardware_encoder"] = best["hw"]
+        config["video_codec"] = best["codec"]
+        save_config(config)
+        print("Applied and saved - run 'slverse config list' to see it, or 'slverse config set video_codec ...' to change it by hand.")
+    return best
 
 def cmd_langs(args, config):
     jwlangs = load_jwlangs()
@@ -2508,6 +2578,9 @@ def main():
     p_inspect = subparsers.add_parser("inspect", help="Show output provenance, edit status, and verse chapters")
     p_inspect.add_argument("file", help="An slverse-generated media file")
 
+    p_benchmark = subparsers.add_parser("benchmark", help="Time this machine's video encoders for speed/size/quality and suggest the best default")
+    p_benchmark.add_argument("--apply", action="store_true", help="Save the recommended hardware_encoder/video_codec to config instead of just printing them")
+
     p_bulk = subparsers.add_parser("bulk", help="Precompute whole chapters (optionally interpolated) ahead of time, instead of extracting on demand")
     p_bulk.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
     p_bulk.add_argument("--books", default="all", help="Book number range, e.g. '40-66' or '66' (default: all 66)")
@@ -2572,6 +2645,8 @@ def main():
         cmd_cache(args, config)
     elif args.command == "inspect":
         cmd_inspect(args)
+    elif args.command == "benchmark":
+        cmd_benchmark(args, config)
     elif args.command == "bulk":
         for arg_name, config_key in (("encoder", "hardware_encoder"), ("codec", "video_codec"), ("crf", "video_crf"), ("preset", "video_preset")):
             value = getattr(args, arg_name)

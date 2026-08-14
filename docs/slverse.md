@@ -51,7 +51,7 @@ Make the script executable:
 chmod +x slverse
 ```
 
-Run the interactive setup — it installs `ffmpeg`, asks which sign languages you watch, how much disk space to cache, which 60fps engine to use, whether to add `slverse` to your `PATH`, and whether to keep jwkit itself updated automatically (on by default; every jwkit tool checks for updates at most once a day, only when you actually run one, never in the background):
+Run the interactive setup — it installs `ffmpeg`, asks which sign languages you watch, how much disk space to cache, which 60fps engine to use, offers to benchmark this machine's video encoders (see `benchmark` below) to pick `hardware_encoder`/`video_codec`, whether to add `slverse` to your `PATH`, and whether to keep jwkit itself updated automatically (on by default; every jwkit tool checks for updates at most once a day, only when you actually run one, never in the background):
 
 ```bash
 ./slverse setup
@@ -174,6 +174,12 @@ Same, but sped up 2.5x instead, with an explicit `--speed` (accepts a decimal, a
 ./slverse extract FSL "Rev 13:1" --write --fast 3 5 --speed 2.5
 ```
 
+Time every video encoder this machine's ffmpeg build actually has (real hardware encoders included) against a real cached sample or a synthetic one, and apply the recommendation:
+
+```bash
+./slverse benchmark --apply
+```
+
 ## Important Behavior / Defaults
 
 - Global configuration is saved in `~/.config/jwkit/slverse/config.toml`. Sync state is split into a small `state.json` (sync timestamps, cached book-name lookups) plus one index file per synced language under `~/.config/jwkit/slverse/index/`, so it stays fast to load as you sync more languages.
@@ -181,7 +187,7 @@ Same, but sped up 2.5x instead, with an explicit `--speed` (accepts a decimal, a
 - Extraction downloads a verified chapter once and reuses it by default (`extract_mode = cache`). Cached chapters live in `~/.cache/slverse/`, capped at `cache_max_gb` (default 5 GB) with least-recently-used chapters removed first once the cap is hit. Pass `--onthefly` only when you explicitly want to stream without caching.
 - The tool uses lazy loading: it only downloads or streams a chapter when a specific verse extraction is requested, and only syncs metadata for the languages you've configured (default `ASL,FSL,BVL,INI,SPE`) unless you name others.
 - Verse start/end times come from JW.org's own API metadata (backfilled into the local index on first use), not from probing a downloaded video file. Book-name lookups are cached per `api_language` too, instead of hitting jw.org on every extract.
-- Encoding quality is configurable (`video_codec`, `video_crf`, `video_preset`) and defaults to `av1` (`libsvtav1 -crf 30 -preset 6` in software - royalty-free and, measured directly, smaller *and* nearly as fast as h264 on this machine; see `docs/ffrife.md`'s codec comparison table for the numbers). This is intentionally higher quality than JW.org's own source encode (~1.07 Mbps H.264 Main@3.1 720p30, per a direct `ffprobe` of a sample video) rather than matching it bitrate-for-bitrate: overlays force a re-encode of an already-lossy source, and re-encoding a second generation at the source's own bitrate would compound visible compression loss. Since clips are short, the absolute file size stays small either way. `video_codec=av1` automatically falls back to `hevc` then `h264` if this machine/ffmpeg build can't actually encode av1 (no hardware AV1 encoder for the configured `hardware_encoder`, and no `libsvtav1`/`libaom-av1` in software) - it prints a one-line notice when that happens.
+- Encoding quality is configurable (`video_codec`, `video_crf`, `video_preset`) and defaults to `av1` (`libsvtav1 -crf 30 -preset 6` in software - royalty-free and, measured directly, smaller *and* nearly as fast as h264 on this machine; see `docs/ffrife.md`'s codec comparison table for the numbers). This is intentionally higher quality than JW.org's own source encode (~1.07 Mbps H.264 Main@3.1 720p30, per a direct `ffprobe` of a sample video) rather than matching it bitrate-for-bitrate: overlays force a re-encode of an already-lossy source, and re-encoding a second generation at the source's own bitrate would compound visible compression loss. Since clips are short, the absolute file size stays small either way. `video_codec=av1` automatically falls back to `hevc` then `h264` if this machine/ffmpeg build can't actually encode av1 (no hardware AV1 encoder for the configured `hardware_encoder`, and no `libsvtav1`/`libaom-av1` in software) - it prints a one-line notice when that happens. These are still just defaults, not a claim they're best on every machine - GPU vendor/generation, ffmpeg build, and content all change the real answer; run `slverse benchmark` (or accept setup's offer to run it) for this machine's own numbers instead of guessing.
 - Picks a drawtext-capable `ffmpeg` automatically: it prefers an `ffmpeg-full`-style build (or whatever `ffmpeg_binary`/`ffprobe_binary` you set explicitly) over the stock Homebrew `ffmpeg`, which doesn't include `freetype`/`fontconfig`.
 - When applying overlays, the tool expects standard English abbreviations or full names (e.g., "Rev" or "Revelation") by default, or a plain book number.
 - `extract`/`find`/`bulk` trigger a metadata refresh at most once every `auto_sync_interval_hours` (default 24), so verse availability stays current without ever running `slverse sync` by hand. By default (`auto_sync_background = true`) this refresh runs as a detached background process and never blocks the command that triggered it; set `./slverse config set auto_sync_background false` to sync inline and block instead. Disable the refresh entirely per-run with `--no-auto-sync`, or permanently with `./slverse config set auto_sync false`. A failed or offline attempt still resets the timer, so a bad connection doesn't retry (and pause) on every command for the rest of the day.
