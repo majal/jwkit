@@ -741,7 +741,7 @@ def run_ffmpeg(args, duration=None, slow_after=4.0):
     proc.stdout.close()
     proc.wait()
     if shown:
-        print_time_progress(duration, duration, label="Encoding", eta_seconds=0)
+        print_time_progress(duration, duration, label="Encoding ✓")
         print()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
@@ -1847,10 +1847,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     if not window:
         return lang, None, f"Verses {verses} not found for {lang} (video may not exist for this chapter in this language yet)."
     start_time, end_time, url, checksum, valid_verses, source_labels, kept_segments = window
-    # drawtext attached directly to an input uses the source PTS despite
-    # input-side -ss; only concat/filter-complex paths reset it to zero.
-    direct_input_timeline = not getattr(args, "trim_mid_transitions", False)
-    fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None, source_timeline=direct_input_timeline)
+    # RIFE frame extraction normalizes the trimmed stream to a zero-based
+    # timeline, as do concat/filter-complex paths.
+    fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None)
     verses_str = format_verses_label(valid_verses)
     out_filename = f"{book_name.replace(' ', '_')}_{chapter}_{verses_str}_{lang}.mp4"
     edit_bits = []

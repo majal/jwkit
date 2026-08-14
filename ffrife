@@ -292,7 +292,7 @@ def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     proc.stdout.close()
     proc.wait()
     if shown:
-        print_time_progress(duration, duration, label=label, eta_seconds=0)
+        print_time_progress(duration, duration, label=f"{label} ✓")
         print()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
@@ -382,7 +382,7 @@ def run_rife(rife_path, in_frames, out_frames, target_count, slow_after=4.0):
                 proc.kill()
                 proc.wait()
     if shown:
-        print_count_progress(target_count, target_count, label="RIFE", eta_seconds=0)
+        print_count_progress(target_count, target_count, label="RIFE ✓")
         print()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, [rife_path])
