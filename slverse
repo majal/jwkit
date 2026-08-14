@@ -1932,10 +1932,11 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             if not download_file(url, local_path, expected_checksum=checksum):
                 return lang, None, f"Download failed for {lang} {book_name} {chapter}."
         else:
-            print(f"[{lang}] Using cached video file.")
+            if not getattr(args, "quiet", False): print(f"[{lang}] Using cached video file.")
 
-        print(f"[{lang}] Source cache: {local_path}")
-        print(f"[{lang}] Source: {url}")
+        if not getattr(args, "quiet", False):
+            print(f"[{lang}] Source cache: {local_path}")
+            print(f"[{lang}] Source: {url}")
 
         note_cache_use(state, local_path)
         if mode:
@@ -2276,6 +2277,7 @@ def main():
     p_extract.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
     p_extract.add_argument("reference", help="Bible reference (e.g., 'Rev 13:1, 2')")
     p_extract.add_argument("-f", "--write", action="store_true", help="Encode and save the output file. Default is preview-only: play the verse with its overlay (delogo box shown, not applied) and write nothing.")
+    p_extract.add_argument("-q", "--quiet", action="store_true", help="Suppress source/cache status lines (progress and errors still show)")
     p_extract.add_argument("-m", "--play", action="store_true", help="With --write, also play the finished file via mpv. Without --write, preview via mpv instead of ffplay.")
     p_extract.add_argument("--interpolate", action="store_true", help="Force interpolation on output")
     p_extract.add_argument("--onthefly", action="store_true", help="Stream-extract from the source URL; never store the full chapter on disk (default)")
