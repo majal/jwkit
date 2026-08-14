@@ -118,7 +118,13 @@ if command_exists git; then
     if [ -d "$JWKIT_HOME/.git" ]; then
         c_yellow "Updating existing install at $JWKIT_HOME"
         git -C "$JWKIT_HOME" fetch -q origin main
-        untracked_files="$(git -C "$JWKIT_HOME" ls-files --others --exclude-standard | sed '/^jwkit-update$/d')"
+        # Named explicitly rather than relying only on .gitignore: an
+        # existing install whose checked-out .gitignore predates a given
+        # installer-generated file (as .jwkit-install-state did until this
+        # fix) would otherwise see it as an untracked "local change" and
+        # never update again to PICK UP that .gitignore fix - the exact bug
+        # this line fixes. Keep this list and .gitignore in sync.
+        untracked_files="$(git -C "$JWKIT_HOME" ls-files --others --exclude-standard | grep -vE '^(jwkit-update|\.jwkit-install-state)$' || true)"
         if ! git -C "$JWKIT_HOME" diff --quiet ||
            ! git -C "$JWKIT_HOME" diff --cached --quiet ||
            [ -n "$untracked_files" ]; then

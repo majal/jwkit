@@ -17,6 +17,7 @@ ENV/
 .env.*
 .DS_Store
 jwkit-update
+.jwkit-install-state
 .vscode/
 .idea/
 *.swp
