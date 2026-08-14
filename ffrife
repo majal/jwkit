@@ -352,21 +352,31 @@ def run_rife(rife_path, in_frames, out_frames, target_count, slow_after=4.0):
     proc = subprocess.Popen([rife_path, "-i", str(in_frames), "-o", str(out_frames)])
     start = time.time()
     shown = False
-    while proc.poll() is None:
-        time.sleep(0.5)
-        if not shown and time.time() - start > slow_after:
-            shown = True
-        if shown:
-            current = len(list(Path(out_frames).glob("*.png")))
-            now = time.time()
-            samples.append((now, current))
-            samples = samples[-12:]
-            eta = None
-            if len(samples) >= 4 and samples[-1][1] > samples[0][1]:
-                rate = (samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0])
-                if rate > 0:
-                    eta = max(0, (target_count - current) / rate)
-            print_count_progress(current, target_count, label="RIFE", eta_seconds=eta)
+    samples = []
+    try:
+        while proc.poll() is None:
+            time.sleep(0.5)
+            if not shown and time.time() - start > slow_after:
+                shown = True
+            if shown:
+                current = len(list(Path(out_frames).glob("*.png")))
+                now = time.time()
+                samples.append((now, current))
+                samples = samples[-12:]
+                eta = None
+                if len(samples) >= 4 and samples[-1][1] > samples[0][1]:
+                    rate = (samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0])
+                    if rate > 0:
+                        eta = max(0, (target_count - current) / rate)
+                print_count_progress(current, target_count, label="RIFE", eta_seconds=eta)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
     if shown:
         print()
     if proc.returncode != 0:
