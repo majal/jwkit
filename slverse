@@ -2097,7 +2097,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
 
 def cmd_extract(args, config):
     langs = get_lang_list(config, args.lang) if (args.lang.lower() == "all" or "," in args.lang) else [args.lang.upper()]
-    ref = args.reference
+    ref = " ".join(args.reference) if isinstance(args.reference, list) else args.reference
 
     book_name, chapter, verses = parse_reference(ref)
     if not book_name:
@@ -2414,7 +2414,7 @@ def main():
 
     p_extract = subparsers.add_parser("extract", help="Extract and overlay verses from a chapter")
     p_extract.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
-    p_extract.add_argument("reference", help="Bible reference (e.g., 'Rev 13:1, 2')")
+    p_extract.add_argument("reference", nargs="+", help="Bible reference (e.g., Rev 13:1, 2; quoting is optional)")
     p_extract.add_argument("-f", "--write", action="store_true", help="Encode and save the output file. Default is preview-only: play the verse with its overlay (delogo box shown, not applied) and write nothing.")
     p_extract.add_argument("-o", "--output", help="Output media filename (requires --write and one language)")
     p_extract.add_argument("-q", "--quiet", action="store_true", help="Suppress source/cache status lines (progress and errors still show)")

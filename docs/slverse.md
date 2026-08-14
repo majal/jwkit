@@ -99,6 +99,12 @@ Extract a specific verse (Revelation 13:1, 2 in FSL) and interpolate to 60fps:
 ./slverse extract FSL "Rev 13:1, 2" --interpolate
 ```
 
+Quoting the reference is optional, so this is equivalent:
+
+```bash
+./slverse extract FSL Rev 13:1, 2 --interpolate
+```
+
 Use Apple VideoToolbox and HEVC for one extraction, without changing saved configuration:
 
 ```bash
