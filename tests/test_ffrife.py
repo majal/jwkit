@@ -253,6 +253,16 @@ class FfrifeCliDispatchTest(unittest.TestCase):
         self.assertEqual(self.ffrife.normalize_argv(["setup"]), ["setup"])
         self.assertEqual(self.ffrife.normalize_argv(["config", "list"]), ["config", "list"])
 
+    def test_benchmark_not_treated_as_a_bare_input_file(self) -> None:
+        # Regression guard: without "benchmark" in normalize_argv's known-
+        # subcommand set, `ffrife benchmark` would get rewritten to
+        # `ffrife run benchmark`, treating the word "benchmark" as an input
+        # filename instead of dispatching to cmd_benchmark.
+        self.assertEqual(self.ffrife.normalize_argv(["benchmark"]), ["benchmark"])
+        args = self.ffrife.build_parser().parse_args(self.ffrife.normalize_argv(["benchmark", "--sample", "x.mp4"]))
+        self.assertEqual(args.command, "benchmark")
+        self.assertEqual(args.sample, "x.mp4")
+
     def test_bare_input_parses_with_expected_defaults(self) -> None:
         args = self.ffrife.build_parser().parse_args(self.ffrife.normalize_argv(["in.mp4", "-o", "out.mp4"]))
         self.assertEqual(args.command, "run")

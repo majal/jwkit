@@ -71,6 +71,12 @@ Use Apple VideoToolbox for this output only:
 ./ffrife input.mp4 -o output.mp4 --encoder videotoolbox --codec hevc
 ```
 
+Time every video encoder this machine's ffmpeg build actually has against a real clip, and apply the recommendation:
+
+```bash
+./ffrife benchmark --sample your-clip.mp4 --apply
+```
+
 ## Important Behavior / Defaults
 
 - Global configuration is saved in `~/.config/jwkit/ffrife/config.toml` (separate from `slverse`'s own config - `slverse` bridges its own `hardware_encoder`/`video_crf`/etc. into a call to `ffrife` rather than needing them kept in sync across two files by hand).
@@ -84,6 +90,7 @@ Use Apple VideoToolbox for this output only:
   | av1 | libsvtav1 | 2.2s | 0.61 MB | 0.9963 |
 
   AV1 via SVT-AV1 came out smallest *and* nearly as fast as h264 - hevc was both bigger and ~3x slower than av1 here, so there's no real case for hevc as a middle tier on this hardware. If `video_codec=av1` isn't actually encodable (no `libsvtav1`/`libaom-av1` in this ffmpeg build, and no hardware AV1 encoder for the configured `hardware_encoder`), it automatically falls back to `hevc`, then `h264` - never upward. AV2 (AOMedia's av1 successor, spec finalized May 2026) is not a real option yet: no ffmpeg encoder support and no shipping hardware decoders as of this writing.
+- **This table is one machine's numbers, not a universal answer.** `hardware_encoder`/`video_codec` defaults are a reasonable starting point, not a claim that generalizes across GPU vendors/generations or content types - run `ffrife benchmark` (or `slverse benchmark`, same shared engine in `_jwkit_common.py`) to get real timed/sized/SSIM-measured results for the actual machine and content in question, including trying real GPU hardware encoders (nvenc, qsv) this doc was never measured against. A candidate encoder that's compiled into ffmpeg but has no matching driver/hardware present (e.g. `h264_nvenc` without an NVIDIA GPU) is tried and skipped gracefully, not assumed working from its mere presence in `ffmpeg -encoders`.
 - `ffrife <input> -o <output> ...` works without typing the `run` subcommand explicitly; `ffrife run <input> -o <output> ...` is equivalent.
 - `--encoder` (`cpu`, `videotoolbox`, `nvenc`, `qsv`), `--codec` (`h264`, `hevc`, `av1`), `--crf`, and `--preset` override encode configuration for one run without changing `config.toml`. Every other `config.toml` setting (`rife_binary_path`, `ffmpeg_binary`, `ffprobe_binary`) has a matching `--<dashed-key>` flag too - run `ffrife run --help` for the full list.
 - `--speed` under 1 slows down, over 1 speeds up. RIFE always exactly doubles frame count, so `--fps` should be set to 2x the source's actual frame rate when combining it with `--speed` (this is what `jwsl`'s `--slow` and `ffslow`'s `--rife` do automatically) - any other `--fps` value changes the output's actual duration, not just its smoothness.

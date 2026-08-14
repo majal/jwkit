@@ -41,7 +41,13 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("extract", result.stdout)
         self.assertIn("find", result.stdout)
         self.assertIn("cache", result.stdout)
+        self.assertIn("benchmark", result.stdout)
         self.assertIn("bulk", result.stdout)
+
+    def test_slverse_benchmark_help(self) -> None:
+        result = self.run_script("slverse", "benchmark", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--apply", result.stdout)
 
     def test_ffinpaint_help(self) -> None:
         result = self.run_script("ffinpaint", "--help")

@@ -85,5 +85,116 @@ class JwkitCommonMaybeAutoUpdateTest(unittest.TestCase):
         git_update.assert_not_called()
 
 
+class JwkitCommonBenchmarkTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def setUp(self) -> None:
+        # Same isolation reasoning as JwkitCommonEncodeArgsTest-equivalent
+        # tests elsewhere (see test_slverse.py's SlverseEncodeArgsTest) -
+        # this module is a real `import _jwkit_common`, shared process-wide,
+        # so its resolution caches need clearing between tests.
+        self._orig_has_encoder = self.common.ffmpeg_has_encoder
+        self.addCleanup(setattr, self.common, "ffmpeg_has_encoder", self._orig_has_encoder)
+
+    def test_benchmark_candidates_cpu_prefers_svtav1_over_aom(self) -> None:
+        self.common.ffmpeg_has_encoder = lambda ffmpeg_bin, name: name in {"libx264", "libx265", "libsvtav1", "libaom-av1"}
+        combos = self.common.benchmark_candidates("ffmpeg")
+        av1_combos = [c for c in combos if c[0] == "cpu" and c[1] == "av1"]
+        self.assertEqual(av1_combos, [("cpu", "av1", "libsvtav1", False)])
+
+    def test_benchmark_candidates_only_includes_available_hardware(self) -> None:
+        self.common.ffmpeg_has_encoder = lambda ffmpeg_bin, name: name in {"libx264", "h264_videotoolbox"}
+        combos = self.common.benchmark_candidates("ffmpeg")
+        hw_used = {c[0] for c in combos}
+        self.assertIn("videotoolbox", hw_used)
+        self.assertNotIn("nvenc", hw_used)
+        self.assertNotIn("qsv", hw_used)
+        # videotoolbox listed only for h264 (its own hevc/av1 encoders were
+        # made unavailable above), not blanket-included for every codec.
+        vt_codecs = {c[1] for c in combos if c[0] == "videotoolbox"}
+        self.assertEqual(vt_codecs, {"h264"})
+
+    def test_measure_ssim_parses_all_score(self) -> None:
+        fake_result = mock.Mock(stderr="n:1 ... [Parsed_ssim_0] SSIM Y:... All:0.987654 (19.05)")
+        with mock.patch.object(self.common.subprocess, "run", return_value=fake_result):
+            self.assertAlmostEqual(self.common.measure_ssim("ffmpeg", "a.mp4", "b.mp4"), 0.987654)
+
+    def test_measure_ssim_returns_none_on_no_match(self) -> None:
+        fake_result = mock.Mock(stderr="no ssim here")
+        with mock.patch.object(self.common.subprocess, "run", return_value=fake_result):
+            self.assertIsNone(self.common.measure_ssim("ffmpeg", "a.mp4", "b.mp4"))
+
+    def test_measure_ssim_returns_none_on_exception(self) -> None:
+        with mock.patch.object(self.common.subprocess, "run", side_effect=TimeoutError("stuck")):
+            self.assertIsNone(self.common.measure_ssim("ffmpeg", "a.mp4", "b.mp4"))
+
+    def test_run_encoder_benchmark_records_success_and_failure(self) -> None:
+        candidates = [("cpu", "h264", "libx264", False), ("nvenc", "h264", "h264_nvenc", True)]
+        calls = []
+
+        def fake_run(cmd, check=True, capture_output=False, timeout=None):
+            calls.append(cmd)
+            if "h264_nvenc" in cmd:
+                raise self.common.subprocess.CalledProcessError(1, cmd)
+            # Reference encode or the libx264 candidate encode - touch the
+            # output file (last arg) so size_bytes/measure_ssim have
+            # something to look at.
+            output = cmd[-1]
+            with open(output, "wb") as f:
+                f.write(b"fake video bytes")
+            return mock.Mock(stderr="")
+
+        with mock.patch.object(self.common.subprocess, "run", fake_run), \
+             mock.patch.object(self.common, "measure_ssim", return_value=0.99):
+            results = self.common.run_encoder_benchmark("ffmpeg", "sample.mp4", candidates=candidates)
+
+        self.assertEqual(len(results), 2)
+        ok_result = next(r for r in results if r["hw"] == "cpu")
+        self.assertTrue(ok_result["ok"])
+        self.assertEqual(ok_result["ssim"], 0.99)
+        self.assertGreater(ok_result["size_bytes"], 0)
+        failed_result = next(r for r in results if r["hw"] == "nvenc")
+        self.assertFalse(failed_result["ok"])
+        self.assertIsNotNone(failed_result["error"])
+        self.assertIsNone(failed_result["seconds"])
+
+    def test_recommend_prefers_smallest_above_ssim_floor(self) -> None:
+        results = [
+            {"hw": "cpu", "codec": "h264", "ok": True, "ssim": 0.999, "size_bytes": 5_000_000, "vcodec": "libx264", "seconds": 1, "error": None},
+            {"hw": "cpu", "codec": "av1", "ok": True, "ssim": 0.985, "size_bytes": 2_000_000, "vcodec": "libsvtav1", "seconds": 2, "error": None},
+            {"hw": "cpu", "codec": "hevc", "ok": True, "ssim": 0.960, "size_bytes": 500_000, "vcodec": "libx265", "seconds": 3, "error": None},  # smallest, but below the floor
+        ]
+        best = self.common.recommend_from_benchmark(results, ssim_floor=0.98)
+        self.assertEqual(best["codec"], "av1")  # smallest among those clearing 0.98, not the absolute smallest
+
+    def test_recommend_falls_back_to_highest_ssim_when_none_clear_floor(self) -> None:
+        results = [
+            {"hw": "cpu", "codec": "h264", "ok": True, "ssim": 0.90, "size_bytes": 5_000_000, "vcodec": "libx264", "seconds": 1, "error": None},
+            {"hw": "cpu", "codec": "av1", "ok": True, "ssim": 0.95, "size_bytes": 2_000_000, "vcodec": "libsvtav1", "seconds": 2, "error": None},
+        ]
+        best = self.common.recommend_from_benchmark(results, ssim_floor=0.98)
+        self.assertEqual(best["codec"], "av1")
+
+    def test_recommend_returns_none_when_nothing_worked(self) -> None:
+        results = [{"hw": "nvenc", "codec": "h264", "ok": False, "ssim": None, "size_bytes": None, "vcodec": "h264_nvenc", "seconds": None, "error": "boom"}]
+        self.assertIsNone(self.common.recommend_from_benchmark(results))
+
+    def test_format_benchmark_table_sorts_by_size_and_lists_failures(self) -> None:
+        results = [
+            {"hw": "cpu", "codec": "h264", "ok": True, "ssim": 0.99, "size_bytes": 5_000_000, "vcodec": "libx264", "seconds": 1.0, "error": None},
+            {"hw": "cpu", "codec": "av1", "ok": True, "ssim": 0.98, "size_bytes": 2_000_000, "vcodec": "libsvtav1", "seconds": 2.0, "error": None},
+            {"hw": "nvenc", "codec": "h264", "ok": False, "ssim": None, "size_bytes": None, "vcodec": "h264_nvenc", "seconds": None, "error": "No such device\nmore detail"},
+        ]
+        table = self.common.format_benchmark_table(results)
+        lines = table.splitlines()
+        self.assertLess(lines.index("cpu          av1        2.0s     2.00MB   0.9800"),
+                         lines.index("cpu          h264       1.0s     5.00MB   0.9900"))
+        self.assertIn("unavailable", table)
+        self.assertIn("No such device", table)
+        self.assertNotIn("more detail", table)  # only the first line of a multi-line error is shown
+
+
 if __name__ == "__main__":
     unittest.main()
