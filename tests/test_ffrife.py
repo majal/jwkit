@@ -50,6 +50,11 @@ class FfrifeEncodeArgsTest(unittest.TestCase):
         self.assertEqual(self.ffrife.videotoolbox_quality_from_crf("0"), 100)
         self.assertEqual(self.ffrife.videotoolbox_quality_from_crf("120"), 1)
 
+    def test_auto_quality_is_codec_specific(self) -> None:
+        for codec, crf in (("h264", "20"), ("hevc", "23"), ("av1", "30")):
+            args = self.ffrife.build_encode_args({"hardware_encoder": "cpu", "video_codec": codec, "video_crf": "auto", "video_preset": "slow"})
+            self.assertIn(crf, args)
+
 
 class FfrifeProgressBarTest(unittest.TestCase):
     @classmethod

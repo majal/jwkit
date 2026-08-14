@@ -89,7 +89,7 @@ DEFAULT_CONFIG = {
     "rife_fallback_engine": "none",  # none, framerate, minterpolate
     "hardware_encoder": "cpu",  # cpu, videotoolbox, nvenc, qsv - see jwsl's detect_hardware_encoder for why cpu is the default
     "video_codec": "h264",
-    "video_crf": "20",
+    "video_crf": "auto",  # h264=20, hevc=23, av1=30 unless overridden
     "video_preset": "slow",
     "ffmpeg_binary": "",
     "ffprobe_binary": "",
@@ -236,7 +236,9 @@ def videotoolbox_quality_from_crf(crf):
 def build_encode_args(config):
     hw = config.get("hardware_encoder", "cpu")
     codec = config.get("video_codec", "h264")
-    crf = config.get("video_crf", "20")
+    crf = config.get("video_crf", "auto")
+    if str(crf).strip().lower() == "auto":
+        crf = {"h264": "20", "hevc": "23", "av1": "30"}.get(codec, "20")
     preset = config.get("video_preset", "slow")
 
     if hw == "nvenc":
@@ -250,7 +252,9 @@ def build_encode_args(config):
         args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
     else:
         vcodec = {"hevc": "libx265", "av1": "libsvtav1"}.get(codec, "libx264")
-        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", preset]
+        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", ("6" if codec == "av1" and preset == "slow" else preset)]
+        if codec == "av1":
+            args += ["-svtav1-params", "tune=0"]
 
     return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
 
@@ -400,7 +404,7 @@ def atempo_chain(speed):
     return ",".join(filters)
 
 # --- Core: single-pass interpolation ---
-def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=60, speed=None):
+def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=60, speed=None, metadata_args=None):
     """Interpolate `source` (local path or remote URL) to `fps`, optionally
     trimmed to [start, end] and with an extra ffmpeg -vf filter chain
     applied - in ONE pass that extracts frames directly from the source
@@ -444,7 +448,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         cmd = trim_args + ["-i", str(source)]
         if vf_chain:
             cmd += ["-vf", ",".join(vf_chain)]
-        cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"]) + build_encode_args(config) + [str(output_file)]
+        cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"]) + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
         run_ffmpeg(cmd, duration=duration)
         return True
 
@@ -483,7 +487,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
             merge_cmd += ["-vf", speed_vf]
         if has_audio:
             merge_cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"])
-        merge_cmd += build_encode_args(config) + [str(output_file)]
+        merge_cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]
         run_ffmpeg(merge_cmd, duration=duration)
     return True
 
