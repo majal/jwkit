@@ -1923,6 +1923,8 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         else:
             print(f"[{lang}] Using cached video file.")
 
+        print(f"[{lang}] Source cache: {local_path}")
+
         note_cache_use(state, local_path)
         if mode:
             extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
