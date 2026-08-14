@@ -783,6 +783,37 @@ def build_encode_args(config, notice=True):
     # av1->hevc->h264 hardware/software fallback chain.
     return _jwkit_common.build_encode_args(FFMPEG_BIN, config, notice=notice)
 
+def describe_cut_edit(args):
+    """Real values, not a generic category label: two different --window
+    (or -s/-e) cuts of the same verse must not both end up titled
+    'Psalm 16:11 ASL (custom cut)' - whoever's looking at a pile of clips
+    by title alone (a video mixer/controller, not the filename) needs to
+    tell them apart at a glance. --window wins if somehow both are present
+    (matches resolve_verse_window's own precedence)."""
+    bits = []
+    clip_window_val = getattr(args, "clip_window", None)
+    offset_start_val = getattr(args, "offset_start", None)
+    offset_end_val = getattr(args, "offset_end", None)
+    if clip_window_val:
+        w_start, w_end = clip_window_val
+        bits.append(f"cut {w_start:g}-{w_end:g}s")
+    elif offset_start_val or offset_end_val:
+        parts = []
+        if offset_start_val: parts.append(f"s{offset_start_val:+g}s")
+        if offset_end_val: parts.append(f"e{offset_end_val:+g}s")
+        bits.append("cut " + " ".join(parts))
+    if getattr(args, "keep_end_transition", False) or getattr(args, "trim_mid_transitions", False):
+        bits.append("transition edit")
+    return bits
+
+def describe_retime_edit(mode, boundaries, speed):
+    """Same reasoning as describe_cut_edit: --slow 3 5 and --slow 2 8 need
+    visibly different titles, not both 'slow motion 0.5x'."""
+    if not mode:
+        return None
+    times = "-".join(f"{b:g}" for b in boundaries)
+    return f"{mode} motion {speed:g}x@{times}s"
+
 def output_metadata_args(book_name, chapter, verses, lang, source_url, checksum, edit_note="normal-speed full verse window", title_edit=""):
     title = f"{book_name} {chapter}:{verses} {lang}" + (f" ({title_edit})" if title_edit else "")
     return ["-metadata", f"title={title}", "-metadata", f"artist=JW.org ({lang})",
@@ -2117,9 +2148,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     out_filename = getattr(args, "output", None) or f"{book_name.replace(' ', '_')}_{chapter}_{verses_str}_{lang}.mp4"
     if getattr(args, "output", None):
         Path(out_filename).parent.mkdir(parents=True, exist_ok=True)
-    edit_bits = []
-    if getattr(args, "offset_start", None) or getattr(args, "offset_end", None) or getattr(args, "clip_window", None): edit_bits.append("custom cut")
-    if getattr(args, "keep_end_transition", False) or getattr(args, "trim_mid_transitions", False): edit_bits.append("transition edit")
+    edit_bits = describe_cut_edit(args)
 
     if not args.write:
         # Default: preview only, nothing written to disk deliberately - the
@@ -2151,8 +2180,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     mode, boundaries, speed, retime_error = resolve_retime_args(args, end_time - start_time)
     if retime_error:
         return lang, None, retime_error
-    if mode:
-        edit_bits.append(f"{mode} motion {speed:g}x")
+    retime_bit = describe_retime_edit(mode, boundaries, speed)
+    if retime_bit:
+        edit_bits.append(retime_bit)
     title_edit = "; ".join(bit for bit in edit_bits if bit != "transition edit")
     metadata_args = output_metadata_args(book_name, chapter, verses_str, lang, url, checksum, "; ".join(edit_bits) or "normal-speed full verse window", title_edit)
     duration = end_time - start_time

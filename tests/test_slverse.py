@@ -1446,6 +1446,66 @@ class SlverseConfigCommandTest(unittest.TestCase):
         self.assertEqual(saved["cache_max_gb"], "10")
 
 
+class SlverseEditDescriptionTest(unittest.TestCase):
+    """Output metadata titles need to actually distinguish different edits
+    of the same verse (see extract_one_lang/output_metadata_args) - a
+    controller looking at a pile of clips by title alone can't tell two
+    different --window cuts apart if both just say '(custom cut)'."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def args(self, **overrides):
+        base = dict(clip_window=None, offset_start=None, offset_end=None, keep_end_transition=False, trim_mid_transitions=False)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_no_edit_produces_no_bits(self) -> None:
+        self.assertEqual(self.slverse.describe_cut_edit(self.args()), [])
+
+    def test_different_windows_produce_different_bits(self) -> None:
+        a = self.slverse.describe_cut_edit(self.args(clip_window=(3.567, 10.003)))
+        b = self.slverse.describe_cut_edit(self.args(clip_window=(2.0, 8.0)))
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, ["cut 3.567-10.003s"])
+        self.assertEqual(b, ["cut 2-8s"])
+
+    def test_different_offsets_produce_different_bits(self) -> None:
+        a = self.slverse.describe_cut_edit(self.args(offset_start=5.302))
+        b = self.slverse.describe_cut_edit(self.args(offset_start=-2))
+        c = self.slverse.describe_cut_edit(self.args(offset_end=-3))
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, c)
+        self.assertEqual(a, ["cut s+5.302s"])
+        self.assertEqual(c, ["cut e-3s"])
+
+    def test_window_takes_precedence_over_offsets_if_both_present(self) -> None:
+        bits = self.slverse.describe_cut_edit(self.args(clip_window=(3.0, 9.0), offset_start=99))
+        self.assertEqual(bits, ["cut 3-9s"])
+
+    def test_transition_edit_bit_still_present_for_the_editing_metadata_field(self) -> None:
+        bits = self.slverse.describe_cut_edit(self.args(keep_end_transition=True))
+        self.assertIn("transition edit", bits)
+
+    def test_different_retime_boundaries_produce_different_descriptions(self) -> None:
+        a = self.slverse.describe_retime_edit("slow", [3, 5], 0.5)
+        b = self.slverse.describe_retime_edit("slow", [2, 8], 0.5)
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, "slow motion 0.5x@3-5s")
+
+    def test_no_mode_returns_none(self) -> None:
+        self.assertIsNone(self.slverse.describe_retime_edit(None, None, None))
+
+    def test_full_title_omits_transition_edit_but_keeps_it_in_editing_field(self) -> None:
+        # Mirrors extract_one_lang's own title_edit/edit_note split.
+        bits = self.slverse.describe_cut_edit(self.args(clip_window=(3.0, 9.0), keep_end_transition=True))
+        title_edit = "; ".join(b for b in bits if b != "transition edit")
+        edit_note = "; ".join(bits)
+        self.assertEqual(title_edit, "cut 3-9s")
+        self.assertIn("transition edit", edit_note)
+
+
 class SlverseGenericConfigOverrideTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
