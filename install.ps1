@@ -13,6 +13,7 @@ $RepoUrl = "https://github.com/majal/jwkit"
 $RepoZip = "$RepoUrl/archive/refs/heads/main.zip"
 $JwkitHome = if ($env:JWKIT_HOME) { $env:JWKIT_HOME } else { Join-Path $HOME ".jwkit" }
 $Tools = @("ffrife", "jwdl", "jwvideo-mux", "slverse")
+$InstalledPackageIds = @()
 
 function Write-Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg) { Write-Host $msg -ForegroundColor Green }
@@ -40,14 +41,17 @@ try {
     if (-not $havePython) {
         Write-Warn "Installing Python..."
         winget install --id Python.Python.3 -e --accept-source-agreements --accept-package-agreements
+        $InstalledPackageIds += "Python.Python.3"
     }
     if (-not (Test-Command ffmpeg)) {
         Write-Warn "Installing ffmpeg..."
         winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements
+        $InstalledPackageIds += "Gyan.FFmpeg"
     }
     if (-not (Test-Command git)) {
         Write-Warn "Installing git..."
         winget install --id Git.Git -e --accept-source-agreements --accept-package-agreements
+        $InstalledPackageIds += "Git.Git"
     }
     if ($havePython -and (Test-Command ffmpeg) -and (Test-Command git)) {
         Write-Ok "Already have Python, ffmpeg, and git."
@@ -63,6 +67,11 @@ try {
 
     # --- Fetch jwkit ---
     Write-Step "Getting jwkit"
+    $statePath = Join-Path $JwkitHome ".jwkit-install-state.json"
+    $previousDependencies = @()
+    if (Test-Path $statePath) {
+        try { $previousDependencies = @((Get-Content $statePath -Raw | ConvertFrom-Json).dependencies) } catch { }
+    }
     if (Test-Path $JwkitHome) {
         Remove-Item -Recurse -Force $JwkitHome
     }
@@ -78,6 +87,10 @@ try {
     $extractedRoot = Get-ChildItem -Path $extractPath -Directory | Select-Object -First 1
     Copy-Item -Path (Join-Path $extractedRoot.FullName "*") -Destination $JwkitHome -Recurse -Force
     Remove-Item -Recurse -Force $extractPath, $zipPath
+    $allDependencies = @($previousDependencies + $InstalledPackageIds | Select-Object -Unique)
+    if ($allDependencies.Count -gt 0) {
+        @{ dependencies = $allDependencies } | ConvertTo-Json | Set-Content -Path $statePath -Encoding UTF8
+    }
 
     # --- Command shims (Windows won't run a shebang-only script directly) ---
     Write-Step "Creating command shims"

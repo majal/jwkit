@@ -121,3 +121,20 @@ class InstallPathTests(unittest.TestCase):
             self.assertFalse(install_dir.exists())
             self.assertEqual(config.read_text(), "auto_update = false\n")
             self.assertEqual(profile.read_text(), "before\nafter\n")
+
+    def test_uninstaller_keeps_legacy_dependencies_without_a_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            install_dir = home / ".jwkit"
+            install_dir.mkdir()
+
+            result = subprocess.run(
+                ["bash", str(UNINSTALLER)],
+                check=True,
+                env=os.environ | {"HOME": str(home), "JWKIT_HOME": str(install_dir)},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertIn("Existing dependencies not recorded", result.stdout)
