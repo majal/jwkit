@@ -391,6 +391,26 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         self.slverse.resolve_verse_window = lambda lang, book_num, chapter, verses, config: (
             10.0, 20.0, "http://example/vid.mp4", "abc123", [11],
         )
+        # Preview's default preview_source=cache downloads/reuses a local
+        # chapter file - isolate cache_dir to a throwaway temp dir and stub
+        # download_file so tests never touch ~/.cache/slverse or the real
+        # network (a real download_file call against a fake host would
+        # actually retry 3x with backoff before giving up, which is both
+        # slow and a filesystem side effect neither test should have).
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self._tmp.name)
+        self.download_calls: list = []
+        self.slverse.download_file = lambda url, path, expected_checksum=None: (
+            self.download_calls.append((url, path)), True
+        )[1]
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def base_config(self, **overrides):
+        config = {"extract_mode": "onthefly", "cache_dir": str(self.cache_dir)}
+        config.update(overrides)
+        return config
 
     def test_default_no_write_previews_and_writes_nothing(self) -> None:
         preview_calls = []
@@ -399,19 +419,57 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         self.slverse.extract_verse = lambda *a, **k: extract_calls.append((a, k))
         args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
 
-        lang, filename, error = self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, {"extract_mode": "onthefly"}, {})
+        lang, filename, error = self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(), {})
 
         self.assertIsNone(filename)
         self.assertIsNone(error)
         self.assertEqual(len(preview_calls), 1)
         self.assertEqual(len(extract_calls), 0)
 
+    def test_preview_source_cache_default_downloads_once_and_plays_local_path(self) -> None:
+        preview_calls = []
+        self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+
+        self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(), {})
+
+        self.assertEqual(len(self.download_calls), 1)
+        self.assertEqual(self.download_calls[0][0], "http://example/vid.mp4")
+        played_source = preview_calls[0][0][0]
+        self.assertEqual(played_source, str(self.cache_dir / "FSL" / "vid.mp4"))
+        self.assertEqual(preview_calls[0][1].get("source_url"), "http://example/vid.mp4")
+
+    def test_preview_source_remote_streams_url_and_never_downloads(self) -> None:
+        preview_calls = []
+        self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+
+        self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(preview_source="remote"), {})
+
+        self.assertEqual(self.download_calls, [])
+        played_source = preview_calls[0][0][0]
+        self.assertEqual(played_source, "http://example/vid.mp4")
+
+    def test_preview_source_cache_reuses_already_downloaded_file(self) -> None:
+        lang_dir = self.cache_dir / "FSL"
+        lang_dir.mkdir(parents=True)
+        (lang_dir / "vid.mp4").write_bytes(b"fake video")
+        preview_calls = []
+        self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+
+        self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(), {})
+
+        self.assertEqual(self.download_calls, [])  # already cached - no download needed
+        played_source = preview_calls[0][0][0]
+        self.assertEqual(played_source, str(lang_dir / "vid.mp4"))
+
     def test_write_flag_encodes_and_returns_a_filename(self) -> None:
         extract_calls = []
         self.slverse.extract_verse = lambda *a, **k: extract_calls.append((a, k))
         args = argparse.Namespace(write=True, play=False, onthefly=True, cache=False)
 
-        lang, filename, error = self.slverse.extract_one_lang("ASL", "Psalm", 19, 16, [11], args, {"extract_mode": "onthefly"}, {})
+        lang, filename, error = self.slverse.extract_one_lang("ASL", "Psalm", 19, 16, [11], args, self.base_config(), {})
 
         self.assertIsNone(error)
         self.assertIsNotNone(filename)

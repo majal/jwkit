@@ -115,6 +115,8 @@ DEFAULT_CONFIG = {
     "auto_sync": "true",  # once-a-day background refresh on extract/find/bulk, so non-techies stay current without running 'sync' themselves
     "auto_sync_interval_hours": "24",
     "auto_sync_background": "true",  # run the once-a-day refresh as a detached subprocess so it never blocks the current command; false restores the old blocking-in-foreground behavior
+    "preview_source": "cache",  # extract's preview mode (no --write): 'cache' downloads a chapter once (if not already cached) and plays/reuses that local copy from then on - fast, no repeat bandwidth; 'remote' always streams straight from the URL and never touches disk
+    "preview_window_size": "65%",  # multi-language preview windows (slverse find --play, or 'ffv all <ref> -p'), as an mpv --autofit percentage of screen size - ignored for a single-language preview, which still autoplays fullscreen
     "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
     "font_family": "noto-sans-display",  # noto-sans-display, inter, google-sans-flex - see FONT_FAMILIES
     "api_language": "E",  # Language for book names (e.g., E for English)
@@ -255,7 +257,7 @@ def focus_process(pid):
         if result.returncode == 0:
             return
 
-def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, geometry=None):
+def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, geometry=None, autofit=None):
     """Spawn mpv with `args` and try to bring it to the front on every OS.
     --force-window=immediate plus mpv's own --focus-on=open default (mpv
     0.34+) cover Linux/Windows window managers reasonably well; see
@@ -265,14 +267,20 @@ def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, g
     instead of closing itself once playback ends, so you can seek back and
     review it - matches mpv's own factory default; the old --no-keep-open
     here was old ffv's choice, not something we need to keep. fullscreen/
-    paused/geometry are the extra knobs cmd_find's multi-language --play
-    uses to open several matches windowed, paused, and cascaded instead of
-    each one grabbing the whole screen in turn."""
+    paused/geometry/autofit are the extra knobs cmd_find's multi-language
+    --play uses to open several matches windowed, paused, sized, and
+    cascaded instead of each one grabbing the whole screen in turn.
+    autofit is an mpv --autofit value (e.g. "65%") - a percentage of the
+    screen, aspect-ratio preserved, so we don't need to know the actual
+    screen resolution ourselves; geometry positions the window and is
+    offset-only here (e.g. "+40+40"), leaving sizing to autofit."""
     cmd = ["mpv", "--no-config", "--force-window=immediate"]
     cmd.append("--fullscreen=yes" if fullscreen else "--fullscreen=no")
     cmd.append("--keep-open=yes" if keep_open else "--no-keep-open")
     if paused:
         cmd.append("--pause")
+    if autofit:
+        cmd.append(f"--autofit={autofit}")
     if geometry:
         cmd.append(f"--geometry={geometry}")
     cmd += list(args)
@@ -825,7 +833,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
             print("(--play needs mpv, which isn't installed - falling back to ffplay)")
         else:
             print()
-            print(f"Previewing (from local cache): {source}" if from_cache else f"Previewing: {source_url or source}")
+            print(f"Previewing: {source}")
             if from_cache:
                 print(f"Source: {source_url}")
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -844,7 +852,10 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
     print()
     print(f"Previewing: {FFPLAY_BIN} {' '.join(ffplay_args)}")
     if from_cache:
-        print(f"(from local cache; source: {source_url})")
+        # Plain "Source: <url>" on its own line, not folded into a
+        # parenthetical - so it's a clean copy/paste to swap in for the
+        # local path above if you want to check the actual CDN source.
+        print(f"Source: {source_url}")
     launch_ffplay(ffplay_args)
 
 def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False):
@@ -1427,13 +1438,29 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     out_filename = f"{book_name.replace(' ', '_')}_{chapter}_{'_'.join(map(str, valid_verses))}_{lang}.mp4"
 
     if not args.write:
-        # Default: preview only, nothing written to disk - see preview_verse.
-        # Plays from a local cached copy of the chapter when one already
-        # exists (from a prior --write --cache extract, or a 'bulk' run),
-        # since that's faster and works offline; otherwise streams straight
-        # from the remote URL. Either way the remote URL is still shown.
-        cached = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang / url.split("/")[-1]
-        source = str(cached) if cached.exists() else url
+        # Default: preview only, nothing written to disk deliberately - the
+        # locally cached chapter file is the one exception, and it's opt-out
+        # rather than opt-in (see preview_source). 'cache' (the default)
+        # downloads the chapter once if it isn't already cached and plays
+        # from that local copy from then on, so previewing more verses from
+        # the same chapter costs no further bandwidth; 'remote' always
+        # streams straight from the URL instead and never touches disk.
+        # Either way the remote URL is still shown alongside what's playing.
+        source = url
+        if config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower() != "remote":
+            cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang
+            cached = cache_dir / url.split("/")[-1]
+            if cached.exists():
+                note_cache_use(state, cached)
+                source = str(cached)
+            else:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                if download_file(url, cached, expected_checksum=checksum):
+                    note_cache_use(state, cached)
+                    enforce_cache_budget(config, state, protect=cached)
+                    source = str(cached)
+                # else: download failed (offline, CDN hiccup, etc) - fall
+                # back to streaming straight from the URL for this preview.
         preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url)
         return lang, None, None
 
@@ -1627,26 +1654,30 @@ def cmd_find(args, config):
         else:
             to_play = [r for r in results if r["found"]]
             multi = len(to_play) > 1
+            window_size = config.get("preview_window_size", DEFAULT_CONFIG["preview_window_size"])
             if multi:
                 print(f"\nOpening {len(to_play)} preview windows, one per language, all paused - unpause each to review it.")
             for i, r in enumerate(to_play):
                 start_str = f"{int(r['start']//3600):02d}:{int(r['start']%3600//60):02d}:{r['start']%60:06.3f}"
                 dur = r["end"] - r["start"]
                 # Multiple matches: windowed (not fullscreen, so several can
-                # be visible at once) and cascaded so they don't stack
-                # exactly on top of each other; a single match keeps the
-                # old fullscreen-and-autoplay behavior. Every mpv window
-                # here is spawned via subprocess.Popen with wait=False, so
-                # this loop never blocks - true on macOS/Linux/Windows
-                # alike, since a Popen child outlives its parent's normal
-                # exit on all three without any extra detachment flags.
-                geometry = f"480x270+{40 + (i % 5) * 60}+{40 + (i % 5) * 60}" if multi else None
+                # be visible at once), sized to preview_window_size (percent
+                # of screen, aspect preserved - mpv works this out itself,
+                # no need to know actual screen resolution here), and
+                # cascaded a bit so they don't stack exactly on top of each
+                # other. A single match keeps the old fullscreen-and-autoplay
+                # behavior. Every mpv window here is spawned via
+                # subprocess.Popen with wait=False, so this loop never
+                # blocks - true on macOS/Linux/Windows alike, since a Popen
+                # child outlives its parent's normal exit on all three
+                # without any extra detachment flags.
                 launch_mpv(
                     [f"--start={start_str}", f"--length={dur:.3f}", r["url"]],
                     wait=False,
                     fullscreen=not multi,
                     paused=multi,
-                    geometry=geometry,
+                    autofit=window_size if multi else None,
+                    geometry=f"+{40 + (i % 5) * 60}+{40 + (i % 5) * 60}" if multi else None,
                 )
 
 def cmd_cache(args, config):
