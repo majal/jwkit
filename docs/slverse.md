@@ -105,6 +105,12 @@ Use Apple VideoToolbox and HEVC for one extraction, without changing saved confi
 ./slverse extract FSL "Rev 13:1, 2" --write --encoder videotoolbox --codec hevc
 ```
 
+Save a single extraction under an explicit filename:
+
+```bash
+./slverse extract FSL "Psalm 16:11" --write --output psalm-16-11.mkv
+```
+
 Do the same for every language in your configured list, in parallel:
 
 ```bash
