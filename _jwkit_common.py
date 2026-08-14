@@ -21,6 +21,26 @@ DEFAULT_JWKIT_CONFIG = {
 }
 
 
+class ProgressETA:
+    """Small shared rolling-rate ETA estimator for jwkit progress displays."""
+    def __init__(self, total, window_seconds=30.0):
+        self.total = total
+        self.window_seconds = window_seconds
+        self.samples = []
+
+    def update(self, completed, now=None):
+        now = time.time() if now is None else now
+        self.samples.append((now, completed))
+        self.samples = [sample for sample in self.samples if now - sample[0] <= self.window_seconds]
+        if len(self.samples) < 2 or completed <= self.samples[0][1]:
+            return None
+        elapsed = now - self.samples[0][0]
+        if elapsed <= 0:
+            return None
+        rate = (completed - self.samples[0][1]) / elapsed
+        return max(0.0, (self.total - completed) / rate) if rate > 0 else None
+
+
 def load_jwkit_config():
     """The shared, repo-wide jwkit config - separate from each tool's own
     ~/.config/jwkit/<tool>/config.*, since auto_update applies to the
