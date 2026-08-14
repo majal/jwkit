@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""jwpl - build and inspect .jwlplaylist archives.
+
+The container/database layout is compatible with JW Library schema 16. Format
+research was cross-checked against exported JW Library archives and the
+MIT-licensed JWLManager project (https://github.com/erykjj/jwlmanager).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fnmatch
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import uuid
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    import tomli as tomllib  # type: ignore
+
+
+JWKIT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(JWKIT_ROOT))
+import _jwkit_common
+
+CONFIG_DIR = Path.home() / ".config" / "jwkit" / "jwpl"
+LEGACY_CONFIG_DIR = Path.home() / ".config" / "theoskratos" / "jwlplaylist"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+DIRECTORY_CONFIG = "jwlplaylist.toml"
+SUPPORTED_EXTENSIONS = {
+    ".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".webp",
+    ".m4v", ".mkv", ".mov", ".mp4", ".webm",
+    ".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav",
+}
+DEFAULTS: dict[str, Any] = {
+    "recursive": False,
+    "include": ["*"],
+    "exclude": ["*.jwlplaylist", ".DS_Store", DIRECTORY_CONFIG],
+    "end_action": 2,
+    "image_duration_seconds": 4.0,
+    "thumbnail_size": 250,
+    "device_name": "jwpl",
+    "video_title_source": "filename",
+    "number_titles": False,
+    "ffmpeg": "ffmpeg",
+    "ffprobe": "ffprobe",
+}
+DESCRIPTIONS = {
+    "recursive": "scan subdirectories too",
+    "include": "glob(s) that media paths must match",
+    "exclude": "glob(s) omitted after include matching",
+    "end_action": "JW Library end action (0-3; 2 pauses after each item)",
+    "image_duration_seconds": "display duration stored for still images",
+    "thumbnail_size": "maximum thumbnail width/height in pixels",
+    "device_name": "creator name recorded in manifest.json",
+    "video_title_source": "video label source: filename or embedded metadata",
+    "number_titles": "prefix normalized zero-padded presentation numbers",
+    "ffmpeg": "ffmpeg executable used to make thumbnails",
+    "ffprobe": "ffprobe executable used to read media duration",
+}
+
+# Small valid PNG used only if thumbnail extraction fails and --allow-fallback-thumbnail is set.
+DEFAULT_THUMBNAIL = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+IMAGE_EXTENSIONS = {".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".webp"}
+
+
+def migrate_legacy_config_dir() -> None:
+    """Move the private-prototype config into jwkit's standard namespace."""
+    if LEGACY_CONFIG_DIR.exists() and not CONFIG_DIR.exists():
+        CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(LEGACY_CONFIG_DIR), str(CONFIG_DIR))
+        print(f"Moved your existing settings from {LEGACY_CONFIG_DIR} to {CONFIG_DIR}.")
+
+
+def _natural_key(path: Path) -> list[Any]:
+    return [int(x) if x.isdigit() else x.casefold() for x in re.split(r"(\d+)", path.as_posix())]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(json.dumps(str(v), ensure_ascii=False) for v in value) + "]"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _read_toml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    settings = data.get("playlist", data)
+    if not isinstance(settings, dict):
+        raise ValueError(f"{path}: expected a TOML table")
+    unknown = sorted(set(settings) - (set(DEFAULTS) | {"name", "output"}))
+    if unknown:
+        raise ValueError(f"{path}: unknown setting(s): {', '.join(unknown)}")
+    return settings
+
+
+def _write_toml(path: Path, settings: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["[playlist]"]
+    for key in [*DEFAULTS, "name", "output"]:
+        if key in settings:
+            lines.append(f"{key} = {_toml_value(settings[key])}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _create_schema(connection: sqlite3.Connection, timestamp: str) -> None:
+    # Schema 16 mirrors current JW Library exports. Empty user-data tables are
+    # intentionally retained: Android validates the complete backup schema.
+    connection.executescript("""
+PRAGMA user_version=16;
+PRAGMA journal_mode=DELETE;
+CREATE TABLE android_metadata(locale TEXT);
+CREATE TABLE BlockRange(BlockRangeId INTEGER NOT NULL PRIMARY KEY,BlockType INTEGER NOT NULL,Identifier INTEGER NOT NULL,StartToken INTEGER,EndToken INTEGER,UserMarkId INTEGER NOT NULL,CHECK(BlockType BETWEEN 1 AND 2),FOREIGN KEY(UserMarkId) REFERENCES UserMark(UserMarkId));
+CREATE TABLE Bookmark(BookmarkId INTEGER NOT NULL PRIMARY KEY,LocationId INTEGER NOT NULL,PublicationLocationId INTEGER NOT NULL,Slot INTEGER NOT NULL,Title TEXT NOT NULL,Snippet TEXT,BlockType INTEGER NOT NULL DEFAULT 0,BlockIdentifier INTEGER,FOREIGN KEY(LocationId) REFERENCES Location(LocationId),FOREIGN KEY(PublicationLocationId) REFERENCES Location(LocationId),CONSTRAINT PublicationLocationId_Slot UNIQUE(PublicationLocationId,Slot));
+CREATE TABLE IndependentMedia(IndependentMediaId INTEGER NOT NULL PRIMARY KEY,OriginalFilename TEXT NOT NULL,FilePath TEXT NOT NULL UNIQUE,MimeType TEXT NOT NULL,Hash TEXT NOT NULL);
+CREATE TABLE InputField(LocationId INTEGER NOT NULL,TextTag TEXT NOT NULL,Value TEXT NOT NULL,FOREIGN KEY(LocationId) REFERENCES Location(LocationId),CONSTRAINT LocationId_TextTag PRIMARY KEY(LocationId,TextTag));
+CREATE TABLE LastModified(LastModified TEXT NOT NULL);
+CREATE TABLE Location(LocationId INTEGER NOT NULL PRIMARY KEY,BookNumber INTEGER,ChapterNumber INTEGER,DocumentId INTEGER,Track INTEGER,IssueTagNumber INTEGER NOT NULL DEFAULT 0,KeySymbol TEXT,MepsLanguage INTEGER,Type INTEGER NOT NULL,Title TEXT,Specialty TEXT,Edition TEXT,UNIQUE(BookNumber,ChapterNumber,KeySymbol,MepsLanguage,Type));
+CREATE TABLE Note(NoteId INTEGER NOT NULL PRIMARY KEY,Guid TEXT NOT NULL UNIQUE,UserMarkId INTEGER,LocationId INTEGER,Title TEXT,Content TEXT,LastModified TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%SZ','now')),Created TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%SZ','now')),BlockType INTEGER NOT NULL DEFAULT 0,BlockIdentifier INTEGER,FOREIGN KEY(UserMarkId) REFERENCES UserMark(UserMarkId),FOREIGN KEY(LocationId) REFERENCES Location(LocationId));
+CREATE TABLE PlaylistItem(PlaylistItemId INTEGER NOT NULL PRIMARY KEY,Label TEXT NOT NULL,StartTrimOffsetTicks INTEGER,EndTrimOffsetTicks INTEGER,Accuracy INTEGER NOT NULL,EndAction INTEGER NOT NULL,ThumbnailFilePath TEXT,FOREIGN KEY(Accuracy) REFERENCES PlaylistItemAccuracy(PlaylistItemAccuracyId),FOREIGN KEY(ThumbnailFilePath) REFERENCES IndependentMedia(FilePath),CHECK(length(Label)>0),CHECK(EndAction IN(0,1,2,3)));
+CREATE TABLE PlaylistItemAccuracy(PlaylistItemAccuracyId INTEGER NOT NULL PRIMARY KEY,Description TEXT NOT NULL UNIQUE);
+CREATE TABLE PlaylistItemIndependentMediaMap(PlaylistItemId INTEGER NOT NULL,IndependentMediaId INTEGER NOT NULL,DurationTicks INTEGER NOT NULL,PRIMARY KEY(PlaylistItemId,IndependentMediaId),FOREIGN KEY(PlaylistItemId) REFERENCES PlaylistItem(PlaylistItemId),FOREIGN KEY(IndependentMediaId) REFERENCES IndependentMedia(IndependentMediaId)) WITHOUT ROWID;
+CREATE TABLE PlaylistItemLocationMap(PlaylistItemId INTEGER NOT NULL,LocationId INTEGER NOT NULL,MajorMultimediaType INTEGER NOT NULL,BaseDurationTicks INTEGER,PRIMARY KEY(PlaylistItemId,LocationId),FOREIGN KEY(PlaylistItemId) REFERENCES PlaylistItem(PlaylistItemId),FOREIGN KEY(LocationId) REFERENCES Location(LocationId)) WITHOUT ROWID;
+CREATE TABLE PlaylistItemMarker(PlaylistItemMarkerId INTEGER NOT NULL PRIMARY KEY,PlaylistItemId INTEGER NOT NULL,Label TEXT NOT NULL,StartTimeTicks INTEGER NOT NULL,DurationTicks INTEGER NOT NULL,EndTransitionDurationTicks INTEGER NOT NULL,UNIQUE(PlaylistItemId,StartTimeTicks),FOREIGN KEY(PlaylistItemId) REFERENCES PlaylistItem(PlaylistItemId));
+CREATE TABLE PlaylistItemMarkerBibleVerseMap(PlaylistItemMarkerId INTEGER NOT NULL,VerseId INTEGER NOT NULL,PRIMARY KEY(PlaylistItemMarkerId,VerseId),FOREIGN KEY(PlaylistItemMarkerId) REFERENCES PlaylistItemMarker(PlaylistItemMarkerId)) WITHOUT ROWID;
+CREATE TABLE PlaylistItemMarkerParagraphMap(PlaylistItemMarkerId INTEGER NOT NULL,MepsDocumentId INTEGER NOT NULL,ParagraphIndex INTEGER NOT NULL,MarkerIndexWithinParagraph INTEGER NOT NULL,PRIMARY KEY(PlaylistItemMarkerId,MepsDocumentId,ParagraphIndex,MarkerIndexWithinParagraph),FOREIGN KEY(PlaylistItemMarkerId) REFERENCES PlaylistItemMarker(PlaylistItemMarkerId)) WITHOUT ROWID;
+CREATE TABLE Tag(TagId INTEGER NOT NULL PRIMARY KEY,Type INTEGER NOT NULL,Name TEXT NOT NULL,UNIQUE(Type,Name),CHECK(length(Name)>0),CHECK(Type IN(0,1,2)));
+CREATE TABLE TagMap(TagMapId INTEGER NOT NULL PRIMARY KEY,PlaylistItemId INTEGER,LocationId INTEGER,NoteId INTEGER,TagId INTEGER NOT NULL,Position INTEGER NOT NULL,FOREIGN KEY(TagId) REFERENCES Tag(TagId),FOREIGN KEY(PlaylistItemId) REFERENCES PlaylistItem(PlaylistItemId),FOREIGN KEY(LocationId) REFERENCES Location(LocationId),FOREIGN KEY(NoteId) REFERENCES Note(NoteId),CONSTRAINT TagId_Position UNIQUE(TagId,Position),CONSTRAINT TagId_NoteId UNIQUE(TagId,NoteId),CONSTRAINT TagId_LocationId UNIQUE(TagId,LocationId));
+CREATE TABLE UserMark(UserMarkId INTEGER NOT NULL PRIMARY KEY,ColorIndex INTEGER NOT NULL,LocationId INTEGER NOT NULL,StyleIndex INTEGER NOT NULL,UserMarkGuid TEXT NOT NULL UNIQUE,Version INTEGER NOT NULL,FOREIGN KEY(LocationId) REFERENCES Location(LocationId));
+INSERT INTO android_metadata VALUES('en_US');
+INSERT INTO LastModified VALUES('1970-01-01T00:00:00Z');
+INSERT INTO PlaylistItemAccuracy VALUES(1,'Accurate');
+INSERT INTO PlaylistItemAccuracy VALUES(2,'NeedsUserVerification');
+""")
+    indexes = {
+        "IX_BlockRange_UserMarkId": "BlockRange(UserMarkId)",
+        "IX_Location_KeySymbol_MepsLanguage_BookNumber_ChapterNumber": "Location(KeySymbol,MepsLanguage,BookNumber,ChapterNumber)",
+        "IX_Location_Media": "Location(KeySymbol,IssueTagNumber,MepsLanguage,DocumentId,Track,Type,COALESCE(Specialty,''),COALESCE(Edition,''))",
+        "IX_Location_MepsLanguage_DocumentId": "Location(MepsLanguage,DocumentId)",
+        "IX_Note_LastModified_LocationId": "Note(LastModified,LocationId)",
+        "IX_Note_LocationId_BlockIdentifier": "Note(LocationId,BlockIdentifier)",
+        "IX_PlaylistItem_ThumbnailFilePath": "PlaylistItem(ThumbnailFilePath)",
+        "IX_PlaylistItemIndependentMediaMap_IndependentMediaId": "PlaylistItemIndependentMediaMap(IndependentMediaId)",
+        "IX_PlaylistItemLocationMap_LocationId": "PlaylistItemLocationMap(LocationId)",
+        "IX_TagMap_LocationId_TagId_Position": "TagMap(LocationId,TagId,Position)",
+        "IX_TagMap_NoteId_TagId_Position": "TagMap(NoteId,TagId,Position)",
+        "IX_TagMap_PlaylistItemId_TagId_Position": "TagMap(PlaylistItemId,TagId,Position)",
+        "IX_TagMap_TagId": "TagMap(TagId)",
+        "IX_UserMark_LocationId": "UserMark(LocationId)",
+    }
+    for name, expression in indexes.items():
+        unique = "UNIQUE " if name == "IX_Location_Media" else ""
+        connection.execute(f"CREATE {unique}INDEX {name} ON {expression}")
+    for table in ("BlockRange", "Bookmark", "IndependentMedia", "Note", "Tag", "TagMap", "UserMark"):
+        for operation in ("Insert", "Update", "Delete"):
+            connection.execute(
+                f"CREATE TRIGGER TR_Update_LastModified_{operation}_{table} {operation.upper()} ON {table} "
+                "BEGIN UPDATE LastModified SET LastModified=strftime('%Y-%m-%dT%H:%M:%SZ','now'); END"
+            )
+    connection.execute("CREATE TRIGGER TR_Raise_Error_Before_Insert_LastModified BEFORE INSERT ON LastModified BEGIN SELECT RAISE(FAIL,'INSERT INTO LastModified not allowed'); END")
+    connection.execute("CREATE TRIGGER TR_Raise_Error_Before_Delete_LastModified BEFORE DELETE ON LastModified BEGIN SELECT RAISE(FAIL,'DELETE FROM LastModified not allowed'); END")
+    connection.execute("UPDATE LastModified SET LastModified=?", (timestamp,))
+
+
+def _duration_ticks(path: Path, settings: dict[str, Any]) -> int:
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        return round(float(settings["image_duration_seconds"]) * 10_000_000)
+    result = subprocess.run(
+        [str(settings["ffprobe"]), "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    return round(float(result.stdout.strip()) * 10_000_000)
+
+
+def _embedded_title(path: Path, settings: dict[str, Any]) -> str | None:
+    """Read a video's title without modifying or remuxing the source file."""
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        return None
+    result = subprocess.run(
+        [str(settings["ffprobe"]), "-v", "error", "-show_entries",
+         "format_tags=title:stream_tags=title", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    data = json.loads(result.stdout or "{}")
+    title = data.get("format", {}).get("tags", {}).get("title")
+    if not title:
+        title = next(
+            (stream.get("tags", {}).get("title") for stream in data.get("streams", [])
+             if stream.get("tags", {}).get("title")),
+            None,
+        )
+    return str(title).strip() if title else None
+
+
+def _leading_number(text: str) -> int | None:
+    match = re.match(r"^\s*(\d+)(?=\s|[._-]|$)", text)
+    return int(match.group(1)) if match else None
+
+
+def _without_leading_number(text: str) -> str:
+    return re.sub(r"^\s*\d+(?:\s+|[._-]+\s*)", "", text, count=1).strip()
+
+
+def presentation_labels(media: list[Path], settings: dict[str, Any]) -> list[str]:
+    """Build the labels JW Library shows presentation controllers.
+
+    The public default preserves the historical filename behavior. With
+    video_title_source=metadata, video labels use their good embedded title
+    while pictures use their filename. number_titles normalizes the leading
+    filename number (or the item position when absent) to the width required by
+    the largest number: 01..12, 001..120, and so on.
+    """
+    source_numbers = [_leading_number(path.stem) for path in media]
+    largest = max([len(media), *(number for number in source_numbers if number is not None)])
+    width = len(str(largest))
+    labels = []
+    for position, (path, source_number) in enumerate(zip(media, source_numbers), start=1):
+        if settings["video_title_source"] == "metadata" and path.suffix.lower() not in IMAGE_EXTENSIONS:
+            title = _embedded_title(path, settings) or path.stem
+        else:
+            title = path.name
+        if settings["number_titles"]:
+            number = source_number if source_number is not None else position
+            title = f"{number:0{width}d} {_without_leading_number(Path(title).stem)}".strip()
+        labels.append(title)
+    return labels
+
+
+def _make_thumbnail(source: Path, destination: Path, settings: dict[str, Any]) -> None:
+    size = int(settings["thumbnail_size"])
+    command = [str(settings["ffmpeg"]), "-v", "error", "-y"]
+    if source.suffix.lower() not in IMAGE_EXTENSIONS:
+        command += ["-ss", "0"]
+    command += ["-i", str(source), "-frames:v", "1", "-vf", f"scale={size}:{size}:force_original_aspect_ratio=decrease", str(destination)]
+    subprocess.run(command, check=True, capture_output=True)
+
+
+def _matches(relative: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(Path(relative).name, pattern) for pattern in patterns)
+
+
+def discover_media(directory: Path, settings: dict[str, Any]) -> list[Path]:
+    iterator = directory.rglob("*") if settings["recursive"] else directory.iterdir()
+    found = []
+    for path in iterator:
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        relative = path.relative_to(directory).as_posix()
+        if _matches(relative, list(settings["include"])) and not _matches(relative, list(settings["exclude"])):
+            found.append(path)
+    return sorted(found, key=lambda p: _natural_key(p.relative_to(directory)))
+
+
+def create_playlist(directory: Path, output: Path, name: str, settings: dict[str, Any], *, dry_run: bool = False) -> list[Path]:
+    media = discover_media(directory, settings)
+    if not media:
+        raise ValueError(f"no supported media matched in {directory}")
+    if dry_run:
+        return media
+    labels = presentation_labels(media, settings)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with tempfile.TemporaryDirectory(prefix="jwlplaylist-") as temp_name:
+        temp = Path(temp_name)
+        db_path = temp / "userData.db"
+        connection = sqlite3.connect(db_path)
+        _create_schema(connection, now)
+        connection.execute("INSERT INTO Tag(TagId,Type,Name) VALUES(1,2,?)", (name,))
+        next_media_id = 1
+        for position, (source, label) in enumerate(zip(media, labels)):
+            suffix = source.suffix.lower()
+            mime = mimetypes.guess_type(source.name)[0] or ("video/mp4" if suffix == ".mp4" else "application/octet-stream")
+            archive_media = f"{str(uuid.uuid4()).upper()}{suffix}"
+            shutil.copy2(source, temp / archive_media)
+            media_id = next_media_id
+            next_media_id += 1
+            connection.execute("INSERT INTO IndependentMedia VALUES(?,?,?,?,?)", (media_id, source.name, archive_media, mime, _sha256(source)))
+            thumb_name = f"{str(uuid.uuid4()).upper()}.jpg"
+            thumb_mime = "image/jpeg"
+            try:
+                _make_thumbnail(source, temp / thumb_name, settings)
+            except (OSError, subprocess.CalledProcessError):
+                thumb_name = f"{str(uuid.uuid4()).upper()}.png"
+                thumb_mime = "image/png"
+                (temp / thumb_name).write_bytes(DEFAULT_THUMBNAIL)
+            thumb_id = next_media_id
+            next_media_id += 1
+            connection.execute("INSERT INTO IndependentMedia VALUES(?,?,?,?,?)", (thumb_id, source.name, thumb_name, thumb_mime, _sha256(temp / thumb_name)))
+            item_id = position + 1
+            connection.execute("INSERT INTO PlaylistItem VALUES(?,?,?,?,?,?,?)", (item_id, label, None, None, 1, int(settings["end_action"]), thumb_name))
+            connection.execute("INSERT INTO PlaylistItemIndependentMediaMap VALUES(?,?,?)", (item_id, media_id, _duration_ticks(source, settings)))
+            connection.execute("INSERT INTO TagMap(TagMapId,PlaylistItemId,TagId,Position) VALUES(?,?,1,?)", (item_id, item_id, position))
+        connection.execute("UPDATE LastModified SET LastModified=?", (now,))
+        connection.commit()
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(f"database foreign-key violations: {violations}")
+        connection.execute("VACUUM")
+        connection.close()
+        manifest = {
+            "name": output.name,
+            "creationDate": now,
+            "version": 1,
+            "type": 1,
+            "userDataBackup": {
+                "lastModifiedDate": now,
+                "deviceName": str(settings["device_name"]),
+                "databaseName": "userData.db",
+                "hash": _sha256(db_path),
+                "schemaVersion": 16,
+            },
+        }
+        (temp / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        (temp / "default_thumbnail.png").write_bytes(DEFAULT_THUMBNAIL)
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(temp.iterdir()):
+                archive.write(path, path.name)
+    return media
+
+
+def inspect_playlist(path: Path) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="jwlplaylist-inspect-") as temp_name:
+        with zipfile.ZipFile(path) as archive:
+            archive.extract("manifest.json", temp_name)
+            archive.extract("userData.db", temp_name)
+            archive_hashes = {
+                name: hashlib.sha256(archive.read(name)).hexdigest()
+                for name in archive.namelist()
+                if name not in {"manifest.json", "userData.db"} and not name.endswith("/")
+            }
+        temp = Path(temp_name)
+        manifest = json.loads((temp / "manifest.json").read_text(encoding="utf-8"))
+        connection = sqlite3.connect(temp / "userData.db")
+        rows = connection.execute("""
+            SELECT tm.Position, pi.Label, pi.EndAction, im.OriginalFilename,
+                   im.FilePath, im.Hash, pm.DurationTicks
+            FROM TagMap tm JOIN PlaylistItem pi USING(PlaylistItemId)
+            LEFT JOIN PlaylistItemIndependentMediaMap pm USING(PlaylistItemId)
+            LEFT JOIN IndependentMedia im USING(IndependentMediaId)
+            ORDER BY tm.Position
+        """).fetchall()
+        names = [row[0] for row in connection.execute("SELECT Name FROM Tag WHERE Type=2 ORDER BY TagId")]
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        connection.close()
+        db_actual_hash = _sha256(temp / "userData.db")
+        items = []
+        for row in rows:
+            actual_hash = archive_hashes.get(row[4]) if row[4] else None
+            stored_hash = row[5]
+            items.append({
+                "position": row[0],
+                "label": row[1],
+                "end_action": row[2],
+                "original_filename": row[3],
+                "archive_path": row[4],
+                "sha256": actual_hash,
+                "stored_sha256": stored_hash,
+                "hash_matches": bool(actual_hash and stored_hash == actual_hash),
+                "hash_matches_if_bytes_unpadded": bool(
+                    actual_hash and stored_hash
+                    and stored_hash == "".join(f"{byte:x}" for byte in bytes.fromhex(actual_hash))
+                ),
+                "duration_ticks": row[6],
+            })
+        expected_db_hash = manifest.get("userDataBackup", {}).get("hash")
+        result = {
+            "path": str(path),
+            "schema_version": version,
+            "manifest": manifest,
+            "database_sha256": db_actual_hash,
+            "manifest_database_hash_matches": expected_db_hash == db_actual_hash,
+            "playlists": names,
+            "items": items,
+        }
+    return result
+
+
+def _add_setting_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--include", action="append", help="glob to include; repeatable")
+    parser.add_argument("--exclude", action="append", help="glob to exclude; repeatable")
+    parser.add_argument("--end-action", type=int, choices=range(4))
+    parser.add_argument("--image-duration-seconds", type=float)
+    parser.add_argument("--thumbnail-size", type=int)
+    parser.add_argument("--device-name")
+    parser.add_argument("--video-title-source", choices=("filename", "metadata"))
+    parser.add_argument("--number-titles", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--ffmpeg")
+    parser.add_argument("--ffprobe")
+
+
+def _resolved_settings(args: argparse.Namespace, directory: Path) -> dict[str, Any]:
+    settings = dict(DEFAULTS)
+    settings.update(_read_toml(CONFIG_FILE))
+    if not args.no_directory_config:
+        settings.update(_read_toml(Path(args.config) if args.config else directory / DIRECTORY_CONFIG))
+    for key in DEFAULTS:
+        value = getattr(args, key, None)
+        if value is not None:
+            settings[key] = value
+    if settings["video_title_source"] not in {"filename", "metadata"}:
+        raise ValueError("video_title_source must be filename or metadata")
+    return settings
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="jwpl", description="Create JW Library playlists from media directories")
+    color_group = parser.add_mutually_exclusive_group()
+    color_group.add_argument("--color", dest="color", action="store_true", default=None, help="force colored output")
+    color_group.add_argument("--no-color", dest="color", action="store_false", help="disable colored output")
+    sub = parser.add_subparsers(dest="command", required=True)
+    create = sub.add_parser("create", help="create a .jwlplaylist")
+    create.add_argument("directory", type=Path)
+    create.add_argument("--name", help="playlist name (default: directory name)")
+    create.add_argument("--output", type=Path, help="output archive (default: DIRECTORY/DIRECTORY.jwlplaylist)")
+    create.add_argument("--config", type=Path, help="use this per-directory TOML file")
+    create.add_argument("--no-directory-config", action="store_true")
+    create.add_argument("--dry-run", action="store_true", help="show selected media without writing")
+    _add_setting_flags(create)
+    inspect = sub.add_parser("inspect", help="print archive structure and ordered items")
+    inspect.add_argument("playlist", type=Path)
+    inspect.add_argument("--json", action="store_true")
+    config = sub.add_parser("config", help="show or edit global defaults")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("list")
+    get = config_sub.add_parser("get")
+    get.add_argument("key", choices=sorted(DEFAULTS))
+    set_parser = config_sub.add_parser("set")
+    set_parser.add_argument("key", choices=sorted(DEFAULTS))
+    set_parser.add_argument("value")
+    init = sub.add_parser("init", help=f"write a starter {DIRECTORY_CONFIG} in a directory")
+    init.add_argument("directory", type=Path, nargs="?", default=Path.cwd())
+    init.add_argument("--force", action="store_true")
+    return parser
+
+
+def _parse_config_value(key: str, raw: str) -> Any:
+    current = DEFAULTS[key]
+    if isinstance(current, bool):
+        if raw.casefold() not in {"true", "false"}:
+            raise ValueError("boolean value must be true or false")
+        return raw.casefold() == "true"
+    if isinstance(current, int):
+        return int(raw)
+    if isinstance(current, float):
+        return float(raw)
+    if isinstance(current, list):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    return raw
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    _jwkit_common.maybe_auto_update(JWKIT_ROOT)
+    migrate_legacy_config_dir()
+    color = _jwkit_common.Colorizer(
+        _jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color)
+    )
+    try:
+        if args.command == "create":
+            directory = args.directory.expanduser().resolve()
+            if not directory.is_dir():
+                raise ValueError(f"not a directory: {directory}")
+            settings = _resolved_settings(args, directory)
+            directory_config = _read_toml(Path(args.config) if args.config else directory / DIRECTORY_CONFIG) if not args.no_directory_config else {}
+            name = args.name or directory_config.get("name") or directory.name
+            output_value = args.output or directory_config.get("output")
+            output = Path(output_value).expanduser() if output_value else directory / f"{name}.jwlplaylist"
+            if not output.is_absolute():
+                output = directory / output
+            media = create_playlist(directory, output, name, settings, dry_run=args.dry_run)
+            if args.dry_run:
+                print(f"Playlist: {name}\nSelected {len(media)} item(s):")
+                for item, label in zip(media, presentation_labels(media, settings)):
+                    print(f"{item.relative_to(directory)}  ->  {label}")
+            else:
+                print(color.green(f"Created {output} ({len(media)} items)"))
+            return 0
+        if args.command == "inspect":
+            data = inspect_playlist(args.playlist.expanduser().resolve())
+            if args.json:
+                print(json.dumps(data, ensure_ascii=False, indent=2))
+            else:
+                print(f"{data['path']}\nschema: {data['schema_version']}\nplaylist: {', '.join(data['playlists'])}\nitems: {len(data['items'])}")
+                nonstandard_hashes = sum(
+                    1 for item in data["items"]
+                    if item["stored_sha256"] and not item["hash_matches"]
+                )
+                if nonstandard_hashes:
+                    byte_unpadded = sum(
+                        1 for item in data["items"]
+                        if not item["hash_matches"] and item["hash_matches_if_bytes_unpadded"]
+                    )
+                    print(f"stored media hashes differing from archive bytes: {nonstandard_hashes} ({byte_unpadded} match bytewise hex without zero-padding)")
+                for item in data["items"]:
+                    print(f"{item['position']:>3}  {item['label']}")
+            return 0
+        if args.command == "init":
+            path = args.directory.expanduser().resolve() / DIRECTORY_CONFIG
+            if path.exists() and not args.force:
+                raise ValueError(f"already exists: {path} (use --force to replace)")
+            _write_toml(path, {**DEFAULTS, "name": args.directory.resolve().name})
+            print(f"Created {path}")
+            return 0
+        saved = _read_toml(CONFIG_FILE)
+        resolved = {**DEFAULTS, **saved}
+        if args.config_command == "list":
+            print(f"Global config: {CONFIG_FILE}")
+            for key, value in resolved.items():
+                print(f"{key} = {_toml_value(value)}\n    {DESCRIPTIONS[key]}")
+        elif args.config_command == "get":
+            print(_toml_value(resolved[args.key]))
+            print(DESCRIPTIONS[args.key])
+        else:
+            saved[args.key] = _parse_config_value(args.key, args.value)
+            _write_toml(CONFIG_FILE, saved)
+            print(f"Set {args.key} = {_toml_value(saved[args.key])}")
+        return 0
+    except (OSError, ValueError, sqlite3.Error, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
+        print(color.red(f"jwpl: {exc}"), file=os.sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
