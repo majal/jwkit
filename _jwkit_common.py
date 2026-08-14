@@ -1,5 +1,5 @@
 """_jwkit_common - shared helpers used by every top-level jwkit tool
-(slverse, ffrife, jwdl, jwvideo-mux), loaded as a sibling module the same
+(slverse, ffrife, jwdl, jwpl, jwvideo-mux), loaded as a sibling module the same
 way slverse already loads ffrife (SourceFileLoader, not a real import,
 since these are standalone shebang scripts rather than a package).
 

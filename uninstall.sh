@@ -7,7 +7,7 @@ set -euo pipefail
 
 JWKIT_HOME="${JWKIT_HOME:-$HOME/.jwkit}"
 MARKER="# jwkit PATH (added by jwkit's install.sh)"
-TOOLS=(ffinpaint ffrife jwdl jwvideo-mux slverse)
+TOOLS=(ffinpaint ffrife jwdl jwpl jwvideo-mux slverse)
 
 die() { printf 'jwkit uninstall: %s\n' "$1" >&2; exit 1; }
 note() { printf '%s\n' "$1"; }

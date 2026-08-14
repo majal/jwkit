@@ -16,6 +16,7 @@ Each tool below has its own section covering what it does, what it needs, and th
   - [`ffinpaint`](#ffinpaint)
   - [`ffrife`](#ffrife)
   - [`jwdl`](#jwdl)
+  - [`jwpl`](#jwpl)
   - [`jwvideo-mux`](#jwvideo-mux)
   - [`slverse`](#slverse)
 - [Your Local Setup](#your-local-setup)
@@ -26,7 +27,7 @@ Each tool below has its own section covering what it does, what it needs, and th
 
 ## Quick Install
 
-One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `jwdl`, `ffinpaint`, `ffrife`, and `jwvideo-mux` just work. No manual downloads, no separate setup steps.
+One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `jwdl`, `jwpl`, `ffinpaint`, `ffrife`, and `jwvideo-mux` just work. No manual downloads, no separate setup steps.
 
 **macOS or Linux** (Terminal):
 
@@ -45,6 +46,7 @@ Then open a **new** terminal window and try:
 ```bash
 slverse --help
 jwdl list
+jwpl --help
 ```
 
 For the interactive setup (which sign languages you watch, cache size, etc.), run `slverse setup` once.
@@ -94,6 +96,14 @@ Full docs: [docs/ffrife.md](docs/ffrife.md)
 `jwdl` downloads JW music, periodicals, and videos from jw.org, one folder per collection.
 
 Full docs: [docs/jwdl.md](docs/jwdl.md)
+
+[↑ TOC](#table-of-contents)
+
+### [`jwpl`](./jwpl)
+
+`jwpl` turns an ordered folder of pictures, videos, and audio into a JW Library `.jwlplaylist`, with configurable controller-facing titles and no JW Library UI work.
+
+Full docs: [docs/jwpl.md](docs/jwpl.md)
 
 [↑ TOC](#table-of-contents)
 
