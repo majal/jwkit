@@ -791,7 +791,7 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     drawtext_ll = f"drawtext=text='{lang.upper()}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y + h - 5}:alpha={label_alpha}"
     return f"{delogo},{drawtext},{drawtext_ll}"
 
-def preview_verse(source, start_time, end_time, book_name, chapter, verse_label, lang, config, use_mpv=False):
+def preview_verse(source, start_time, end_time, book_name, chapter, verse_label, lang, config, use_mpv=False, source_url=None):
     """Default 'slverse extract' behavior (no --write): play the verse with
     its overlay applied live - including a visible box where delogo would
     remove the source caption - without writing anything to disk. Mirrors
@@ -802,10 +802,16 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
     overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True)
     duration = end_time - start_time
 
+    from_cache = source_url is not None and str(source) != str(source_url)
+
     if use_mpv:
         if not command_exists("mpv"):
             print("(--play needs mpv, which isn't installed - falling back to ffplay)")
         else:
+            print()
+            print(f"Previewing (from local cache): {source}" if from_cache else f"Previewing: {source_url or source}")
+            if from_cache:
+                print(f"Source: {source_url}")
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_out = Path(tmp_dir) / "preview.mkv"
                 cmd = ["-ss", str(start_time), "-t", str(duration), "-i", str(source)]
@@ -820,7 +826,9 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
     if overlay:
         ffplay_args += ["-vf", overlay]
     print()
-    print(f"Previewing (nothing written - pass --write/-f to save): {FFPLAY_BIN} {' '.join(ffplay_args)}")
+    print(f"Previewing: {FFPLAY_BIN} {' '.join(ffplay_args)}")
+    if from_cache:
+        print(f"(from local cache; source: {source_url})")
     launch_ffplay(ffplay_args)
 
 def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False):
@@ -1404,11 +1412,13 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
 
     if not args.write:
         # Default: preview only, nothing written to disk - see preview_verse.
-        # Always plays straight from the source (remote URL or, if --cache
-        # was also passed, a locally cached chapter); no need for the
-        # cache/onthefly branching below since nothing is being encoded to
-        # keep.
-        preview_verse(url, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play)
+        # Plays from a local cached copy of the chapter when one already
+        # exists (from a prior --write --cache extract, or a 'bulk' run),
+        # since that's faster and works offline; otherwise streams straight
+        # from the remote URL. Either way the remote URL is still shown.
+        cached = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang / url.split("/")[-1]
+        source = str(cached) if cached.exists() else url
+        preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url)
         return lang, None, None
 
     mode, boundaries, speed, retime_error = resolve_retime_args(args, end_time - start_time)
@@ -1515,7 +1525,7 @@ def cmd_extract(args, config):
         elif filename:
             print(f"[{lang}] Successfully created: {filename}")
         else:
-            print(f"[{lang}] Preview finished (nothing written - pass --write/-f to save).")
+            print(f"[{lang}] Preview finished.")
 
 def cmd_find(args, config):
     """Default output is a compact checkmark table grouped by language -
