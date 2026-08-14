@@ -109,9 +109,10 @@ if command_exists git; then
     if [ -d "$JWKIT_HOME/.git" ]; then
         c_yellow "Updating existing install at $JWKIT_HOME"
         git -C "$JWKIT_HOME" fetch -q origin main
+        untracked_files="$(git -C "$JWKIT_HOME" ls-files --others --exclude-standard | sed '/^jwkit-update$/d')"
         if ! git -C "$JWKIT_HOME" diff --quiet ||
            ! git -C "$JWKIT_HOME" diff --cached --quiet ||
-           [ -n "$(git -C "$JWKIT_HOME" ls-files --others --exclude-standard)" ]; then
+           [ -n "$untracked_files" ]; then
             c_yellow "Local changes found; leaving the existing install untouched."
             c_yellow "Commit, stash, or remove them, then run jwkit-update again."
         elif ! git -C "$JWKIT_HOME" merge --ff-only origin/main; then
@@ -146,7 +147,8 @@ add_path_block() {
     local rc="$1"
     local marker="# jwkit PATH (added by jwkit's install.sh)"
     [ -f "$rc" ] || touch "$rc"
-    if grep -qF "$marker" "$rc" 2>/dev/null; then
+    if grep -qF "$marker" "$rc" 2>/dev/null ||
+       grep -qF "$JWKIT_HOME" "$rc" 2>/dev/null; then
         return 0
     fi
     {
