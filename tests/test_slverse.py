@@ -1023,39 +1023,78 @@ class SlverseDetectDelogoOcclusionTest(unittest.TestCase):
         box = (10, 10, 20, 20)
         self.raw_frames = [self.make_frame(box, (100, 100, 100), (100, 100, 100))]
         result = self.slverse.detect_delogo_occlusion("source.mp4", box, 0.0, 10.0, samples=1)
-        self.assertFalse(result)
+        self.assertIsNone(result)
 
     def test_strongly_deviating_inside_is_occlusion(self) -> None:
         box = (10, 10, 20, 20)
         self.raw_frames = [self.make_frame(box, (220, 180, 150), (100, 100, 100))]
         result = self.slverse.detect_delogo_occlusion("source.mp4", box, 0.0, 10.0, samples=1)
-        self.assertTrue(result)
+        self.assertIsNotNone(result)
+        occ_start, occ_end = result
+        self.assertGreaterEqual(occ_start, 0.0)
+        self.assertLessEqual(occ_end, 10.0)
+        self.assertLess(occ_start, occ_end)
 
-    def test_end_before_start_returns_false_without_probing(self) -> None:
+    def test_localizes_to_the_hit_samples_not_the_whole_window(self) -> None:
+        # 10 samples over a 20s window (2s apart); only samples 4-6
+        # (centered ~9s, ~11s, ~13s - enough to clear the samples//3 hit
+        # threshold) show the deviation - the returned range should bracket
+        # just those, padded by one sample step, not the full 0..20 window.
+        box = (10, 10, 20, 20)
+        border, inside = (100, 100, 100), (220, 180, 150)
+        self.raw_frames = [
+            self.make_frame(box, inside if i in (4, 5, 6) else border, border)
+            for i in range(10)
+        ]
+        occ_start, occ_end = self.slverse.detect_delogo_occlusion("source.mp4", box, 0.0, 20.0, samples=10)
+        self.assertGreater(occ_start, 0.0)
+        self.assertLess(occ_end, 20.0)
+        self.assertLess(occ_end - occ_start, 20.0)
+
+    def test_end_before_start_returns_none_without_probing(self) -> None:
         self.raw_frames = []  # a probe call here would raise IndexError - proving none happened
         result = self.slverse.detect_delogo_occlusion("source.mp4", (10, 10, 20, 20), 10.0, 5.0)
-        self.assertFalse(result)
+        self.assertIsNone(result)
 
-    def test_subprocess_failure_returns_false(self) -> None:
+    def test_subprocess_failure_returns_none(self) -> None:
         def raising_run(cmd, check=True, capture_output=True, timeout=None):
             raise TimeoutError("ffmpeg hung")
         with mock.patch.object(self.slverse.subprocess, "run", raising_run):
             result = self.slverse.detect_delogo_occlusion("source.mp4", (10, 10, 20, 20), 0.0, 10.0, samples=1)
-        self.assertFalse(result)
+        self.assertIsNone(result)
 
     def test_wrong_sized_payload_is_skipped_not_crashed(self) -> None:
         self.raw_frames = [b"\x00" * 3]  # far too short for the requested crop
         result = self.slverse.detect_delogo_occlusion("source.mp4", (10, 10, 20, 20), 0.0, 10.0, samples=1)
-        self.assertFalse(result)
+        self.assertIsNone(result)
+
+
+class SlverseShrinkBoxForInpaintTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_shrinks_by_configured_padding_around_center(self) -> None:
+        box = (88, 49, 240, 60)
+        config = {"delogo_width_pad": "10", "delogo_height_pad": "10"}
+        self.assertEqual(self.slverse.shrink_box_for_inpaint(box, config), (93, 54, 230, 50))
+
+    def test_never_shrinks_below_one_pixel(self) -> None:
+        box = (10, 10, 4, 4)
+        config = {"delogo_width_pad": "50", "delogo_height_pad": "50"}
+        x, y, w, h = self.slverse.shrink_box_for_inpaint(box, config)
+        self.assertGreaterEqual(w, 1)
+        self.assertGreaterEqual(h, 1)
 
 
 class SlverseExtractVerseInpaintTest(unittest.TestCase):
     """extract_verse's delogo_engine=auto/inpaint branch, delegating to the
     sibling ffinpaint tool - previously untested (only ffinpaint's own
-    mask/config were covered). Also locks in the audio-mapping fix: the
-    inpainted intermediate is video-only (E2FGVI's own output has no audio
-    track), so the final encode has to pull audio back in from the
-    original source rather than silently dropping it."""
+    mask/config were covered). Also locks in two fixes: only the detected
+    occlusion sub-range (not the whole verse window) goes to the AI
+    backend, composited back over a cheap full-window blur; and the final
+    encode pulls audio from the original source (input 0 here, not the
+    inpainted intermediate, which is video-only) rather than dropping it."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1065,9 +1104,14 @@ class SlverseExtractVerseInpaintTest(unittest.TestCase):
         self.run_calls = []
         self.slverse.run_ffmpeg = lambda cmd, duration=None: self.run_calls.append(cmd)
         self.slverse.build_overlay_filter = lambda *a, **k: "delogo=x=88:y=49:w=240:h=60:show=0,drawtext=text='Psalm'"
+        # No localized sub-range by default (forced delogo_engine=inpaint
+        # falls back to the full window) - individual tests override this
+        # to exercise auto-mode's detect-then-narrow path.
+        self.slverse.detect_delogo_occlusion = lambda source, box, start, end: None
 
     def config(self, **overrides):
-        cfg = {"interpolation_engine": "none", "delogo_engine": "inpaint", "delogo_inpaint_fallback": "blur"}
+        cfg = {"interpolation_engine": "none", "delogo_engine": "inpaint", "delogo_inpaint_fallback": "blur",
+               "delogo_width_pad": "10", "delogo_height_pad": "10"}
         cfg.update(overrides)
         return cfg
 
@@ -1084,29 +1128,47 @@ class SlverseExtractVerseInpaintTest(unittest.TestCase):
             self.config(**config_overrides),
         )
 
-    def test_inpaint_success_maps_audio_when_present(self) -> None:
-        self.inpaint_calls = []
-        self.slverse.load_ffinpaint = lambda: self.fake_ffinpaint(True)
-        self.slverse.has_audio_stream = lambda source: True
-        self.extract()
-        self.assertEqual(len(self.inpaint_calls), 1)
-        source, output, box, start, end = self.inpaint_calls[0]
-        self.assertEqual(box, (88, 49, 240, 60))
-        self.assertEqual((start, end), (10.0, 20.0))
-        cmd = self.run_calls[0]
-        self.assertIn("1:a", cmd)
-        self.assertIn("-shortest", cmd)
-        self.assertEqual(cmd.count("-i"), 2)  # inpainted video + the original source, for its audio
-
-    def test_inpaint_success_omits_audio_when_absent(self) -> None:
+    def test_inpaint_uses_shrunk_box_and_full_window_when_unlocalized(self) -> None:
         self.inpaint_calls = []
         self.slverse.load_ffinpaint = lambda: self.fake_ffinpaint(True)
         self.slverse.has_audio_stream = lambda source: False
         self.extract()
+        self.assertEqual(len(self.inpaint_calls), 1)
+        source, output, box, start, end = self.inpaint_calls[0]
+        self.assertEqual(box, (93, 54, 230, 50))  # shrunk from (88,49,240,60) by delogo_width/height_pad
+        self.assertEqual((start, end), (10.0, 20.0))  # no localized range - full window
+
+    def test_auto_engine_narrows_to_the_occlusion_sub_range(self) -> None:
+        self.inpaint_calls = []
+        self.slverse.load_ffinpaint = lambda: self.fake_ffinpaint(True)
+        self.slverse.has_audio_stream = lambda source: False
+        self.slverse.detect_delogo_occlusion = lambda source, box, start, end: (13.0, 15.0)
+        self.extract(delogo_engine="auto")
+        self.assertEqual(len(self.inpaint_calls), 1)
+        _, _, _, start, end = self.inpaint_calls[0]
+        self.assertEqual((start, end), (13.0, 15.0))  # only the sub-range, not 10.0..20.0
+
+    def test_composite_filtergraph_shape(self) -> None:
+        self.inpaint_calls = []
+        self.slverse.load_ffinpaint = lambda: self.fake_ffinpaint(True)
+        self.slverse.has_audio_stream = lambda source: True
+        self.slverse.detect_delogo_occlusion = lambda source, box, start, end: (13.0, 15.0)
+        self.extract(delogo_engine="auto")
         cmd = self.run_calls[0]
-        self.assertNotIn("1:a", cmd)
-        self.assertNotIn("-shortest", cmd)
-        self.assertEqual(cmd.count("-i"), 1)  # only the inpainted video - nothing to pull audio from
+        # Input 0 is the plain trimmed source (also where audio comes from -
+        # the inpainted intermediate is video-only); input 1 is the short
+        # inpainted patch.
+        self.assertEqual(cmd[:6], ["-ss", "10.0", "-to", "20.0", "-i", "http://example/vid.mp4"])
+        self.assertIn("-filter_complex", cmd)
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[1:v]setpts=PTS+3.000/TB[patch]", fc)  # 13.0 - 10.0 (start_time)
+        self.assertIn("delogo=x=88:y=49:w=240:h=60:show=0", fc)  # blur uses the ORIGINAL (un-shrunk) box
+        self.assertIn("between(t\\,3.000\\,5.000)", fc)  # rel_start=3, rel_end=5
+        self.assertIn("drawtext=text='Psalm'", fc)  # replacement label still drawn on top
+        self.assertIn("-map", cmd)
+        self.assertIn("0:a", cmd)
+        self.assertIn("-c:a", cmd)
+        self.assertIn("copy", cmd)
 
     def test_inpaint_failure_falls_back_to_blur(self) -> None:
         self.inpaint_calls = []
@@ -1117,6 +1179,7 @@ class SlverseExtractVerseInpaintTest(unittest.TestCase):
         self.assertIn("using the normal delogo blur", out.getvalue())
         self.assertEqual(len(self.run_calls), 1)
         self.assertIn("delogo=", " ".join(self.run_calls[0]))  # fell through to the plain overlay path
+        self.assertNotIn("-filter_complex", self.run_calls[0])
 
     def test_inpaint_fallback_error_raises(self) -> None:
         self.inpaint_calls = []
@@ -1125,9 +1188,10 @@ class SlverseExtractVerseInpaintTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.extract(delogo_inpaint_fallback="error")
 
-    def test_blur_engine_never_loads_ffinpaint(self) -> None:
+    def test_blur_engine_never_loads_ffinpaint_or_detects(self) -> None:
         loaded = []
         self.slverse.load_ffinpaint = lambda: loaded.append(True)
+        self.slverse.detect_delogo_occlusion = lambda *a: loaded.append("detect")
         self.slverse.has_audio_stream = lambda source: False
         self.extract(delogo_engine="blur")
         self.assertEqual(loaded, [])
@@ -1136,12 +1200,12 @@ class SlverseExtractVerseInpaintTest(unittest.TestCase):
         self.inpaint_calls = []
         self.slverse.load_ffinpaint = lambda: self.fake_ffinpaint(True)
         self.slverse.has_audio_stream = lambda source: False
-        self.slverse.detect_delogo_occlusion = lambda source, box, start, end: False
+        self.slverse.detect_delogo_occlusion = lambda source, box, start, end: None
         self.extract(delogo_engine="auto")
         self.assertEqual(self.inpaint_calls, [])
         self.assertIn("delogo=", " ".join(self.run_calls[0]))  # blur, not inpaint
 
-        self.slverse.detect_delogo_occlusion = lambda source, box, start, end: True
+        self.slverse.detect_delogo_occlusion = lambda source, box, start, end: (13.0, 15.0)
         self.extract(delogo_engine="auto")
         self.assertEqual(len(self.inpaint_calls), 1)
 

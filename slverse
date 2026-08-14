@@ -1062,20 +1062,29 @@ def detect_delogo_occlusion(source, box, start_time, end_time, samples=5):
     dependency: ffmpeg returns RGB bytes directly.  A positive result is a
     conservative prompt to use an already configured temporal backend, not a
     claim that every deviation is a hand.
+
+    Returns None if no occlusion was detected, or (occ_start, occ_end) - the
+    span from the first to the last hit timestamp, padded by one sample
+    step on each side (clamped to [start_time, end_time]) since sampling is
+    sparse and the actual crossing likely started/ended somewhere between
+    samples. Callers use this to inpaint only the sub-range that actually
+    needs it instead of the whole verse window - a real cost difference
+    against a GPU-minutes-per-clip AI backend (see extract_verse).
     """
     x, y, w, h = box; pad = 8
     left, top = max(0, x - pad), max(0, y - pad)
     cw, ch = w + (x - left) + pad, h + (y - top) + pad
     if cw <= w or ch <= h or end_time <= start_time:
-        return False
-    hits = 0
+        return None
+    step = (end_time - start_time) / samples
+    hit_timestamps = []
     for i in range(samples):
-        timestamp = start_time + (end_time - start_time) * (i + 0.5) / samples
+        timestamp = start_time + step * (i + 0.5)
         cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-ss", str(timestamp), "-i", str(source), "-frames:v", "1", "-vf", f"crop={cw}:{ch}:{left}:{top},format=rgb24", "-f", "rawvideo", "pipe:1"]
         try:
             raw = subprocess.run(cmd, check=True, capture_output=True, timeout=15).stdout
         except Exception:
-            return False
+            return None
         if len(raw) != cw * ch * 3:
             continue
         inside, border = [], []
@@ -1092,8 +1101,23 @@ def detect_delogo_occlusion(source, box, start_time, end_time, samples=5):
         reference = tuple(sorted(pixel[c] for pixel in border)[len(border) // 2] for c in range(3))
         deviating = sum(sum(abs(pixel[c] - reference[c]) for c in range(3)) > 75 for pixel in inside)
         if deviating / max(1, len(inside)) > 0.025:
-            hits += 1
-    return hits >= max(1, samples // 3)
+            hit_timestamps.append(timestamp)
+    if len(hit_timestamps) < max(1, samples // 3):
+        return None
+    return (max(start_time, min(hit_timestamps) - step), min(end_time, max(hit_timestamps) + step))
+
+def shrink_box_for_inpaint(box, config):
+    """A smaller mask than blur's own (delogo_width_pad/height_pad exist to
+    give the *blur* a safety margin beyond the measured source caption) -
+    inpainting reconstructs precisely what the mask marks rather than
+    blurring a region, so it doesn't need that same fudge factor. Less for
+    the model to hallucinate, and less area/time to process. Shrinks evenly
+    around the box's own center; never below 1px either side."""
+    x, y, w, h = box
+    width_pad = int(config.get("delogo_width_pad", DEFAULT_CONFIG["delogo_width_pad"]))
+    height_pad = int(config.get("delogo_height_pad", DEFAULT_CONFIG["delogo_height_pad"]))
+    new_w, new_h = max(1, w - width_pad), max(1, h - height_pad)
+    return (x + (w - new_w) // 2, y + (h - new_h) // 2, new_w, new_h)
 
 def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False, source_labels=None, kept_segments=None, fade_outs=None, metadata_args=None):
     """Single-pass: trim + overlay + (for framerate/minterpolate) the fps
@@ -1122,32 +1146,50 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
 
     delogo_engine = str(config.get("delogo_engine", "blur")).lower()
     box = delogo_box_from_filter(overlay)
-    wants_inpaint = delogo_engine == "inpaint" or (delogo_engine == "auto" and box and detect_delogo_occlusion(source, box, start_time, end_time))
-    if wants_inpaint and box and len(segments) == 1 and engine == "none":
+    occlusion_range = detect_delogo_occlusion(source, box, start_time, end_time) if box and delogo_engine in ("auto", "inpaint") else None
+    wants_inpaint = box and (delogo_engine == "inpaint" or (delogo_engine == "auto" and occlusion_range))
+    if wants_inpaint and len(segments) == 1 and engine == "none":
         ffinpaint = load_ffinpaint()
+        # Only the detected occlusion sub-range (padded - see
+        # detect_delogo_occlusion) goes to the AI backend, not the whole
+        # verse window: a real cost difference against a GPU-minutes-per-
+        # clip model. delogo_engine=inpaint with no localized range (forced
+        # on, or the detector found nothing) falls back to the full window.
+        # Sized down from blur's own (padded-for-safety) box too - see
+        # shrink_box_for_inpaint.
+        inpaint_start, inpaint_end = occlusion_range or (start_time, end_time)
+        inpaint_box = shrink_box_for_inpaint(box, config)
         with tempfile.TemporaryDirectory(prefix="slverse-inpaint-") as tmp_dir:
             inpainted = Path(tmp_dir) / "inpainted.mp4"
-            if ffinpaint.inpaint(source, inpainted, box, ffinpaint.load_config(), start_time, end_time):
-                # E2FGVI's unmodified upstream runner emits a video-only MP4
-                # (no audio track at all), so this is the final overlay
-                # encode - pull audio back in from the original source
-                # (trimmed to the same window) rather than dropping it.
-                # JW's own Sign Language sources normally carry no audio
-                # track (see has_audio_stream), so this is usually a no-op
-                # in practice, but staying correct here means a future
-                # audio-bearing source doesn't silently lose its audio only
-                # on the inpaint path while the blur path keeps it.
-                # RIFE composition remains safely on the blur path until an
-                # upstream PNG-output API exists.
-                audio = has_audio_stream(source)
-                cmd = ["-i", str(inpainted)]
-                if audio:
-                    cmd += ["-ss", str(start_time), "-to", str(end_time), "-i", str(source)]
+            if ffinpaint.inpaint(source, inpainted, inpaint_box, ffinpaint.load_config(), inpaint_start, inpaint_end):
+                # Composite: blur the whole window cheaply (input 0, the
+                # plain trimmed source - also where audio comes from,
+                # unlike the inpainted intermediate which is video-only),
+                # then overlay the short inpainted patch (input 1) on top,
+                # active only during the sub-range it actually covers.
+                # setpts shifts input 1's own zero-based timeline (see the
+                # RIFE fade-timing note above - the same -ss/-to-before-i
+                # reset applies inside ffinpaint's own frame extraction) to
+                # line up with input 0's, so overlay's enable=between(t,..)
+                # window and the patch's actual frames agree on when "now"
+                # is.
+                x, y, w, h = box
+                rel_start, rel_end = inpaint_start - start_time, inpaint_end - start_time
+                filters = [
+                    f"[1:v]setpts=PTS+{rel_start:.3f}/TB[patch]",
+                    f"[0:v]delogo=x={x}:y={y}:w={w}:h={h}:show=0[blurred]",
+                    f"[blurred][patch]overlay=eof_action=pass:enable='between(t\\,{rel_start:.3f}\\,{rel_end:.3f})'[patched]",
+                ]
                 text_overlay = without_delogo(overlay)
-                if text_overlay: cmd += ["-vf", text_overlay]
-                cmd += ["-map", "0:v"]
+                out_label = "[patched]"
+                if text_overlay:
+                    filters.append(f"[patched]{text_overlay}[final]")
+                    out_label = "[final]"
+                audio = has_audio_stream(source)
+                cmd = ["-ss", str(start_time), "-to", str(end_time), "-i", str(source), "-i", str(inpainted)]
+                cmd += ["-filter_complex", ";".join(filters), "-map", out_label]
                 if audio:
-                    cmd += ["-map", "1:a", "-c:a", "aac", "-b:a", "128k", "-shortest"]
+                    cmd += ["-map", "0:a", "-c:a", "copy"]
                 cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]
                 run_ffmpeg(cmd, duration=duration)
                 return
