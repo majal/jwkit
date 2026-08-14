@@ -1943,7 +1943,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     # timeline, as do concat/filter-complex paths.
     fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None)
     verses_str = format_verses_label(valid_verses)
-    out_filename = f"{book_name.replace(' ', '_')}_{chapter}_{verses_str}_{lang}.mp4"
+    out_filename = getattr(args, "output", None) or f"{book_name.replace(' ', '_')}_{chapter}_{verses_str}_{lang}.mp4"
+    if getattr(args, "output", None):
+        Path(out_filename).parent.mkdir(parents=True, exist_ok=True)
     edit_bits = []
     if getattr(args, "offset_start", None) or getattr(args, "offset_end", None) or getattr(args, "clip_window", None): edit_bits.append("custom cut")
     if getattr(args, "keep_end_transition", False) or getattr(args, "trim_mid_transitions", False): edit_bits.append("transition edit")
@@ -2081,6 +2083,15 @@ def cmd_extract(args, config):
     if not args.write and len(langs) > 1:
         print(f"Preview mode only plays one language at a time (got {', '.join(langs)}).")
         print("Pass --write/-f to batch-export all of them, or give a single language to preview.")
+        return
+
+    output = getattr(args, "output", None)
+    if output and not args.write:
+        print("--output/-o requires --write/-f.")
+        return
+
+    if output and len(langs) > 1:
+        print("--output/-o requires one language; use the default names for multi-language exports.")
         return
 
     if (args.slow or args.fast) and not args.write:
@@ -2367,6 +2378,7 @@ def main():
     p_extract.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
     p_extract.add_argument("reference", help="Bible reference (e.g., 'Rev 13:1, 2')")
     p_extract.add_argument("-f", "--write", action="store_true", help="Encode and save the output file. Default is preview-only: play the verse with its overlay (delogo box shown, not applied) and write nothing.")
+    p_extract.add_argument("-o", "--output", help="Output media filename (requires --write and one language)")
     p_extract.add_argument("-q", "--quiet", action="store_true", help="Suppress source/cache status lines (progress and errors still show)")
     p_extract.add_argument("-m", "--play", action="store_true", help="With --write, also play the finished file via mpv. Without --write, preview via mpv instead of ffplay.")
     p_extract.add_argument("--interpolate", action="store_true", help="Force interpolation on output")
