@@ -272,7 +272,7 @@ def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
     start = time.time()
     shown = False
-    samples = []
+    eta_estimator = _jwkit_common.ProgressETA(duration)
     last_print = 0.0
     for line in proc.stdout:
         line = line.strip()
@@ -284,11 +284,8 @@ def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
             continue
         if not shown and time.time() - start > slow_after:
             shown = True
-        if shown and time.time() - last_print >= 5.0:
-            now = time.time(); samples.append((now, current)); samples = samples[-8:]
-            eta = None
-            if len(samples) >= 3 and samples[-1][1] > samples[0][1]:
-                eta = max(0, (duration - current) / ((samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0])))
+        now = time.time(); eta = eta_estimator.update(current, now)
+        if shown and now - last_print >= 5.0:
             print_time_progress(current, duration, label=label, eta_seconds=eta)
             last_print = now
     proc.stdout.close()
@@ -359,25 +356,20 @@ def run_rife(rife_path, in_frames, out_frames, target_count, slow_after=4.0):
     proc = subprocess.Popen([rife_path, "-i", str(in_frames), "-o", str(out_frames)])
     start = time.time()
     shown = False
-    samples = []
+    eta_estimator = _jwkit_common.ProgressETA(target_count)
     last_print = 0.0
     try:
         while proc.poll() is None:
             time.sleep(0.5)
             if not shown and time.time() - start > slow_after:
                 shown = True
-            if shown and time.time() - last_print >= 5.0:
+            if shown:
                 current = len(list(Path(out_frames).glob("*.png")))
                 now = time.time()
-                samples.append((now, current))
-                samples = samples[-8:]
-                eta = None
-                if len(samples) >= 4 and samples[-1][1] > samples[0][1]:
-                    rate = (samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0])
-                    if rate > 0:
-                        eta = max(0, (target_count - current) / rate)
-                print_count_progress(current, target_count, label="RIFE", eta_seconds=eta)
-                last_print = now
+                eta = eta_estimator.update(current, now)
+                if now - last_print >= 5.0:
+                    print_count_progress(current, target_count, label="RIFE", eta_seconds=eta)
+                    last_print = now
     finally:
         if proc.poll() is None:
             proc.terminate()
