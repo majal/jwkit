@@ -30,6 +30,13 @@ class FfrifeConfigTest(unittest.TestCase):
             config = self.ffrife.load_config()
             self.assertEqual(config, self.ffrife.DEFAULT_CONFIG)
 
+    def test_run_encoder_overrides_parse(self) -> None:
+        args = self.ffrife.build_parser().parse_args([
+            "run", "input.mp4", "-o", "output.mp4", "--encoder", "nvenc",
+            "--codec", "hevc", "--crf", "24", "--preset", "fast",
+        ])
+        self.assertEqual((args.encoder, args.codec, args.crf, args.preset), ("nvenc", "hevc", "24", "fast"))
+
 
 class FfrifeEncodeArgsTest(unittest.TestCase):
     @classmethod
