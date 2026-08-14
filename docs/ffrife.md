@@ -75,8 +75,17 @@ Use Apple VideoToolbox for this output only:
 
 - Global configuration is saved in `~/.config/jwkit/ffrife/config.toml` (separate from `slverse`'s own config - `slverse` bridges its own `hardware_encoder`/`video_crf`/etc. into a call to `ffrife` rather than needing them kept in sync across two files by hand).
 - `hardware_encoder` defaults to `cpu` (`libx264`). Measured directly on Apple Silicon: `videotoolbox` at a quality setting matching `crf 20` produced a file ~2.6x larger than `libx264 crf 20 preset slow` for immeasurably different quality (SSIM within 0.0003), with no meaningful speed advantage at short clip lengths.
+- `video_codec` defaults to `av1` (`libsvtav1` in software - no consumer Apple Silicon has AV1 *hardware encode* yet, that's landing with 2026's M5 Pro/Max; VideoToolbox's AV1 support through M4 is decode-only). Measured on a real 10s 720p clip on Apple M3, each codec at its own auto-crf (`h264`=20, `hevc`=23, `av1`=30) and `preset slow` (`preset 6` for `libsvtav1`, ffmpeg's own recommended AV1-equivalent):
+
+  | codec | encoder | time | size | SSIM vs lossless |
+  |---|---|---|---|---|
+  | h264 | libx264 | 1.7s | 1.46 MB | 0.9979 |
+  | hevc | libx265 | 7.0s | 0.79 MB | 0.9967 |
+  | av1 | libsvtav1 | 2.2s | 0.61 MB | 0.9963 |
+
+  AV1 via SVT-AV1 came out smallest *and* nearly as fast as h264 - hevc was both bigger and ~3x slower than av1 here, so there's no real case for hevc as a middle tier on this hardware. If `video_codec=av1` isn't actually encodable (no `libsvtav1`/`libaom-av1` in this ffmpeg build, and no hardware AV1 encoder for the configured `hardware_encoder`), it automatically falls back to `hevc`, then `h264` - never upward. AV2 (AOMedia's av1 successor, spec finalized May 2026) is not a real option yet: no ffmpeg encoder support and no shipping hardware decoders as of this writing.
 - `ffrife <input> -o <output> ...` works without typing the `run` subcommand explicitly; `ffrife run <input> -o <output> ...` is equivalent.
-- `--encoder` (`cpu`, `videotoolbox`, `nvenc`, `qsv`), `--codec` (`h264`, `hevc`, `av1`), `--crf`, and `--preset` override encode configuration for one run without changing `config.toml`.
+- `--encoder` (`cpu`, `videotoolbox`, `nvenc`, `qsv`), `--codec` (`h264`, `hevc`, `av1`), `--crf`, and `--preset` override encode configuration for one run without changing `config.toml`. Every other `config.toml` setting (`rife_binary_path`, `ffmpeg_binary`, `ffprobe_binary`) has a matching `--<dashed-key>` flag too - run `ffrife run --help` for the full list.
 - `--speed` under 1 slows down, over 1 speeds up. RIFE always exactly doubles frame count, so `--fps` should be set to 2x the source's actual frame rate when combining it with `--speed` (this is what `jwsl`'s `--slow` and `ffslow`'s `--rife` do automatically) - any other `--fps` value changes the output's actual duration, not just its smoothness.
 
 ## Notes / Caveats

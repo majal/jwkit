@@ -88,7 +88,7 @@ DEFAULT_CONFIG = {
     "rife_binary_path": "",
     "rife_fallback_engine": "none",  # none, framerate, minterpolate
     "hardware_encoder": "cpu",  # cpu, videotoolbox, nvenc, qsv - see jwsl's detect_hardware_encoder for why cpu is the default
-    "video_codec": "h264",
+    "video_codec": "av1",  # h264, hevc, av1 - falls back to hevc then h264 automatically if unavailable, see _jwkit_common.build_encode_args
     "video_crf": "auto",  # h264=20, hevc=23, av1=30 unless overridden
     "video_preset": "slow",
     "ffmpeg_binary": "",
@@ -222,42 +222,13 @@ def fetch_json(url):
         print(f"Error fetching {url}: {e}")
         return None
 
-# --- Encode settings (same logic/defaults as jwsl's build_encode_args - see
-# jwsl's detect_hardware_encoder for the benchmark behind defaulting to cpu) ---
-def nvenc_quality_from_crf(crf):
-    return crf
-
+# --- Encode settings (shared with slverse via _jwkit_common.build_encode_args -
+# see there for the av1->hevc->h264 hardware/software fallback chain) ---
 def videotoolbox_quality_from_crf(crf):
-    try:
-        crf_val = float(crf)
-    except ValueError:
-        crf_val = 20
-    return max(1, min(100, round(100 - crf_val)))
+    return _jwkit_common.videotoolbox_quality_from_crf(crf)
 
-def build_encode_args(config):
-    hw = config.get("hardware_encoder", "cpu")
-    codec = config.get("video_codec", "h264")
-    crf = config.get("video_crf", "auto")
-    if str(crf).strip().lower() == "auto":
-        crf = {"h264": "20", "hevc": "23", "av1": "30"}.get(codec, "20")
-    preset = config.get("video_preset", "slow")
-
-    if hw == "nvenc":
-        vcodec = {"hevc": "hevc_nvenc", "av1": "av1_nvenc"}.get(codec, "h264_nvenc")
-        args = ["-c:v", vcodec, "-preset", preset, "-cq", str(nvenc_quality_from_crf(crf))]
-    elif hw == "videotoolbox":
-        vcodec = "hevc_videotoolbox" if codec == "hevc" else "h264_videotoolbox"
-        args = ["-c:v", vcodec, "-q:v", str(videotoolbox_quality_from_crf(crf))]
-    elif hw == "qsv":
-        vcodec = "hevc_qsv" if codec == "hevc" else "h264_qsv"
-        args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
-    else:
-        vcodec = {"hevc": "libx265", "av1": "libsvtav1"}.get(codec, "libx264")
-        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", ("6" if codec == "av1" and preset == "slow" else preset)]
-        if codec == "av1":
-            args += ["-svtav1-params", "tune=0"]
-
-    return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+def build_encode_args(config, notice=True):
+    return _jwkit_common.build_encode_args(FFMPEG_BIN, config, notice=notice)
 
 def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     base = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y"]
@@ -539,6 +510,25 @@ def cmd_config(args, config):
         for k, v in config.items():
             print(f"{k} = {v}")
 
+# DEFAULT_CONFIG keys with their own dedicated per-run flag already -
+# excluded from the generic --<key> override loop (see slverse's own
+# GENERIC_OVERRIDE_EXCLUDED_KEYS for the same pattern).
+GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset"}
+
+def add_generic_config_overrides(parser):
+    for key in DEFAULT_CONFIG:
+        if key in GENERIC_OVERRIDE_EXCLUDED_KEYS:
+            continue
+        parser.add_argument(f"--{key.replace('_', '-')}", dest=key, help=f"Override {key} for this run")
+
+def apply_generic_config_overrides(args, config):
+    for key in DEFAULT_CONFIG:
+        if key in GENERIC_OVERRIDE_EXCLUDED_KEYS:
+            continue
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+
 def build_parser():
     parser = argparse.ArgumentParser(description="ffrife - AI frame interpolation (rife-ncnn-vulkan) for any video")
     subparsers = parser.add_subparsers(dest="command")
@@ -563,6 +553,7 @@ def build_parser():
     p_run.add_argument("--codec", choices=["h264", "hevc", "av1"], help="Video codec for this run (default: configured video_codec)")
     p_run.add_argument("--crf", help="Video quality for this run; use 'auto' for the codec default")
     p_run.add_argument("--preset", help="FFmpeg encoder preset for this run (e.g. slow, medium, fast)")
+    add_generic_config_overrides(p_run)
     return parser
 
 def normalize_argv(argv):
@@ -578,6 +569,12 @@ def main():
     args = build_parser().parse_args(normalize_argv(sys.argv[1:]))
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     config = load_config()
+    # Applied before binary resolution below (not per-command) so a
+    # --ffmpeg-binary/--ffprobe-binary override actually takes effect for
+    # this run, rather than resolving against the pre-override config. A
+    # no-op for subcommands that don't register these flags at all -
+    # getattr(args, key, None) just finds nothing to apply.
+    apply_generic_config_overrides(args, config)
 
     global FFMPEG_BIN, FFPROBE_BIN
     FFMPEG_BIN = resolve_ffmpeg_binary(config)
