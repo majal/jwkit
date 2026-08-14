@@ -205,7 +205,7 @@ class SlverseAutoSyncTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def base_config(self, **overrides):
-        config = {"languages": "ASL,FSL", "auto_sync": "true", "auto_sync_interval_hours": "24"}
+        config = {"languages": "ASL,FSL", "auto_sync": "true", "auto_sync_interval_hours": "24", "auto_sync_background": "false"}
         config.update(overrides)
         return config
 
@@ -250,6 +250,40 @@ class SlverseAutoSyncTest(unittest.TestCase):
         self.slverse.maybe_auto_sync(args, self.base_config(languages="ASL,FSL,BVL"))
 
         self.assertEqual(self.sync_calls, [["ASL", "FSL", "BVL"]])
+        self.assertGreater(self.slverse.get_state()["_auto_sync"]["last_attempt"], time.time() - 10)
+
+    def test_background_default_spawns_detached_subprocess_instead_of_blocking(self) -> None:
+        # Swap only this loaded module's `subprocess` name for a proxy that
+        # records Popen calls and forwards everything else (DEVNULL, etc) to
+        # the real module - never touch the shared real `subprocess` module
+        # itself, or every later test's real subprocess calls (ffmpeg, ...)
+        # would silently get this stub too.
+        import subprocess as real_subprocess
+
+        popen_calls: list = []
+
+        class _RecordingSubprocessProxy:
+            def Popen(self, argv, **kwargs):
+                popen_calls.append((argv, kwargs))
+            def __getattr__(self, name):
+                return getattr(real_subprocess, name)
+
+        args = argparse.Namespace(no_auto_sync=False)
+        self.slverse.save_state({"_auto_sync": {"last_attempt": 0}})
+        self.slverse.internet_available = lambda: True
+        self.slverse.subprocess = _RecordingSubprocessProxy()
+
+        config = self.base_config(languages="ASL,FSL,BVL")
+        del config["auto_sync_background"]  # unset -> falls back to DEFAULT_CONFIG's "true"
+        self.slverse.maybe_auto_sync(args, config)
+
+        # Spawned out-of-process, not run inline - so sync_languages (patched
+        # onto this module) never gets called from maybe_auto_sync itself.
+        self.assertEqual(self.sync_calls, [])
+        self.assertEqual(len(popen_calls), 1)
+        argv, kwargs = popen_calls[0]
+        self.assertEqual(argv[1:], [str(Path(self.slverse.__file__).resolve()), "sync", "--quiet"])
+        self.assertTrue(kwargs.get("start_new_session"))
         self.assertGreater(self.slverse.get_state()["_auto_sync"]["last_attempt"], time.time() - 10)
 
 

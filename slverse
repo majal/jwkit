@@ -114,6 +114,7 @@ DEFAULT_CONFIG = {
     "extract_workers": "3",
     "auto_sync": "true",  # once-a-day background refresh on extract/find/bulk, so non-techies stay current without running 'sync' themselves
     "auto_sync_interval_hours": "24",
+    "auto_sync_background": "true",  # run the once-a-day refresh as a detached subprocess so it never blocks the current command; false restores the old blocking-in-foreground behavior
     "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
     "font_family": "noto-sans-display",  # noto-sans-display, inter, google-sans-flex - see FONT_FAMILIES
     "api_language": "E",  # Language for book names (e.g., E for English)
@@ -1264,7 +1265,7 @@ def sync_languages(langs, config, state, quiet=False):
 def cmd_sync(args, config):
     langs = get_lang_list(config, args.lang)
     state = get_state()
-    sync_languages(langs, config, state)
+    sync_languages(langs, config, state, quiet=getattr(args, "quiet", False))
     save_state(state)
 
 def internet_available():
@@ -1283,10 +1284,16 @@ def internet_available():
         return False
 
 def maybe_auto_sync(args, config):
-    """Once-a-day, best-effort background-ish refresh so non-technical users
-    get updated verse availability without ever running 'slverse sync'
-    themselves. Gated on a plain elapsed-time check (no network) on every
-    call, so the common case (already synced today) costs nothing."""
+    """Once-a-day, best-effort refresh so non-technical users get updated
+    verse availability without ever running 'slverse sync' themselves.
+    Gated on a plain elapsed-time check (no network) on every call, so the
+    common case (already synced today) costs nothing.
+
+    Runs as a detached background subprocess by default (auto_sync_background,
+    see DEFAULT_CONFIG) so it never holds up the command that triggered it -
+    a full multi-language sync can take a while and the caller almost always
+    just wants their extract/find/bulk to proceed. Set auto_sync_background
+    to false to restore the old behavior of syncing inline before proceeding."""
     if getattr(args, "no_auto_sync", False):
         return
     if config.get("auto_sync", "true").strip().lower() not in ("true", "1", "yes"):
@@ -1308,6 +1315,19 @@ def maybe_auto_sync(args, config):
     save_state(state)
 
     if not internet_available():
+        return
+
+    background = config.get("auto_sync_background", DEFAULT_CONFIG["auto_sync_background"]).strip().lower() in ("true", "1", "yes")
+    if background:
+        print("Refreshing sign language availability in the background (runs about once a day)...", file=sys.stderr)
+        try:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "sync", "--quiet"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            pass
         return
 
     print("Checking for updated sign language availability (runs about once a day)...", file=sys.stderr)
@@ -1710,6 +1730,7 @@ def main():
 
     p_sync = subparsers.add_parser("sync", help="Sync metadata (and verse markers) so extract can skip video downloads to look up timestamps")
     p_sync.add_argument("lang", nargs="?", default="all", help="Sign language code, comma list, or 'all' for your configured list (default: all)")
+    p_sync.add_argument("-q", "--quiet", action="store_true", help="Suppress per-language progress output (used internally by the background auto-sync)")
 
     p_extract = subparsers.add_parser("extract", help="Extract and overlay verses from a chapter")
     p_extract.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
