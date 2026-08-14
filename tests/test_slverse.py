@@ -36,6 +36,148 @@ class SlverseTimeParsingTest(unittest.TestCase):
         times = self.slverse.markers_to_verse_times([{"verseNumber": "not-a-number"}, None])
         self.assertEqual(times, {})
 
+    def test_markers_to_verse_times_parses_end_transition(self) -> None:
+        # endTransitionDuration is 0 mid-paragraph and nonzero on a
+        # paragraph's/chapter's last verse - the fade-out + copyright
+        # endscreen tail (see resolve_verse_window / DEFAULT_CONFIG
+        # trim_end_transition).
+        markers = [
+            {"verseNumber": 10, "startTime": "00:02:13.633", "duration": "00:00:15.782", "endTransitionDuration": "00:00:00.000"},
+            {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:06.940"},
+        ]
+        times = self.slverse.markers_to_verse_times(markers)
+        self.assertAlmostEqual(times[10]["end_transition"], 0.0)
+        self.assertAlmostEqual(times[11]["end_transition"], 6.940)
+
+    def test_markers_to_verse_times_defaults_missing_end_transition_to_zero(self) -> None:
+        times = self.slverse.markers_to_verse_times([{"verseNumber": 1, "startTime": "00:00:00.000", "duration": "00:00:05.000"}])
+        self.assertAlmostEqual(times[1]["end_transition"], 0.0)
+
+
+class SlverseResolveVerseWindowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def config(self, **overrides):
+        cfg = dict(self.slverse.DEFAULT_CONFIG)
+        cfg.update(overrides)
+        return cfg
+
+    def _stub_index(self, markers) -> None:
+        self.slverse.load_index = lambda lang: {
+            "19_16": {
+                "url": "http://example/vid.mp4",
+                "checksum": "abc123",
+                "markers": markers,
+            }
+        }
+
+    def test_trims_trailing_end_transition_by_default(self) -> None:
+        self._stub_index([
+            {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:06.940", "label": "Psalm 16:11"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window("ASL", 19, 16, [11], self.config())
+        self.assertAlmostEqual(end, 149.415 + 33.800 - 6.940)
+        self.assertEqual(source_labels, ["Psalm 16:11"])
+        self.assertEqual(kept_segments, [(0.0, end - start)])
+
+    def test_trim_end_transition_false_keeps_full_marker_duration(self) -> None:
+        self._stub_index([
+            {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:06.940", "label": "Psalm 16:11"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "ASL", 19, 16, [11], self.config(trim_end_transition="false"),
+        )
+        self.assertAlmostEqual(end, 149.415 + 33.800)
+
+    def test_keep_end_transition_override_beats_config_default(self) -> None:
+        self._stub_index([
+            {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:06.940", "label": "Psalm 16:11"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "ASL", 19, 16, [11], self.config(), keep_end_transition=True,
+        )
+        self.assertAlmostEqual(end, 149.415 + 33.800)
+
+    def test_offset_start_nudges_the_computed_start(self) -> None:
+        self._stub_index([
+            {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:11"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "ASL", 19, 16, [11], self.config(), offset_start=5.302,
+        )
+        self.assertAlmostEqual(start, 149.415 + 5.302)
+        self.assertAlmostEqual(end, 149.415 + 33.800)
+
+    def test_offset_end_nudges_the_computed_end_negative_to_end_early(self) -> None:
+        self._stub_index([
+            {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:11"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "ASL", 19, 16, [11], self.config(), offset_end=-3.0,
+        )
+        self.assertAlmostEqual(end, 149.415 + 33.800 - 3.0)
+
+    def test_offset_start_never_goes_negative(self) -> None:
+        self._stub_index([
+            {"verseNumber": 1, "startTime": "00:00:02.000", "duration": "00:00:05.000", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:1"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "ASL", 19, 16, [1], self.config(), offset_start=-10.0,
+        )
+        self.assertEqual(start, 0.0)
+
+    def test_offsets_stack_with_end_transition_trim(self) -> None:
+        self._stub_index([
+            {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:06.940", "label": "Psalm 16:11"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "ASL", 19, 16, [11], self.config(), offset_end=-1.0,
+        )
+        self.assertAlmostEqual(end, 149.415 + 33.800 - 6.940 - 1.0)
+
+    def test_no_trim_when_end_transition_is_zero(self) -> None:
+        self._stub_index([
+            {"verseNumber": 10, "startTime": "00:02:13.633", "duration": "00:00:15.782", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:10"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window("ASL", 19, 16, [10], self.config())
+        self.assertAlmostEqual(end, 133.633 + 15.782)
+
+    def test_mid_transition_default_keeps_continuous_range(self) -> None:
+        # A range spanning multiple paragraphs plays through a mid-range
+        # transition untouched by default - only the LAST selected verse's
+        # own trailing transition (trim_end_transition) is ever cut.
+        self._stub_index([
+            {"verseNumber": 8, "startTime": "00:01:00.000", "duration": "00:00:10.000", "endTransitionDuration": "00:00:02.000", "label": "Psalm 16:8"},
+            {"verseNumber": 9, "startTime": "00:01:10.000", "duration": "00:00:08.000", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:9"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "ASL", 19, 16, [8, 9], self.config(),
+        )
+        self.assertEqual(kept_segments, [(0.0, end - start)])
+
+    def test_trim_mid_transitions_cuts_the_paragraph_boundary(self) -> None:
+        self._stub_index([
+            {"verseNumber": 8, "startTime": "00:01:00.000", "duration": "00:00:10.000", "endTransitionDuration": "00:00:02.000", "label": "Psalm 16:8"},
+            {"verseNumber": 9, "startTime": "00:01:10.000", "duration": "00:00:08.000", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:9"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "ASL", 19, 16, [8, 9], self.config(trim_mid_transitions="true"),
+        )
+        # verse 8 spans [0, 10) of the window, transition is its last 2s -> drop [8, 10)
+        self.assertEqual(kept_segments, [(0.0, 8.0), (10.0, 18.0)])
+
+    def test_trim_mid_transitions_cli_override(self) -> None:
+        self._stub_index([
+            {"verseNumber": 8, "startTime": "00:01:00.000", "duration": "00:00:10.000", "endTransitionDuration": "00:00:02.000", "label": "Psalm 16:8"},
+            {"verseNumber": 9, "startTime": "00:01:10.000", "duration": "00:00:08.000", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:9"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "ASL", 19, 16, [8, 9], self.config(), trim_mid_transitions=True,
+        )
+        self.assertEqual(kept_segments, [(0.0, 8.0), (10.0, 18.0)])
+
     def test_verse_markers_unwraps_api_shape(self) -> None:
         # GETPUBMEDIALINKS wraps the marker list: file['markers'] = {..., 'markers': [...]}
         file = {"markers": {"bibleBookNumber": 66, "markers": [{"verseNumber": 1}]}}
@@ -366,7 +508,10 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_builds_overlay_for_non_target_lang(self) -> None:
-        result = self.slverse.build_overlay_filter("ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
+        # BVL (es) -> FSL (en): different reference languages, so the full
+        # delogo+drawtext still applies - unlike ASL->FSL below, which now
+        # share "en" and skip the reference swap (see sign_lang_ref_language).
+        result = self.slverse.build_overlay_filter("BVL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
         self.assertIsNotNone(result)
         self.assertIn("delogo=", result)
         self.assertIn("drawtext=", result)
@@ -374,12 +519,56 @@ class SlverseOverlayFilterTest(unittest.TestCase):
 
     def test_show_box_true_uses_delogo_show_1(self) -> None:
         # Preview mode: draw the box, don't actually blur anything.
-        result = self.slverse.build_overlay_filter("ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=True)
+        result = self.slverse.build_overlay_filter("BVL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=True)
         self.assertIn("show=1", result)
 
     def test_source_lang_label_included(self) -> None:
-        result = self.slverse.build_overlay_filter("asl", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
+        result = self.slverse.build_overlay_filter("bvl", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
+        self.assertIn("text='BVL'", result)
+
+    def test_skips_reference_when_ref_languages_match(self) -> None:
+        # ASL and FSL are different sign languages but both caption in
+        # English (sign_lang_ref_language default), so the verse-reference
+        # swap itself is unnecessary - only the small source-SL label draws.
+        result = self.slverse.build_overlay_filter("ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
+        self.assertIsNotNone(result)
+        self.assertNotIn("delogo=", result)
         self.assertIn("text='ASL'", result)
+
+    def test_skips_reference_and_label_returns_none(self) -> None:
+        result = self.slverse.build_overlay_filter(
+            "ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL", show_source_lang_label="false"), show_box=False,
+        )
+        self.assertIsNone(result)
+
+    def test_unmapped_lang_falls_back_to_full_overlay(self) -> None:
+        # A sign language with no sign_lang_ref_language entry can't be
+        # proven to share a reference language with the target, so it gets
+        # the full (safe) overlay rather than being assumed to match.
+        result = self.slverse.build_overlay_filter(
+            "XSL", "Psalm", 16, "11", self.config(default_target_lang="FSL", sign_lang_ref_language="FSL=en"), show_box=False,
+        )
+        self.assertIn("delogo=", result)
+
+    def test_delogo_sized_from_source_label_not_replacement_text(self) -> None:
+        # The real bug this fixes: a source caption ("Mazmur 16:11") in a
+        # language whose words render wider than the replacement text
+        # ("Psalm 16:11") must size the delogo box off its OWN width, not
+        # the replacement's.
+        seen = []
+
+        def fake_measure(text, font_path, fontsize):
+            seen.append(text)
+            return (200, 30) if text == "Mazmur 16:11" else (100, 30)
+
+        self.slverse.measure_text_size = fake_measure
+        result = self.slverse.build_overlay_filter(
+            "INI", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False,
+            source_labels=["Mazmur 16:11"],
+        )
+        self.assertIn("Mazmur 16:11", seen)
+        self.assertNotIn("Psalm 16:11", seen)
+        self.assertIn("w=220", result)  # 200 + 10 + delogo_width_pad(10)
 
 
 class SlverseExtractPreviewTest(unittest.TestCase):
@@ -388,8 +577,8 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         cls.slverse = load_script_module("slverse")
 
     def setUp(self) -> None:
-        self.slverse.resolve_verse_window = lambda lang, book_num, chapter, verses, config: (
-            10.0, 20.0, "http://example/vid.mp4", "abc123", [11],
+        self.slverse.resolve_verse_window = lambda lang, book_num, chapter, verses, config, **kw: (
+            10.0, 20.0, "http://example/vid.mp4", "abc123", [11], ["Psalm 16:11"], [(0.0, 10.0)],
         )
         # Preview's default preview_source=cache downloads/reuses a local
         # chapter file - isolate cache_dir to a throwaway temp dir and stub
@@ -536,6 +725,100 @@ class SlverseResolveRetimeArgsTest(unittest.TestCase):
         args = argparse.Namespace(slow=["5", "2"], fast=None, speed=None)
         _, _, _, error = self.slverse.resolve_retime_args(args, 10.0)
         self.assertIsNotNone(error)
+
+
+class SlverseResolveKeptSegmentsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_trim_mid_false_returns_single_segment(self) -> None:
+        chapters_meta = {8: {"end": 70.0, "end_transition": 2.0}, 9: {"end": 78.0, "end_transition": 0.0}}
+        segments = self.slverse.resolve_kept_segments(chapters_meta, [8, 9], 60.0, 78.0, trim_mid=False)
+        self.assertEqual(segments, [(0.0, 18.0)])
+
+    def test_ignores_last_verses_own_transition(self) -> None:
+        # Only verses BEFORE the last selected one are candidates for a mid
+        # cut - the last verse's own transition is trim_end_transition's
+        # call, made by the caller before this function ever runs.
+        chapters_meta = {8: {"end": 70.0, "end_transition": 0.0}, 9: {"end": 78.0, "end_transition": 5.0}}
+        segments = self.slverse.resolve_kept_segments(chapters_meta, [8, 9], 60.0, 78.0, trim_mid=True)
+        self.assertEqual(segments, [(0.0, 18.0)])
+
+    def test_cuts_a_mid_range_paragraph_boundary(self) -> None:
+        chapters_meta = {8: {"end": 70.0, "end_transition": 2.0}, 9: {"end": 78.0, "end_transition": 0.0}}
+        segments = self.slverse.resolve_kept_segments(chapters_meta, [8, 9], 60.0, 78.0, trim_mid=True)
+        self.assertEqual(segments, [(0.0, 8.0), (10.0, 18.0)])
+
+    def test_cuts_multiple_mid_range_boundaries(self) -> None:
+        chapters_meta = {
+            1: {"end": 20.0, "end_transition": 1.0},
+            2: {"end": 40.0, "end_transition": 2.0},
+            3: {"end": 50.0, "end_transition": 0.0},
+        }
+        segments = self.slverse.resolve_kept_segments(chapters_meta, [1, 2, 3], 0.0, 50.0, trim_mid=True)
+        self.assertEqual(segments, [(0.0, 19.0), (20.0, 38.0), (40.0, 50.0)])
+
+    def test_single_verse_returns_single_segment(self) -> None:
+        chapters_meta = {11: {"end": 20.0, "end_transition": 5.0}}
+        segments = self.slverse.resolve_kept_segments(chapters_meta, [11], 10.0, 20.0, trim_mid=True)
+        self.assertEqual(segments, [(0.0, 10.0)])
+
+
+class SlverseTrimConcatFilterComplexTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_video_only_by_default(self) -> None:
+        fc = self.slverse.build_trim_concat_filter_complex([(0.0, 8.0), (10.0, 18.0)])
+        self.assertIn("[0:v]trim=0.0:8.0,setpts=PTS-STARTPTS[v1];", fc)
+        self.assertIn("[0:v]trim=10.0:18.0,setpts=PTS-STARTPTS[v2];", fc)
+        self.assertIn("[v1][v2]concat=n=2:v=1[vout]", fc)
+        self.assertNotIn("atrim", fc)
+        self.assertNotIn("[aout]", fc)
+
+    def test_includes_audio_when_requested(self) -> None:
+        fc = self.slverse.build_trim_concat_filter_complex([(0.0, 8.0), (10.0, 18.0)], audio=True)
+        self.assertIn("[0:a]atrim=0.0:8.0,asetpts=PTS-STARTPTS[a1];", fc)
+        self.assertIn("[v1][a1][v2][a2]concat=n=2:v=1:a=1[vout][aout]", fc)
+
+
+class SlverseExtractVerseTrimMidTest(unittest.TestCase):
+    # Locks in the real bug this caught during live testing: JW's own Sign
+    # Language source videos carry no audio stream, so a filter_complex
+    # referencing [0:a] unconditionally fails with "Error binding
+    # filtergraph inputs/outputs" - extract_verse must probe first.
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def setUp(self) -> None:
+        self.slverse.build_overlay_filter = lambda *a, **k: None
+        self.run_calls = []
+        self.slverse.run_ffmpeg = lambda cmd, duration=None: self.run_calls.append(cmd)
+
+    def test_no_audio_stream_omits_audio_mapping(self) -> None:
+        self.slverse.has_audio_stream = lambda source: False
+        config = {"interpolation_engine": "none"}
+        self.slverse.extract_verse(
+            "http://example/vid.mp4", "out.mp4", 0.0, 18.0, "Psalm", 16, "8-9", "ASL", config,
+            kept_segments=[(0.0, 8.0), (10.0, 18.0)],
+        )
+        cmd = self.run_calls[0]
+        self.assertNotIn("-c:a", cmd)
+        self.assertNotIn("[aout]", " ".join(cmd))
+
+    def test_audio_stream_present_maps_audio(self) -> None:
+        self.slverse.has_audio_stream = lambda source: True
+        config = {"interpolation_engine": "none"}
+        self.slverse.extract_verse(
+            "http://example/vid.mp4", "out.mp4", 0.0, 18.0, "Psalm", 16, "8-9", "ASL", config,
+            kept_segments=[(0.0, 8.0), (10.0, 18.0)],
+        )
+        cmd = self.run_calls[0]
+        self.assertIn("[aout]", cmd)
+        self.assertIn("aac", cmd)
 
 
 class SlverseBuildSectionedFilterComplexTest(unittest.TestCase):
@@ -689,6 +972,78 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         self.assertEqual(kwargs["start"], 10.0)
         self.assertEqual(kwargs["end"], 20.0)
         self.assertEqual(kwargs["vf"], "drawtext=text='stub'")
+
+
+class SlverseLaunchMpvTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def setUp(self) -> None:
+        # self.slverse.subprocess IS the real, process-wide stdlib subprocess
+        # module (slverse does a plain `import subprocess`) - patching
+        # .Popen directly without restoring it would break every other
+        # test's real subprocess calls for the rest of the process (this
+        # broke tests/test_smoke.py's CLI smoke tests when first written).
+        # mock.patch.object via addCleanup guarantees it's undone even if a
+        # test fails partway through.
+        self.captured_cmd = []
+        fake_proc = argparse.Namespace(pid=1234, wait=lambda: None)
+
+        def fake_popen(cmd):
+            self.captured_cmd.append(cmd)
+            return fake_proc
+
+        patcher = mock.patch.object(self.slverse.subprocess, "Popen", fake_popen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.slverse.focus_process = lambda pid: None
+
+    def test_osc_flag_omitted_by_default(self) -> None:
+        self.slverse.launch_mpv(["file.mp4"], config={"mpv_show_osc": "true"})
+        self.assertNotIn("--osc=no", self.captured_cmd[0])
+
+    def test_osc_flag_omitted_without_config(self) -> None:
+        # No config passed (e.g. some call sites don't have one in scope):
+        # must not crash, and must default to mpv's normal OSC behavior.
+        self.slverse.launch_mpv(["file.mp4"])
+        self.assertNotIn("--osc=no", self.captured_cmd[0])
+
+    def test_osc_flag_added_when_disabled(self) -> None:
+        self.slverse.launch_mpv(["file.mp4"], config={"mpv_show_osc": "false"})
+        self.assertIn("--osc=no", self.captured_cmd[0])
+
+
+class SlverseConfigCommandTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_every_default_config_key_is_documented(self) -> None:
+        # CONFIG_HELP backs both 'slverse config list' and the docs claim
+        # that the whole config surface is discoverable from the CLI - a
+        # key added to DEFAULT_CONFIG without a matching entry here would
+        # silently go undocumented.
+        missing = set(self.slverse.DEFAULT_CONFIG) - set(self.slverse.CONFIG_HELP)
+        self.assertEqual(missing, set())
+
+    def test_config_get_prints_value_and_help(self) -> None:
+        args = argparse.Namespace(key="cache_max_gb", value=None)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.slverse.cmd_config(args, dict(self.slverse.DEFAULT_CONFIG))
+        output = out.getvalue()
+        self.assertIn("cache_max_gb = 5", output)
+        self.assertIn("Cache size cap", output)
+
+    def test_config_set_updates_and_saves(self) -> None:
+        args = argparse.Namespace(key="cache_max_gb", value="10")
+        saved = {}
+        self.slverse.save_config = lambda config: saved.update(config)
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.slverse.cmd_config(args, config)
+        self.assertEqual(config["cache_max_gb"], "10")
+        self.assertEqual(saved["cache_max_gb"], "10")
 
 
 if __name__ == "__main__":

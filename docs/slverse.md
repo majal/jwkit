@@ -17,6 +17,15 @@
 - `slverse find <book> <chapter> <verse>` searches every language you've already synced for who has a given verse, without downloading anything. `<verse>` also accepts a range (`25-27`) or comma list (`1,3,5`). Default output is a compact ✅/❌ table grouped by language; `--verbose` shows the full URL + mpv command per match, and `--json` gives scripts a machine-readable array. `--play` streams every match with `mpv` - with more than one match, each opens windowed (not fullscreen) and paused, cascaded slightly so they don't stack exactly on top of each other, so you can unpause and review each language side by side; a single match still autoplays fullscreen as before. Every window is spawned non-blocking (macOS/Linux/Windows alike), so the command returns immediately instead of waiting on playback.
 - `slverse bulk <lang>` precomputes whole chapters ahead of time (optionally interpolated to 60fps), for when you'd rather batch-process a language than extract on demand.
 - Auto-detects a drawtext-capable `ffmpeg` build (looks for a `-full` variant before falling back to the stock formula), so overlays work without hand-picking a binary.
+- Trims the trailing fade-out/copyright-endscreen off a chapter's or paragraph's last verse automatically (`trim_end_transition`, default on), using JW's own `endTransitionDuration` marker field rather than guessing from the video.
+- Skips the verse-reference swap (delogo + replacement text) whenever the source and target sign languages already caption in the same spoken language (`sign_lang_ref_language`, e.g. ASL→FSL, both English) — only the small source-SL label still draws, so you're not covering an already-correct caption. Configurable per language pair, since which languages share a reference language isn't derivable from the sign-language code itself.
+- Sizes the delogo box against the source video's *own* burned-in caption text (from JW's marker metadata), not the replacement text being drawn over it — a caption in a language whose words simply run wider than the replacement no longer leaves a visible sliver of the original.
+- `-s`/`--offset-start` and `-e`/`--offset-end` (seconds, either sign) nudge the verse range's own start/end for a partial cut — e.g. `-s 5.302` to skip the first 5.302s and play to the natural end, or `-e -3` to end 3s early. Relative to the verse's own computed boundaries, not a raw seek into the whole file — the same `-s`/`-e` semantics the original `ffv` had.
+- `--keep-end-transition` overrides `trim_end_transition` for one run (keeps the trailing fade/endscreen instead of cutting it); `--trim-mid-transitions` overrides `trim_mid_transitions` for one run (also cuts any paragraph transition in the *middle* of a multi-verse range, not just the trailing one — off by default, since a range spanning multiple paragraphs is normally meant to play through continuously). Automatically detects whether the source has an audio track at all (JW's own Sign Language videos usually don't) and only maps/re-encodes audio when there actually is one to concatenate.
+
+## What It Doesn't Do (Yet)
+
+- **Full delogo alternative for moving foreground.** `delogo` is a static rectangle blur, so an ASL signer's hand passing in front of the caption gets blurred along with it — there's no motion-awareness. Genuinely fixing that needs temporal-aware AI video inpainting (e.g. [ProPainter](https://github.com/sczhou/ProPainter) or [E2FGVI](https://github.com/MCG-NJU/E2FGVI)) that can tell "background caption to remove" apart from "foreground hand to keep" frame-to-frame. That's a real dependency (Python/PyTorch, GPU-recommended) on the scale of the existing `rife-ncnn-vulkan` integration, not a quick filter swap — not bundled yet. If you want to experiment with one of those tools directly on an extracted clip in the meantime, `slverse`'s job (accurate windowing + accurate replacement text) still saves you the manual timestamping.
 
 ## Supported Platforms
 
@@ -60,6 +69,23 @@ You can also set individual options by hand at any time:
 ./slverse config set interpolation_engine rife
 ./slverse config set languages ASL,FSL,BVL,INI,SPE
 ```
+
+## Configuration
+
+Nearly every behavior is a config key, not a fixed default meant for one setup. `./slverse config list` prints every key, its current value, and a one-line description; `./slverse config get <key>` prints just one, description included. A few worth knowing about beyond the obvious cache/encode ones:
+
+| Key | Default | What it's for |
+| --- | --- | --- |
+| `trim_end_transition` | `true` | Cut the trailing fade-out/copyright-endscreen off a chapter's/paragraph's last verse. `--keep-end-transition` overrides for one run. |
+| `trim_mid_transitions` | `false` | Also cut paragraph transitions in the *middle* of a multi-verse range (a jump cut, straight to the next paragraph's first kept frame). Off by default — a range spanning multiple paragraphs is normally meant to play through as one continuous scene. `--trim-mid-transitions` overrides for one run. |
+| `sign_lang_ref_language` | `ASL=en,FSL=en,BVL=es,SPE=es,INI=id` | Which spoken language each sign language's burned-in caption is actually written in — used to skip the reference-swap when source and target already match. Add an entry for any other language you use; an unlisted one always gets the full overlay. |
+| `show_source_lang_label` | `true` | The small "which SL this came from" label under the reference — independent of `overlay_source_label_alpha`, which only controls its opacity. |
+| `mpv_show_osc` | `true` | mpv's on-screen controller that appears on mouse movement, for every mpv window `slverse` opens. `slverse` always passes `--no-config` to mpv (for reproducibility across machines), so a personal `mpv.conf` that already disables this doesn't apply — set `false` here instead to match a "nothing shows on hover" setup. This is a per-user preference, not something worth defaulting off for everyone. |
+| `delogo_width_pad` / `delogo_height_pad` | `10` / `10` | Extra px of safety margin beyond the auto-measured source caption size. |
+| `font_family` / `font_weight_main` / `font_weight_estimator` | `noto-sans-display` / `600` / `400` | Overlay typography — see `FONT_FAMILIES` in the script for the other Google Fonts options. |
+| `download_max_attempts` / `download_retry_backoff` | `3` / `2` | Retry behavior for chapter/font downloads. |
+
+Config lives in `~/.config/jwkit/slverse/config.toml`, one `key = "value"` per line — hand-editable or via `config set`; neither path validates the key name, so check `config list` if a setting doesn't seem to be taking effect (a typo just creates an unused key rather than erroring).
 
 ## Common Usage Examples
 
@@ -139,6 +165,7 @@ Same, but sped up 2.5x instead, with an explicit `--speed` (accepts a decimal, a
 - Preview mode (`extract` without `--write`) defaults to `preview_source = cache`: it downloads the chapter once (if not already cached under `cache_dir`, from a prior `--cache` extract, a `bulk` run, or an earlier preview) and plays that local copy from then on, so previewing more verses from the same chapter costs no further bandwidth. The "Previewing:" line shows the local path being played; a `Source:` line under it has the remote URL too, in case you want to swap it in yourself. Set `./slverse config set preview_source remote` to always stream straight from the URL instead and never touch disk.
 - Both preview players (`ffplay` by default, `mpv` with `--play`/`-m`) stay open on the last frame once playback ends instead of closing themselves, so you can seek back and review the clip; close the window yourself when you're done.
 - `find --play`'s multi-language preview windows are sized via `preview_window_size` (default `65%` of screen size, aspect preserved, via mpv's `--autofit`) when previewing more than one language at once; a single match still autoplays fullscreen.
+- A multi-verse extraction can show more than one distinct source caption in sequence (each verse advances its own marker's label, e.g. "Psalm 16:10" then "Psalm 16:11") - the delogo box is sized to whichever is widest/tallest across the whole window, so it stays correctly sized throughout rather than only for the first verse.
 
 ## Notes / Caveats
 
