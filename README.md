@@ -13,6 +13,7 @@ Each tool below has its own section covering what it does, what it needs, and th
 - [Overview](#overview)
 - [Quick Install](#quick-install)
 - [Tools](#tools)
+  - [`ffinpaint`](#ffinpaint)
   - [`ffrife`](#ffrife)
   - [`jwdl`](#jwdl)
   - [`jwvideo-mux`](#jwvideo-mux)
@@ -25,7 +26,7 @@ Each tool below has its own section covering what it does, what it needs, and th
 
 ## Quick Install
 
-One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `jwdl`, `ffrife`, and `jwvideo-mux` just work. No manual downloads, no separate setup steps.
+One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `jwdl`, `ffinpaint`, `ffrife`, and `jwvideo-mux` just work. No manual downloads, no separate setup steps.
 
 **macOS or Linux** (Terminal):
 
@@ -69,6 +70,14 @@ If a step needs your password (installing Homebrew on macOS, or `sudo` on Linux)
 [↑ TOC](#table-of-contents)
 
 ## Tools
+
+### [`ffinpaint`](./ffinpaint)
+
+`ffinpaint` connects `slverse` to an explicitly user-installed E2FGVI-HQ temporal-inpainting checkout, preserving moving foreground where a static delogo blur cannot. It does not download or bundle the backend or model weights; E2FGVI-HQ is non-commercial-only.
+
+Full docs: [docs/ffinpaint.md](docs/ffinpaint.md)
+
+[↑ TOC](#table-of-contents)
 
 ### [`ffrife`](./ffrife)
 

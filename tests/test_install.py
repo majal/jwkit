@@ -19,7 +19,7 @@ class InstallPathTests(unittest.TestCase):
     def run_installer(self, home: Path) -> subprocess.CompletedProcess[str]:
         install_dir = home / ".jwkit"
         (install_dir / ".git").mkdir(parents=True)
-        for name in ("ffrife", "jwdl", "jwvideo-mux", "slverse"):
+        for name in ("ffinpaint", "ffrife", "jwdl", "jwvideo-mux", "slverse"):
             (install_dir / name).touch()
 
         fake_bin = home / "fake-bin"
