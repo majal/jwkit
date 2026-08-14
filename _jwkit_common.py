@@ -7,8 +7,10 @@ Currently just the on-run auto-update check. Not jw.org-specific and not
 tied to any one tool, so new shared cross-tool concerns belong here too.
 """
 import json
+import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -20,7 +22,47 @@ JWKIT_UPDATE_STATE_FILE = JWKIT_CONFIG_DIR / "update-state.json"
 DEFAULT_JWKIT_CONFIG = {
     "auto_update": True,
     "auto_update_interval_hours": 24,
+    "color_output": "auto",  # auto (color on a real terminal, off when piped/redirected or NO_COLOR is set), always, never
 }
+
+_COLOR_CODES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+
+
+class Colorizer:
+    """Shared across every jwkit tool - see resolve_color_enabled for how
+    `enabled` gets decided (config, --color/--no-color, NO_COLOR, TTY).
+    `c.green("text")` wraps in ANSI when enabled, returns `text` unchanged
+    otherwise, so call sites never need an if/else of their own."""
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def _wrap(self, code, text):
+        return f"\033[{code}m{text}\033[0m" if self.enabled else str(text)
+
+    def bold(self, text): return self._wrap(_COLOR_CODES["bold"], text)
+    def dim(self, text): return self._wrap(_COLOR_CODES["dim"], text)
+    def red(self, text): return self._wrap(_COLOR_CODES["red"], text)
+    def green(self, text): return self._wrap(_COLOR_CODES["green"], text)
+    def yellow(self, text): return self._wrap(_COLOR_CODES["yellow"], text)
+    def cyan(self, text): return self._wrap(_COLOR_CODES["cyan"], text)
+
+
+def resolve_color_enabled(jwkit_config, cli_override=None):
+    """cli_override (True/False from --color/--no-color) wins outright.
+    Otherwise jwkit_config's color_output: always/never are explicit;
+    "auto" (the default) follows NO_COLOR (https://no-color.org - any
+    non-empty value disables) and whether stdout is actually a terminal
+    (never emit escape codes into a pipe, a redirected file, or a log)."""
+    if cli_override is not None:
+        return cli_override
+    setting = str((jwkit_config or {}).get("color_output", "auto")).strip().lower()
+    if setting in ("always", "true", "yes", "1", "on"):
+        return True
+    if setting in ("never", "false", "no", "0", "off"):
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
 
 
 _ENCODER_LIST_CACHE = {}
@@ -88,6 +130,15 @@ def resolve_video_encoder(ffmpeg_bin, hw, codec):
         resolved = ("h264", "libx264", False)
     _RESOLVED_ENCODER_CACHE[cache_key] = resolved
     return resolved
+
+
+def format_eta(eta_seconds):
+    """'40s' rather than '0m 40s' - the minutes component only shows up
+    once there actually is one. Shared by slverse's and ffrife's
+    print_time_progress/print_count_progress (previously three copies of
+    the same f-string, all with the same '0m 40s' wart)."""
+    minutes, seconds = int(eta_seconds // 60), int(eta_seconds % 60)
+    return f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
 
 
 def nvenc_quality_from_crf(crf):
@@ -300,6 +351,8 @@ def load_jwkit_config():
             v = v.strip().strip('"').strip("'")
             if k == "auto_update":
                 config["auto_update"] = v.lower() in ("true", "1", "yes")
+            elif k == "color_output":
+                config["color_output"] = v
             elif k == "auto_update_interval_hours":
                 try:
                     config["auto_update_interval_hours"] = float(v)
@@ -315,6 +368,7 @@ def save_jwkit_config(config):
     with open(JWKIT_CONFIG_FILE, "w") as f:
         f.write(f"auto_update = {'true' if config.get('auto_update', True) else 'false'}\n")
         f.write(f"auto_update_interval_hours = {config.get('auto_update_interval_hours', 24)}\n")
+        f.write(f"color_output = {config.get('color_output', 'auto')}\n")
 
 
 def _read_last_checked():

@@ -51,6 +51,8 @@ For the interactive setup (which sign languages you watch, cache size, etc.), ru
 
 jwkit also updates itself automatically — once a day at most, and only when you actually run a command, so it never does anything in the background. `slverse setup` asks whether you want this on (it's on by default); turn it off any time by editing `auto_update = false` into `~/.config/jwkit/config.toml`. You can still update by hand with `jwkit-update` (installed alongside the tools), or by re-running the install command above — both are safe to repeat.
 
+Output is colored by default on a real terminal (auto-disabled when piped/redirected, or when `NO_COLOR` is set). Every tool takes `--color`/`--no-color` for one run, or set `color_output = always`/`never` in `~/.config/jwkit/config.toml` to change the default everywhere.
+
 To uninstall, run:
 
 ```bash
