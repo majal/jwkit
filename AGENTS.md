@@ -78,9 +78,11 @@ Run `python3 -m tests` before pushing changes that affect tools, tests, or READM
 
 ## Commit And Push Rules
 
-When an agent completes requested repo changes and is confident the work is ready, commit and push them unless the user explicitly asks not to.
+Commit is automatic (2026-08-14, operator-directed): once a change is good and verified, commit it right away so history captures every change and checkpoint. Don't ask first, and don't leave verified work sitting uncommitted "for later." Keep commits narrow — one logical change per commit, not batched unrelated edits.
 
-Do not push when there are unresolved errors or relevant verification has not passed. In those cases, leave a clear status note with the next step.
+Push is separate and intentionally batched, not automatic on every commit — see the auto-update note above (`jwdl-weekly.service`/`jwsl-sync-weekly.service` fast-forward from `origin/main` unattended, so a push reaches those hosts on their next scheduled run with nobody reviewing the diff first). Push when you've verified a batch of commits as a whole, when the user asks, or before ending a work session — not reflexively after each individual commit. Never push when there are unresolved errors or relevant verification has not passed. In those cases, leave a clear status note with the next step.
+
+Never force-push or rewrite history without the user's explicit go-ahead.
 
 ## Doc Template
 
