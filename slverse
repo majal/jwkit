@@ -1624,6 +1624,44 @@ def maybe_auto_sync(args, config):
     sync_languages(langs, config, state, quiet=True)
     save_state(state)
 
+def clamp_offset_window(natural_start, natural_end, offset_start, offset_end, lang="", min_duration=0.1):
+    """Apply --offset-start/--offset-end to (natural_start, natural_end) and
+    clamp the result to the verse's own natural window - a 12s verse only
+    has 12s to offset within (e.g. offset_start=3.567, offset_end=-1.997
+    asks for the 3.567s-10.003s slice, entirely inside those 12s: passes
+    through untouched). An offset that would push start before 0, past the
+    verse's own end, or end before its own start (individually or combined)
+    is a real overshoot - JW's markers don't tell us anything reliable
+    about what comes before/after this verse's own window, so rather than
+    silently referencing whatever happens to be there, this clamps back to
+    the natural window's own edges (or the whole natural window, if the
+    combination collapsed to nothing) and prints what happened."""
+    start = natural_start + (offset_start or 0.0)
+    end = natural_end + (offset_end or 0.0)
+    natural_duration = natural_end - natural_start
+
+    clamped = False
+    if start < 0.0:
+        start = 0.0
+        clamped = True
+    if start > natural_end - min_duration:
+        start = max(0.0, natural_end - min_duration)
+        clamped = True
+    if end > natural_end:
+        end = natural_end
+        clamped = True
+    if end < natural_start + min_duration:
+        end = natural_start + min_duration
+        clamped = True
+    if end - start < min_duration:
+        start, end = natural_start, natural_end
+        clamped = True
+
+    if clamped:
+        prefix = f"[{lang}] " if lang else ""
+        print(f"{prefix}--offset-start/--offset-end overshot this verse's own {natural_duration:.3f}s window - clamped to {start - natural_start:.3f}s..{end - natural_start:.3f}s (relative to its natural start).")
+    return start, end
+
 def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_transition=False, trim_mid_transitions=None, offset_start=0.0, offset_end=0.0):
     """Return (start, end, url, checksum, valid_verses, source_labels,
     kept_segments) for a verse range, using the saved per-language index
@@ -1647,8 +1685,8 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
     kept_segments), a manual nudge on top of the metadata-derived window
     rather than a raw -ss/-to into the whole file: +5.302 on offset_start
     plays from 5.302s into the verse through its natural end; a negative
-    offset_end ends that many seconds early. Clamped so start never goes
-    negative and end never crosses below start + 0.1s."""
+    offset_end ends that many seconds early. See clamp_offset_window for
+    what happens if they overshoot the verse's own natural boundaries."""
     key = f"{book_num}_{chapter}"
     index = load_index(lang)
     entry = index.get(key)
@@ -1686,12 +1724,8 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
         if end_transition > 0 and end - end_transition > start:
             end -= end_transition
 
-    if offset_start:
-        start = max(0.0, start + offset_start)
-    if offset_end:
-        end = end + offset_end
-    if end - start < 0.1:
-        end = start + 0.1
+    if offset_start or offset_end:
+        start, end = clamp_offset_window(start, end, offset_start, offset_end, lang=lang)
 
     trim_mid = str(config.get("trim_mid_transitions", DEFAULT_CONFIG["trim_mid_transitions"])).strip().lower() == "true"
     if trim_mid_transitions is not None:
