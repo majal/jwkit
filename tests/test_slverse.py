@@ -54,6 +54,37 @@ class SlverseTimeParsingTest(unittest.TestCase):
         self.assertAlmostEqual(times[1]["end_transition"], 0.0)
 
 
+class SlverseClampOffsetWindowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_in_bounds_offsets_pass_through_unclamped(self) -> None:
+        with mock.patch("builtins.print") as p:
+            result = self.slverse.clamp_offset_window(100.0, 112.0, 3.567, -1.997)
+        self.assertAlmostEqual(result[0], 103.567)
+        self.assertAlmostEqual(result[1], 110.003)
+        p.assert_not_called()
+
+    def test_start_overshoot_past_natural_end_clamps(self) -> None:
+        with mock.patch("builtins.print") as p:
+            result = self.slverse.clamp_offset_window(100.0, 112.0, 20.0, 0.0)
+        self.assertEqual(result, (100.0, 112.0))
+        p.assert_called_once()
+
+    def test_end_undershoot_before_natural_start_clamps(self) -> None:
+        result = self.slverse.clamp_offset_window(100.0, 112.0, 0.0, -20.0)
+        self.assertEqual(result, (100.0, 112.0))
+
+    def test_start_never_goes_negative(self) -> None:
+        result = self.slverse.clamp_offset_window(2.0, 14.0, -10.0, 0.0)
+        self.assertEqual(result[0], 0.0)
+
+    def test_combined_collapse_falls_back_to_natural_window(self) -> None:
+        result = self.slverse.clamp_offset_window(100.0, 112.0, 8.0, -8.0)
+        self.assertEqual(result, (100.0, 112.0))
+
+
 class SlverseResolveVerseWindowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
