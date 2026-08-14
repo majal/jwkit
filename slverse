@@ -1128,13 +1128,27 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
         with tempfile.TemporaryDirectory(prefix="slverse-inpaint-") as tmp_dir:
             inpainted = Path(tmp_dir) / "inpainted.mp4"
             if ffinpaint.inpaint(source, inpainted, box, ffinpaint.load_config(), start_time, end_time):
-                # E2FGVI's unmodified upstream runner emits MP4, so this is
-                # the final overlay encode.  RIFE composition remains safely
-                # on the blur path until an upstream PNG-output API exists.
+                # E2FGVI's unmodified upstream runner emits a video-only MP4
+                # (no audio track at all), so this is the final overlay
+                # encode - pull audio back in from the original source
+                # (trimmed to the same window) rather than dropping it.
+                # JW's own Sign Language sources normally carry no audio
+                # track (see has_audio_stream), so this is usually a no-op
+                # in practice, but staying correct here means a future
+                # audio-bearing source doesn't silently lose its audio only
+                # on the inpaint path while the blur path keeps it.
+                # RIFE composition remains safely on the blur path until an
+                # upstream PNG-output API exists.
+                audio = has_audio_stream(source)
                 cmd = ["-i", str(inpainted)]
+                if audio:
+                    cmd += ["-ss", str(start_time), "-to", str(end_time), "-i", str(source)]
                 text_overlay = without_delogo(overlay)
                 if text_overlay: cmd += ["-vf", text_overlay]
-                cmd += ["-c:a", "copy"] + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
+                cmd += ["-map", "0:v"]
+                if audio:
+                    cmd += ["-map", "1:a", "-c:a", "aac", "-b:a", "128k", "-shortest"]
+                cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]
                 run_ffmpeg(cmd, duration=duration)
                 return
         if str(config.get("delogo_inpaint_fallback", "blur")).lower() == "error":
