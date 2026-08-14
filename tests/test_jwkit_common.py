@@ -32,6 +32,58 @@ class JwkitCommonConfigTest(unittest.TestCase):
             config = self.common.load_jwkit_config()
         self.assertTrue(config["auto_update"])
 
+    def test_color_output_defaults_to_auto(self) -> None:
+        with mock.patch("pathlib.Path.exists", return_value=False):
+            config = self.common.load_jwkit_config()
+        self.assertEqual(config["color_output"], "auto")
+
+    def test_color_output_roundtrips(self) -> None:
+        text = "auto_update = true\ncolor_output = never\n"
+        with mock.patch("pathlib.Path.exists", return_value=True), \
+             mock.patch("pathlib.Path.read_text", return_value=text):
+            config = self.common.load_jwkit_config()
+        self.assertEqual(config["color_output"], "never")
+
+
+class JwkitCommonColorTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def test_colorizer_wraps_when_enabled(self) -> None:
+        c = self.common.Colorizer(True)
+        self.assertEqual(c.green("hi"), "\033[32mhi\033[0m")
+        self.assertEqual(c.red("bad"), "\033[31mbad\033[0m")
+
+    def test_colorizer_passthrough_when_disabled(self) -> None:
+        c = self.common.Colorizer(False)
+        self.assertEqual(c.green("hi"), "hi")
+        self.assertEqual(c.bold(42), "42")  # non-string input still returns a plain string
+
+    def test_cli_override_wins_over_everything(self) -> None:
+        with mock.patch.object(self.common.os, "environ", {"NO_COLOR": "1"}):
+            self.assertTrue(self.common.resolve_color_enabled({"color_output": "never"}, cli_override=True))
+            self.assertFalse(self.common.resolve_color_enabled({"color_output": "always"}, cli_override=False))
+
+    def test_explicit_config_setting_wins_over_auto_detection(self) -> None:
+        with mock.patch.object(self.common.sys.stdout, "isatty", return_value=False):
+            self.assertTrue(self.common.resolve_color_enabled({"color_output": "always"}))
+        with mock.patch.object(self.common.sys.stdout, "isatty", return_value=True):
+            self.assertFalse(self.common.resolve_color_enabled({"color_output": "never"}))
+
+    def test_auto_respects_no_color_env(self) -> None:
+        with mock.patch.object(self.common.os, "environ", {"NO_COLOR": "1"}), \
+             mock.patch.object(self.common.sys.stdout, "isatty", return_value=True):
+            self.assertFalse(self.common.resolve_color_enabled({"color_output": "auto"}))
+
+    def test_auto_follows_tty_detection(self) -> None:
+        with mock.patch.object(self.common.os, "environ", {}), \
+             mock.patch.object(self.common.sys.stdout, "isatty", return_value=True):
+            self.assertTrue(self.common.resolve_color_enabled({"color_output": "auto"}))
+        with mock.patch.object(self.common.os, "environ", {}), \
+             mock.patch.object(self.common.sys.stdout, "isatty", return_value=False):
+            self.assertFalse(self.common.resolve_color_enabled({"color_output": "auto"}))
+
 
 class JwkitCommonMaybeAutoUpdateTest(unittest.TestCase):
     @classmethod
@@ -83,6 +135,20 @@ class JwkitCommonMaybeAutoUpdateTest(unittest.TestCase):
              mock.patch.object(self.common, "_git_fast_forward_update") as git_update:
             self.common.maybe_auto_update("/fake/root")
         git_update.assert_not_called()
+
+
+class JwkitCommonFormatEtaTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def test_drops_zero_minutes(self) -> None:
+        self.assertEqual(self.common.format_eta(40), "40s")
+        self.assertEqual(self.common.format_eta(0), "0s")
+
+    def test_includes_minutes_once_nonzero(self) -> None:
+        self.assertEqual(self.common.format_eta(65), "1m 05s")
+        self.assertEqual(self.common.format_eta(125.7), "2m 05s")
 
 
 class JwkitCommonBenchmarkTest(unittest.TestCase):

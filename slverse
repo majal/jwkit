@@ -82,6 +82,12 @@ FFMPEG_BIN = "ffmpeg"
 FFPROBE_BIN = "ffprobe"
 FFPLAY_BIN = "ffplay"
 
+# Resolved once at startup by main() -> _jwkit_common.resolve_color_enabled.
+# Defaults off here (not "auto") so anything that runs before main() gets
+# to it (or a test that imports this module directly) never emits escape
+# codes unexpectedly.
+COLOR = _jwkit_common.Colorizer(False)
+
 # Overlay fonts, auto-downloaded into CONFIG_DIR/fonts/ on first use (see
 # resolve_font_paths/ensure_font) via the same Google Fonts CSS2 endpoint
 # browsers use (fonts.googleapis.com/css2?family=...&wght@N) - that always
@@ -515,8 +521,8 @@ def setup_dependencies(config):
     has_ffmpeg = command_exists(ffmpeg_bin) or os.path.exists(ffmpeg_bin)
 
     if has_ffmpeg and ffmpeg_has_filter(ffmpeg_bin, "drawtext"):
-        print(f"Found a drawtext-capable ffmpeg at: {ffmpeg_bin}")
-        print("(overlays will work — nothing to install)")
+        print(COLOR.green(f"Found a drawtext-capable ffmpeg at: {ffmpeg_bin}"))
+        print(COLOR.dim("(overlays will work — nothing to install)"))
     elif has_ffmpeg:
         print(f"Found ffmpeg at {ffmpeg_bin}, but it's missing the drawtext filter (no freetype/fontconfig).")
         print("Text overlays won't work until you install a build that has it.")
@@ -608,7 +614,7 @@ def list_all_sign_languages():
 
 def _progress_bar(frac, width=30):
     filled = int(width * max(0.0, min(1.0, frac)))
-    return "#" * filled + "-" * (width - filled)
+    return COLOR.green("#" * filled) + "-" * (width - filled)
 
 def print_progress(downloaded, total, width=30):
     """Minimal single-line progress bar, redrawn in place via \\r - used for
@@ -626,7 +632,7 @@ def print_time_progress(current_s, total_s, label="", width=30, eta_seconds=None
     bytes - for ffmpeg's own -progress pipe (see run_ffmpeg)."""
     frac = (current_s / total_s) if total_s else 0.0
     prefix = f"{label} " if label else ""
-    suffix = " ✓ Done" if done else (f", ETA {int(eta_seconds // 60)}m {int(eta_seconds % 60):02d}s" if eta_seconds is not None else "")
+    suffix = COLOR.green(" ✓ Done") if done else (COLOR.dim(f", ETA {_jwkit_common.format_eta(eta_seconds)}") if eta_seconds is not None else "")
     sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current_s:.1f}/{total_s:.1f}s{suffix})\033[K")
     sys.stdout.flush()
 
@@ -1019,7 +1025,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
 
     if use_mpv:
         if not command_exists("mpv"):
-            print("(--play needs mpv, which isn't installed - falling back to ffplay)")
+            print(COLOR.yellow("(--play needs mpv, which isn't installed - falling back to ffplay)"))
         else:
             print()
             print(f"Previewing: {source}")
@@ -1199,11 +1205,11 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
                 return
         if str(config.get("delogo_inpaint_fallback", "blur")).lower() == "error":
             raise RuntimeError("Inpainting was selected but ffinpaint is not configured; run 'ffinpaint setup'.")
-        print("(inpainting backend is not configured; using the normal delogo blur)")
+        print(COLOR.yellow("(inpainting backend is not configured; using the normal delogo blur)"))
 
     if engine == "rife":
         if len(segments) > 1:
-            print("(trim_mid_transitions doesn't support interpolation_engine=rife yet - mid-range transitions will play through untouched.)")
+            print(COLOR.yellow("(trim_mid_transitions doesn't support interpolation_engine=rife yet - mid-range transitions will play through untouched.)"))
         ffrife = load_ffrife()
         # RIFE always exactly doubles frame count - merging at a fixed 60fps
         # only preserves duration when the source is exactly 30fps. JW's own
@@ -1671,17 +1677,23 @@ def cmd_setup(args, config):
     ans = input(f"\nKeep jwkit up to date automatically (checked at most once a day when you run a jwkit command)? [{default_label}]: ").strip().lower()
     if ans:
         jwkit_config["auto_update"] = ans in ("y", "yes")
+
+    color_default = str(jwkit_config.get("color_output", "auto")).strip().lower()
+    color_label = "Y/n" if color_default != "never" else "y/N"
+    ans = input(f"Colored output (auto-off when piped/redirected, or with NO_COLOR set)? [{color_label}]: ").strip().lower()
+    if ans:
+        jwkit_config["color_output"] = "always" if ans in ("y", "yes") else "never"
     _jwkit_common.save_jwkit_config(jwkit_config)
 
     save_config(config)
-    print("\nAll set. Run 'slverse config' anytime to see or change these settings.")
+    print(COLOR.bold("\nAll set.") + " Run 'slverse config' anytime to see or change these settings.")
     print("If you use slverse on more than one computer, run 'slverse setup' on each one — settings are per-machine.")
 
 def cmd_config(args, config):
     if args.key and args.value:
         config[args.key] = args.value
         save_config(config)
-        print(f"Set {args.key} = {args.value}")
+        print(COLOR.green(f"Set {args.key} = {args.value}"))
     elif args.key:
         print(f"{args.key} = {config.get(args.key)}")
         help_text = CONFIG_HELP.get(args.key)
@@ -1747,7 +1759,7 @@ def cmd_benchmark(args, config):
     if not best:
         print("\nNo encoder on this machine actually worked - keeping current settings.")
         return None
-    print(f"\nRecommended: hardware_encoder={best['hw']}, video_codec={best['codec']} (smallest file at SSIM >= 0.98, or highest SSIM available if none cleared that)")
+    print(f"\n{COLOR.bold(COLOR.green('Recommended:'))} hardware_encoder={best['hw']}, video_codec={best['codec']} (smallest file at SSIM >= 0.98, or highest SSIM available if none cleared that)")
     if getattr(args, "apply", False):
         config["hardware_encoder"] = best["hw"]
         config["video_codec"] = best["codec"]
@@ -2214,7 +2226,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         if command_exists("mpv"):
             launch_mpv([out_filename], config=config)
         else:
-            print(f"[{lang}] (--play needs mpv, which isn't installed)")
+            print(COLOR.yellow(f"[{lang}] (--play needs mpv, which isn't installed)"))
 
     return lang, out_filename, None
 
@@ -2274,9 +2286,9 @@ def cmd_extract(args, config):
     print()
     for lang, filename, error in results:
         if error:
-            print(f"[{lang}] {error}")
+            print(COLOR.red(f"[{lang}] {error}"))
         elif filename:
-            print(f"[{lang}] Successfully created: {filename}")
+            print(f"[{lang}] {COLOR.green('Successfully created:')} {filename}")
         else:
             print(f"[{lang}] Preview finished.")
 
@@ -2360,7 +2372,7 @@ def cmd_find(args, config):
 
     if args.play:
         if not command_exists("mpv"):
-            print("(--play needs mpv, which isn't installed)")
+            print(COLOR.yellow("(--play needs mpv, which isn't installed)"))
         else:
             to_play = [r for r in results if r["found"]]
             multi = len(to_play) > 1
@@ -2518,6 +2530,9 @@ def main():
         description="slverse - JW Sign Language Video Tool",
         epilog="Nearly all behavior is configurable - see 'slverse config list' or docs/slverse.md.",
     )
+    color_group = parser.add_mutually_exclusive_group()
+    color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colored output for this run (overrides the shared color_output config and auto-detection)")
+    color_group.add_argument("--no-color", dest="color", action="store_false", help="Disable colored output for this run")
     subparsers = parser.add_subparsers(dest="command")
 
     p_setup = subparsers.add_parser("setup", help="Interactive first-run setup (dependencies, languages, cache, 60fps, PATH)")
@@ -2605,7 +2620,8 @@ def main():
     # apply.
     apply_generic_config_overrides(args, config)
 
-    global FFMPEG_BIN, FFPROBE_BIN, FFPLAY_BIN, FONT_MAIN_WEIGHT, FONT_ESTIMATOR_WEIGHT, MAX_ATTEMPTS, RETRY_BACKOFF
+    global FFMPEG_BIN, FFPROBE_BIN, FFPLAY_BIN, FONT_MAIN_WEIGHT, FONT_ESTIMATOR_WEIGHT, MAX_ATTEMPTS, RETRY_BACKOFF, COLOR
+    COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color))
     FFMPEG_BIN = resolve_ffmpeg_binary(config)
     FFPROBE_BIN = resolve_ffprobe_binary(config)
     FFPLAY_BIN = resolve_ffplay_binary(config)
