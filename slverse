@@ -2,6 +2,11 @@
 """
 slverse - JW Sign Language Video Tool
 Downloads, syncs, extracts, overlays, and interpolates JW SL videos.
+
+Nearly every behavior (cache/encode settings, overlay layout, delogo sizing,
+which languages get the verse-reference swapped, mpv playback niceties, ...)
+is a config key, not a hardcoded default meant for one setup - run
+'slverse config list' for the full documented set, or see docs/slverse.md.
 """
 import argparse
 import concurrent.futures
@@ -55,6 +60,7 @@ def migrate_legacy_config_dir():
             print(f"Moved your existing settings from {legacy_dir} to {CONFIG_DIR}.")
             return
 
+# Resolved once at startup by main() from download_max_attempts/download_retry_backoff config.
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF = 2
 
@@ -95,6 +101,7 @@ FONT_FAMILIES = {
     "inter": "Inter",
     "google-sans-flex": "Google Sans Flex",
 }
+# Resolved once at startup by main() from font_weight_main/font_weight_estimator config.
 FONT_MAIN_WEIGHT = "600"      # SemiBold - old ffv's main drawtext weight
 FONT_ESTIMATOR_WEIGHT = "400"  # Regular - old ffv's delogo-sizing estimator weight
 
@@ -133,6 +140,62 @@ DEFAULT_CONFIG = {
     "delogo_width_pad": "10",   # extra px beyond the auto-measured text width, in case the source's own caption runs a bit longer
     "delogo_height_pad": "10",
     "default_target_lang": "FSL",  # requesting this SL skips delogo/drawtext entirely - its own burned-in caption is already correct
+    "trim_end_transition": "true",  # exclude JW's own trailing fade-out/copyright-endscreen transition (endTransitionDuration in the verse marker metadata - confirmed empirically to cover exactly the fade-to-black + JW.org copyright card after a chapter's/paragraph's last verse) from the very end of the extracted window - the right default for a cut that ends there. false (or --keep-end-transition for one run) restores the old behavior of extracting through the full marker duration, transition included. Only ever touches the LAST selected verse - see trim_mid_transitions for transitions in the middle of a multi-verse range.
+    "trim_mid_transitions": "false",  # a verse range spanning multiple paragraphs plays through any mid-range paragraph transition untouched by default (it's one continuous scene, not something to cut) - set true (or --trim-mid-transitions for one run) to also cut those out, jump-cutting straight from one paragraph's last kept frame to the next paragraph's first. Never touches the range's own trailing transition - that's trim_end_transition's job. Not supported together with interpolation_engine=rife or --slow/--fast in this pass; both silently keep mid-range transitions in that combination.
+    "sign_lang_ref_language": "ASL=en,FSL=en,BVL=es,SPE=es,INI=id",  # spoken/verse-reference language each sign language's burned-in caption is actually written in, e.g. "KEY=VAL,KEY2=VAL2" - NOT derivable from the ISO sign-language code in jwlangs.json (e.g. ASL's is "ase"), so this is a small editable table instead. When source and target share a reference language (e.g. ASL->FSL, both en), delogo/drawtext for the verse reference itself is skipped - only show_source_lang_label's small label still applies. Add an entry for any other language you use; an unlisted language is treated as never matching (falls back to the full overlay).
+    "show_source_lang_label": "true",  # the small "which SL this clip came from" label under the verse reference - independent of overlay_source_label_alpha, which only controls its opacity when shown
+    "mpv_show_osc": "true",  # mpv's on-screen controller/overlay that pops up on mouse movement, for every mpv window slverse opens (--play, find --play) - slverse always passes --no-config to mpv for reproducibility, so a personal mpv.conf that disables this doesn't apply here; set false to match a "nothing shows on hover" setup. Per-user preference, not something to default off for everyone.
+    "font_weight_main": "600",  # Google Fonts weight for the main drawtext label (book/chapter/verse) - see FONT_FAMILIES
+    "font_weight_estimator": "400",  # Google Fonts weight used only to size the delogo box, not to draw anything
+    "download_max_attempts": "3",  # retry attempts for a chapter/font download before giving up
+    "download_retry_backoff": "2",  # seconds, doubled (backoff ** attempt) between download retries
+}
+
+# One-line description per DEFAULT_CONFIG key, shown by 'slverse config
+# list'/'slverse config get <key>' so the full config surface is
+# discoverable without opening this file - see docs/slverse.md for the
+# longer version of each.
+CONFIG_HELP = {
+    "cache_dir": "Where cached full-chapter downloads live",
+    "cache_policy": "keep_all, lru, delete_after_use - what happens to a cached chapter after use",
+    "cache_max_gb": "Cache size cap in GB - oldest-used chapters evicted first once hit (cache_policy=lru)",
+    "extract_mode": "onthefly (stream, no disk use) or cache (download chapter, reuse for later verses)",
+    "hardware_encoder": "cpu, nvenc, videotoolbox, or qsv",
+    "video_codec": "h264, hevc, or av1",
+    "video_crf": "Encode quality (lower = higher quality/larger file)",
+    "video_preset": "ffmpeg encoder preset (e.g. slow, medium, fast)",
+    "interpolation_engine": "none, minterpolate, framerate, or rife (delegates to the sibling ffrife tool)",
+    "languages": "Default language list for 'all' and for 'sync'/'langs'",
+    "sync_workers": "Parallel workers for 'sync all'",
+    "extract_workers": "Parallel workers for 'extract all'/'bulk'",
+    "auto_sync": "Once-a-day automatic metadata refresh on extract/find/bulk",
+    "auto_sync_interval_hours": "Hours between automatic refreshes",
+    "auto_sync_background": "Run the automatic refresh as a detached background process instead of blocking",
+    "preview_source": "cache (download once, reuse) or remote (always stream) for preview (extract without --write)",
+    "preview_window_size": "mpv --autofit percentage for 'find --play' multi-language preview windows",
+    "font_path": "Manual font file override (skips font_family)",
+    "font_family": "noto-sans-display, inter, or google-sans-flex",
+    "font_weight_main": "Google Fonts weight for the drawn verse-reference label",
+    "font_weight_estimator": "Google Fonts weight used only to size the delogo box",
+    "api_language": "Language code for book names (e.g. E for English)",
+    "ffmpeg_binary": "Override ffmpeg binary auto-detection",
+    "ffprobe_binary": "Override ffprobe binary auto-detection",
+    "ffplay_binary": "Override ffplay binary auto-detection (used for preview)",
+    "overlay_x": "Verse-reference overlay X position (px)",
+    "overlay_y": "Verse-reference overlay Y position (px)",
+    "overlay_fontsize": "Verse-reference overlay font size",
+    "overlay_alpha": "Verse-reference overlay opacity (0-1)",
+    "overlay_source_label_alpha": "Source-SL label opacity (0-1), when show_source_lang_label is true",
+    "delogo_width_pad": "Extra px of delogo box width beyond the auto-measured source caption",
+    "delogo_height_pad": "Extra px of delogo box height beyond the auto-measured source caption",
+    "default_target_lang": "Requesting this SL skips the overlay entirely - its own caption is already correct",
+    "trim_end_transition": "Exclude JW's trailing fade-out/copyright-endscreen transition from extracted verses",
+    "trim_mid_transitions": "Also cut mid-range paragraph transitions inside a multi-verse range (off by default - continuous play)",
+    "sign_lang_ref_language": "SL-code=spoken-language table (e.g. ASL=en,BVL=es) - skips the reference swap when source/target already share one",
+    "show_source_lang_label": "Show the small 'which SL this came from' label",
+    "mpv_show_osc": "Show mpv's on-screen controller on mouse movement, for mpv windows slverse opens",
+    "download_max_attempts": "Retry attempts for a chapter/font download",
+    "download_retry_backoff": "Seconds (doubled per attempt) between download retries",
 }
 
 # --- Config Management ---
@@ -225,6 +288,22 @@ def lang_display(code, jwlangs=None):
     entry = jwlangs.get(code.upper())
     return f"{code.upper()} ({entry[1]})" if entry else code.upper()
 
+def parse_kv_config(value):
+    """'KEY=VAL,KEY2=VAL2' -> {KEY: val, KEY2: val2} (keys upper-cased,
+    values lower-cased) - the small-table shape used by config values like
+    sign_lang_ref_language. Blank/malformed pairs are skipped rather than
+    raising, since this reads straight from a hand-edited config file."""
+    result = {}
+    for pair in (value or "").split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        k = k.strip().upper()
+        if k:
+            result[k] = v.strip().lower()
+    return result
+
 def get_lang_list(config, lang_arg=None):
     """Resolve a language argument to a list of codes.
     'all' or None uses the configured language list; a comma list is split;
@@ -257,7 +336,7 @@ def focus_process(pid):
         if result.returncode == 0:
             return
 
-def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, geometry=None, autofit=None):
+def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, geometry=None, autofit=None, config=None):
     """Spawn mpv with `args` and try to bring it to the front on every OS.
     --force-window=immediate plus mpv's own --focus-on=open default (mpv
     0.34+) cover Linux/Windows window managers reasonably well; see
@@ -273,10 +352,18 @@ def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, g
     autofit is an mpv --autofit value (e.g. "65%") - a percentage of the
     screen, aspect-ratio preserved, so we don't need to know the actual
     screen resolution ourselves; geometry positions the window and is
-    offset-only here (e.g. "+40+40"), leaving sizing to autofit."""
+    offset-only here (e.g. "+40+40"), leaving sizing to autofit.
+
+    --no-config above means a personal mpv.conf (e.g. one that already
+    disables the mouse-hover on-screen controller) never applies to windows
+    slverse opens - pass `config` so the mpv_show_osc setting (default true,
+    matching stock mpv) can add --osc=no back in per-user, without changing
+    the default for anyone who hasn't set it."""
     cmd = ["mpv", "--no-config", "--force-window=immediate"]
     cmd.append("--fullscreen=yes" if fullscreen else "--fullscreen=no")
     cmd.append("--keep-open=yes" if keep_open else "--no-keep-open")
+    if config is not None and str(config.get("mpv_show_osc", DEFAULT_CONFIG["mpv_show_osc"])).strip().lower() == "false":
+        cmd.append("--osc=no")
     if paused:
         cmd.append("--pause")
     if autofit:
@@ -772,7 +859,7 @@ def measure_text_size(text, font_path, fontsize):
             pass
     return round(len(text) * fontsize * 0.55), round(fontsize * 1.3)
 
-def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box):
+def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box, source_labels=None):
     """delogo (blur out the source video's own burned-in reference caption)
     + drawtext (the correct reference, in the caption position old ffv
     used) + a small label of which sign language this clip came from -
@@ -782,12 +869,42 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     `if [ "${ll}" = "${lang_tr}" ]` early-out - skip delogo/drawtext
     entirely rather than draw a second caption on top of the first).
 
+    Beyond that exact-language match, sign_lang_ref_language may also mark
+    `lang` and default_target_lang as sharing the same spoken/reference
+    language (e.g. ASL and FSL are different sign languages but both caption
+    in English) - in that case the verse reference itself is already
+    correct too, so delogo/drawtext for it are skipped the same way, while
+    show_source_lang_label's small "which SL" label (independent of that
+    skip) can still be drawn on its own.
+
     `show_box` draws the delogo rectangle as a visible outline instead of
     actually blurring it (ffmpeg delogo's own show=1 debug mode) - used for
     preview so you can see where the box lands before writing anything.
+
+    source_labels are the source video's own per-verse caption text(s),
+    straight from JW's marker metadata (e.g. "Mazmur 16:11" for INI) - used
+    to size the delogo box against what ACTUALLY renders in this source,
+    instead of the replacement text being drawn over it. Sizing off the
+    replacement label was the old bug: a source caption in a language whose
+    words simply run wider (INI's "Mazmur" vs "Psalm") left a sliver of the
+    original still showing. Falls back to the replacement label if markers
+    didn't carry one. A multi-verse window can show more than one distinct
+    source caption in sequence (each verse advances its own marker's
+    label), so every distinct one is measured and the box sized to the
+    widest/tallest.
     """
     target_lang = (config.get("default_target_lang") or "").strip().upper()
-    if target_lang and lang.upper() == target_lang:
+    lang_u = lang.upper()
+    if target_lang and lang_u == target_lang:
+        return None
+
+    ref_lang_map = parse_kv_config(config.get("sign_lang_ref_language", DEFAULT_CONFIG["sign_lang_ref_language"]))
+    source_ref = ref_lang_map.get(lang_u)
+    target_ref = ref_lang_map.get(target_lang) if target_lang else None
+    skip_reference = bool(source_ref) and source_ref == target_ref
+
+    show_label = str(config.get("show_source_lang_label", DEFAULT_CONFIG["show_source_lang_label"])).strip().lower() != "false"
+    if skip_reference and not show_label:
         return None
 
     main_font, estimator_font = resolve_font_paths(config)
@@ -800,22 +917,37 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     height_pad = int(config.get("delogo_height_pad", DEFAULT_CONFIG["delogo_height_pad"]))
 
     label_text = f"{book_name} {chapter}:{verse_label}"
-    # The estimator font approximates the source video's own burned-in
-    # caption closely enough to auto-size the delogo box without per-verse
-    # manual pixel offsets.
-    w, h = measure_text_size(label_text, estimator_font, fontsize)
 
     def esc(text):
         return text.replace(":", "\\:").replace("'", "\\'")
 
     font_arg = f":fontfile='{main_font}'" if main_font else ""
-    show = 1 if show_box else 0
-    delogo = f"delogo=x={x - 5}:y={y - 5}:w={w + 10 + width_pad}:h={h + 5 + height_pad}:show={show}"
-    drawtext = f"drawtext=text='{esc(label_text)}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y}:alpha={alpha}"
-    drawtext_ll = f"drawtext=text='{lang.upper()}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y + h - 5}:alpha={label_alpha}"
-    return f"{delogo},{drawtext},{drawtext_ll}"
+    filters = []
 
-def preview_verse(source, start_time, end_time, book_name, chapter, verse_label, lang, config, use_mpv=False, source_url=None):
+    # Measured whether or not the reference itself gets replaced: even when
+    # skip_reference leaves the source's own caption untouched, the small
+    # source-SL label still needs to sit BELOW it rather than on top of it
+    # (drawing at the bare overlay_y position would overlap the still-visible
+    # original caption one-for-one).
+    measure_candidates = list(dict.fromkeys(source_labels or [])) or [label_text]
+    w = h = 0
+    for candidate in measure_candidates:
+        cw, ch = measure_text_size(candidate, estimator_font, fontsize)
+        w, h = max(w, cw), max(h, ch)
+
+    if not skip_reference:
+        show = 1 if show_box else 0
+        delogo = f"delogo=x={x - 5}:y={y - 5}:w={w + 10 + width_pad}:h={h + 5 + height_pad}:show={show}"
+        drawtext = f"drawtext=text='{esc(label_text)}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y}:alpha={alpha}"
+        filters += [delogo, drawtext]
+
+    if show_label:
+        drawtext_ll = f"drawtext=text='{lang_u}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y + h - 5}:alpha={label_alpha}"
+        filters.append(drawtext_ll)
+
+    return ",".join(filters) if filters else None
+
+def preview_verse(source, start_time, end_time, book_name, chapter, verse_label, lang, config, use_mpv=False, source_url=None, source_labels=None):
     """Default 'slverse extract' behavior (no --write): play the verse with
     its overlay applied live - including a visible box where delogo would
     remove the source caption - without writing anything to disk. Mirrors
@@ -823,7 +955,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
     (fastest - no encode at all), while mpv can't take -vf on a remote/
     local source directly, so --play/-m instead makes a quick ultrafast
     temp clip first, the same tradeoff the old script made."""
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True, source_labels=source_labels)
     duration = end_time - start_time
 
     from_cache = source_url is not None and str(source) != str(source_url)
@@ -843,7 +975,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
                     cmd += ["-vf", overlay]
                 cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "copy", "-f", "matroska", str(tmp_out)]
                 run_ffmpeg(cmd, duration=duration)
-                launch_mpv([str(tmp_out)])
+                launch_mpv([str(tmp_out)], config=config)
             return
 
     ffplay_args = ["-ss", str(start_time), "-t", str(duration), "-i", str(source)]
@@ -858,19 +990,34 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
         print(f"Source: {source_url}")
     launch_ffplay(ffplay_args)
 
-def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False):
+def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False, source_labels=None, kept_segments=None):
     """Single-pass: trim + overlay + (for framerate/minterpolate) the fps
     filter all happen in ONE ffmpeg encode, straight from `source`. Used to
     be two full lossy re-encode generations (extract-with-overlay, then a
     second pass just to add the fps filter) - now it's one, for every
     engine except rife, which has an unavoidable one-lossy-generation
     minimum of its own (see ffrife.interpolate: PNG extraction and RIFE
-    itself are lossless, only the final merge encodes)."""
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False)
+    itself are lossless, only the final merge encodes).
+
+    kept_segments (from resolve_verse_window/resolve_kept_segments) is
+    normally just [(0, duration)] - the plain single -vf path below. More
+    than one segment means trim_mid_transitions cut something out of the
+    middle of the window, which needs filter_complex trim+concat instead of
+    a plain -vf - and, if the source has an audio stream, re-encoded audio
+    too, since concatenating cut segments means there's no longer one
+    continuous stream to -c:a copy straight through (JW's own Sign Language
+    source videos normally carry no audio stream at all - see
+    has_audio_stream - so this is usually moot in practice). Not combined
+    with the rife engine here - ffrife owns its own PNG extraction and
+    doesn't know about kept_segments."""
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels)
     engine = config.get("interpolation_engine", "none")
     duration = end_time - start_time
+    segments = kept_segments or [(0.0, duration)]
 
     if engine == "rife":
+        if len(segments) > 1:
+            print("(trim_mid_transitions doesn't support interpolation_engine=rife yet - mid-range transitions will play through untouched.)")
         ffrife = load_ffrife()
         ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=overlay, fps=60)
         return
@@ -889,9 +1036,22 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     # CDN is only asked for bytes from roughly that point on, which is what
     # keeps onthefly mode from pulling the whole chapter over the network.
     cmd = ["-ss", str(start_time), "-to", str(end_time), "-i", str(source)]
-    if vf_chain:
-        cmd += ["-vf", ",".join(vf_chain)]
-    cmd += ["-c:a", "copy"] + build_encode_args(config) + [str(output_file)]
+    if len(segments) > 1:
+        audio = has_audio_stream(source)
+        fc = build_trim_concat_filter_complex(segments, audio=audio)
+        if vf_chain:
+            fc += f";[vout]{','.join(vf_chain)}[final]"
+            out_label = "[final]"
+        else:
+            out_label = "[vout]"
+        cmd += ["-filter_complex", fc, "-map", out_label]
+        if audio:
+            cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]
+        cmd += build_encode_args(config) + [str(output_file)]
+    else:
+        if vf_chain:
+            cmd += ["-vf", ",".join(vf_chain)]
+        cmd += ["-c:a", "copy"] + build_encode_args(config) + [str(output_file)]
     run_ffmpeg(cmd, duration=duration)
 
 def parse_speed(value):
@@ -919,6 +1079,80 @@ def probe_source_fps(source):
     cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(source)]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return float(Fraction(result.stdout.strip()))
+
+def has_audio_stream(source):
+    """JW's own Sign Language source videos carry no audio track at all
+    (confirmed via ffprobe: video + a data stream + a thumbnail PNG stream,
+    no 'a' stream) - a filter_complex that references [0:a] unconditionally
+    (e.g. atrim) fails outright ("Error binding filtergraph inputs/outputs")
+    against one of these, rather than just producing silence. Checked before
+    building trim_mid_transitions' filter_complex so it can branch to a
+    video-only concat instead - see build_trim_concat_filter_complex."""
+    cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", str(source)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=20)
+    except Exception:
+        return False
+    return bool(result.stdout.strip())
+
+def resolve_kept_segments(chapters_meta, valid_verses, start, end, trim_mid):
+    """[(seg_start, seg_end), ...] in seconds relative to the window's own
+    start (0) - everything to actually keep. [(0, end-start)] (the whole
+    window, one segment) unless trim_mid is true AND a verse other than the
+    last selected one has its own nonzero end_transition (a paragraph
+    boundary in the middle of the range, not the range's own trailing one -
+    see trim_end_transition for that). Only verses before the last are
+    considered: the last verse's own transition is trim_end_transition's
+    call, made separately by the caller before `end` ever reaches here."""
+    duration = end - start
+    if not trim_mid or len(valid_verses) < 2:
+        return [(0.0, duration)]
+
+    drops = []
+    for v in valid_verses[:-1]:
+        et = chapters_meta[v].get("end_transition", 0)
+        if et > 0:
+            drop_end = chapters_meta[v]["end"] - start
+            drop_start = drop_end - et
+            if 0 < drop_start < drop_end <= duration:
+                drops.append((drop_start, drop_end))
+
+    if not drops:
+        return [(0.0, duration)]
+
+    segments = []
+    cursor = 0.0
+    for drop_start, drop_end in drops:
+        if drop_start > cursor:
+            segments.append((cursor, drop_start))
+        cursor = drop_end
+    if cursor < duration:
+        segments.append((cursor, duration))
+    return segments
+
+def build_trim_concat_filter_complex(segments, base_label="[0:v]", audio=False):
+    """trim each (seg_start, seg_end) out of `base_label` and concat them
+    back-to-back into [vout] (and [aout] too, when `audio` is true) - the
+    jump-cut side of trim_mid_transitions. Straight trims with no retiming
+    (unlike build_sectioned_filter_complex's alternating slow/fast
+    sections), so audio concatenates cleanly alongside video when there is
+    any - JW's own Sign Language source videos normally carry none at all
+    (see has_audio_stream), so callers should probe first and pass
+    audio=False for those rather than reference a nonexistent [0:a]."""
+    fc = ""
+    v_labels, a_labels = [], []
+    for i, (s, e) in enumerate(segments, start=1):
+        fc += f"{base_label}trim={s}:{e},setpts=PTS-STARTPTS[v{i}];"
+        v_labels.append(f"[v{i}]")
+        if audio:
+            fc += f"[0:a]atrim={s}:{e},asetpts=PTS-STARTPTS[a{i}];"
+            a_labels.append(f"[a{i}]")
+    if audio:
+        pairs = "".join(v + a for v, a in zip(v_labels, a_labels))
+        fc += f"{pairs}concat=n={len(segments)}:v=1:a=1[vout][aout]"
+    else:
+        fc += "".join(v_labels) + f"concat=n={len(segments)}:v=1[vout]"
+    return fc
 
 def build_sectioned_filter_complex(boundaries, speed, mode, base_label):
     """Builds a filter_complex that trims [0:v] (or `base_label`, if an
@@ -948,7 +1182,7 @@ def build_sectioned_filter_complex(boundaries, speed, mode, base_label):
     fc += "".join(f"[{l}]" for l in labels) + f"concat=n={n}:v=1:a=0[out]"
     return fc, "[out]"
 
-def extract_verse_sections(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, mode, boundaries, speed):
+def extract_verse_sections(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, mode, boundaries, speed, source_labels=None):
     """--slow/--fast: split the verse window at `boundaries` (seconds,
     relative to the verse's own start) into alternating normal/retimed
     sections at `speed` - ported from the standalone ffslow/fffast tools'
@@ -958,7 +1192,7 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
     setpts to only half the timeline, leaves no single consistent audio
     track to carry through) - the single-window extract_verse path above
     still keeps audio."""
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels)
     engine = config.get("interpolation_engine", "none")
     duration = end_time - start_time
 
@@ -1076,14 +1310,25 @@ def markers_to_verse_times(markers):
     """Verse-level timestamps come straight from JW's own API metadata
     (GETPUBMEDIALINKS ... &booknum=N already returns per-verse markers), so
     there's no need to download the video and ffprobe its embedded chapters
-    just to find out where a verse starts."""
+    just to find out where a verse starts.
+
+    end_transition (JW's own endTransitionDuration) is 0 for every verse
+    mid-paragraph and nonzero on a paragraph's/chapter's last verse -
+    confirmed against a real clip (Psalm 16:11 ASL: duration 33.800s,
+    endTransitionDuration 6.940s) by extracting frames across that trailing
+    window: the signer holds their final pose through
+    start+duration-end_transition, then fades to black and cuts to the
+    JW.org copyright card by start+duration - i.e. this one field covers
+    exactly the "post-paragraph fadeout + copyright endscreen" tail (see
+    resolve_verse_window)."""
     result = {}
     for m in markers or []:
         try:
             v = int(m["verseNumber"])
             start = parse_hms(m["startTime"])
             dur = parse_hms(m["duration"])
-            result[v] = {"start": start, "end": start + dur, "label": m.get("label", "")}
+            end_transition = parse_hms(m.get("endTransitionDuration") or "0")
+            result[v] = {"start": start, "end": start + dur, "label": m.get("label", ""), "end_transition": end_transition}
         except (KeyError, ValueError, TypeError):
             continue
     return result
@@ -1237,9 +1482,17 @@ def cmd_config(args, config):
         print(f"Set {args.key} = {args.value}")
     elif args.key:
         print(f"{args.key} = {config.get(args.key)}")
+        help_text = CONFIG_HELP.get(args.key)
+        if help_text:
+            print(f"  {help_text}")
     else:
+        # CONFIG_HELP covers every DEFAULT_CONFIG key, so this doubles as
+        # the full documented config surface - see also docs/slverse.md.
+        width = max((len(k) for k in config), default=0)
         for k, v in config.items():
-            print(f"{k} = {v}")
+            help_text = CONFIG_HELP.get(k, "")
+            suffix = f"  # {help_text}" if help_text else ""
+            print(f"{k:<{width}} = {v}{suffix}")
 
 def cmd_langs(args, config):
     jwlangs = load_jwlangs()
@@ -1371,10 +1624,31 @@ def maybe_auto_sync(args, config):
     sync_languages(langs, config, state, quiet=True)
     save_state(state)
 
-def resolve_verse_window(lang, book_num, chapter, verses, config):
-    """Return (start, end, url, checksum, label) for a verse range, using the
-    saved per-language index when we have it and falling back to a live API
-    call (which also backfills the index) when we don't."""
+def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_transition=False, trim_mid_transitions=None, offset_start=0.0, offset_end=0.0):
+    """Return (start, end, url, checksum, valid_verses, source_labels,
+    kept_segments) for a verse range, using the saved per-language index
+    when we have it and falling back to a live API call (which also
+    backfills the index) when we don't. source_labels are the source
+    video's own per-verse caption text straight from JW's marker metadata
+    (e.g. "Mazmur 16:11" for INI) - used by build_overlay_filter to size the
+    delogo box against what's actually burned in, not our replacement text.
+    kept_segments is resolve_kept_segments' output - always [(0, end-start)]
+    unless trim_mid_transitions ends up true.
+
+    keep_end_transition (from --keep-end-transition) forces the trailing
+    fade-out/endscreen to stay even if trim_end_transition's config default
+    is true. trim_mid_transitions (from --trim-mid-transitions), when not
+    None, overrides that config key's default for this call instead of
+    reading it.
+
+    offset_start/offset_end (from --offset-start/--offset-end, seconds,
+    either sign) are the old ffv -s/-e - added straight onto the verse
+    range's own computed start/end (after trim_end_transition, before
+    kept_segments), a manual nudge on top of the metadata-derived window
+    rather than a raw -ss/-to into the whole file: +5.302 on offset_start
+    plays from 5.302s into the verse through its natural end; a negative
+    offset_end ends that many seconds early. Clamped so start never goes
+    negative and end never crosses below start + 0.1s."""
     key = f"{book_num}_{chapter}"
     index = load_index(lang)
     entry = index.get(key)
@@ -1404,7 +1678,28 @@ def resolve_verse_window(lang, book_num, chapter, verses, config):
 
     start = chapters_meta[valid_verses[0]]["start"]
     end = chapters_meta[valid_verses[-1]]["end"]
-    return start, end, entry["url"], entry.get("checksum"), valid_verses
+    trim_end = str(config.get("trim_end_transition", DEFAULT_CONFIG["trim_end_transition"])).strip().lower() != "false"
+    if keep_end_transition:
+        trim_end = False
+    if trim_end:
+        end_transition = chapters_meta[valid_verses[-1]].get("end_transition", 0)
+        if end_transition > 0 and end - end_transition > start:
+            end -= end_transition
+
+    if offset_start:
+        start = max(0.0, start + offset_start)
+    if offset_end:
+        end = end + offset_end
+    if end - start < 0.1:
+        end = start + 0.1
+
+    trim_mid = str(config.get("trim_mid_transitions", DEFAULT_CONFIG["trim_mid_transitions"])).strip().lower() == "true"
+    if trim_mid_transitions is not None:
+        trim_mid = trim_mid_transitions
+    kept_segments = resolve_kept_segments(chapters_meta, valid_verses, start, end, trim_mid)
+
+    source_labels = [chapters_meta[v]["label"] for v in valid_verses if chapters_meta[v].get("label")]
+    return start, end, entry["url"], entry.get("checksum"), valid_verses, source_labels, kept_segments
 
 def resolve_retime_args(args, duration):
     """Turn --slow/--fast's raw TIME strings into (mode, boundaries,
@@ -1430,10 +1725,16 @@ def resolve_retime_args(args, duration):
     return mode, boundaries, speed, None
 
 def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state):
-    window = resolve_verse_window(lang, book_num, chapter, verses, config)
+    window = resolve_verse_window(
+        lang, book_num, chapter, verses, config,
+        keep_end_transition=getattr(args, "keep_end_transition", False),
+        trim_mid_transitions=True if getattr(args, "trim_mid_transitions", False) else None,
+        offset_start=getattr(args, "offset_start", None) or 0.0,
+        offset_end=getattr(args, "offset_end", None) or 0.0,
+    )
     if not window:
         return lang, None, f"Verses {verses} not found for {lang} (video may not exist for this chapter in this language yet)."
-    start_time, end_time, url, checksum, valid_verses = window
+    start_time, end_time, url, checksum, valid_verses, source_labels, kept_segments = window
     verses_str = format_verses_label(valid_verses)
     out_filename = f"{book_name.replace(' ', '_')}_{chapter}_{'_'.join(map(str, valid_verses))}_{lang}.mp4"
 
@@ -1461,7 +1762,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
                     source = str(cached)
                 # else: download failed (offline, CDN hiccup, etc) - fall
                 # back to streaming straight from the URL for this preview.
-        preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url)
+        preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url, source_labels=source_labels)
         return lang, None, None
 
     mode, boundaries, speed, retime_error = resolve_retime_args(args, end_time - start_time)
@@ -1475,11 +1776,14 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     else:
         extract_mode = config.get("extract_mode", DEFAULT_CONFIG["extract_mode"])
 
+    if mode and len(kept_segments) > 1:
+        print(f"[{lang}] --slow/--fast doesn't support trim_mid_transitions yet - mid-range transitions will play through untouched.")
+
     if extract_mode == "onthefly":
         if mode:
-            extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed)
+            extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels)
         else:
-            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=True)
+            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments)
     else:
         cache_dir = Path(config["cache_dir"]) / lang
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1493,9 +1797,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
 
         note_cache_use(state, local_path)
         if mode:
-            extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed)
+            extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels)
         else:
-            extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False)
+            extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False, source_labels=source_labels, kept_segments=kept_segments)
 
         key = f"{book_num}_{chapter}"
         index = load_index(lang)
@@ -1511,7 +1815,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
 
     if args.play:
         if command_exists("mpv"):
-            launch_mpv([out_filename])
+            launch_mpv([out_filename], config=config)
         else:
             print(f"[{lang}] (--play needs mpv, which isn't installed)")
 
@@ -1676,6 +1980,7 @@ def cmd_find(args, config):
                     wait=False,
                     fullscreen=not multi,
                     paused=multi,
+                    config=config,
                     autofit=window_size if multi else None,
                     geometry=f"+{40 + (i % 5) * 60}+{40 + (i % 5) * 60}" if multi else None,
                 )
@@ -1788,7 +2093,10 @@ def cmd_bulk(args, config):
 # --- Main ---
 def main():
     migrate_legacy_config_dir()
-    parser = argparse.ArgumentParser(description="slverse - JW Sign Language Video Tool")
+    parser = argparse.ArgumentParser(
+        description="slverse - JW Sign Language Video Tool",
+        epilog="Nearly all behavior is configurable - see 'slverse config list' or docs/slverse.md.",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     p_setup = subparsers.add_parser("setup", help="Interactive first-run setup (dependencies, languages, cache, 60fps, PATH)")
@@ -1815,6 +2123,10 @@ def main():
     p_extract.add_argument("--onthefly", action="store_true", help="Stream-extract from the source URL; never store the full chapter on disk (default)")
     p_extract.add_argument("--cache", action="store_true", help="Download and keep the full chapter in the local cache instead of streaming on the fly")
     p_extract.add_argument("--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
+    p_extract.add_argument("--keep-end-transition", action="store_true", help="Keep the trailing fade-out/copyright-endscreen this once, overriding trim_end_transition for this run only")
+    p_extract.add_argument("--trim-mid-transitions", action="store_true", help="Also cut mid-range paragraph transitions inside a multi-verse range this once, overriding trim_mid_transitions for this run only")
+    p_extract.add_argument("-s", "--offset-start", type=float, metavar="SECONDS", help="Nudge the verse range's own start by this many seconds (either sign) - e.g. 5.302 to skip the first 5.302s and play to the natural end")
+    p_extract.add_argument("-e", "--offset-end", type=float, metavar="SECONDS", help="Nudge the verse range's own end by this many seconds (either sign) - e.g. -3 to end 3s early")
     p_extract_retime = p_extract.add_mutually_exclusive_group()
     p_extract_retime.add_argument("--slow", nargs="+", metavar="TIME", help="Split the verse at TIME(s) (seconds or HH:MM:SS, relative to the verse's own start) into alternating normal/slow sections (2nd, 4th, ... retimed). Needs --write. Video-only output (matches the standalone ffslow tool).")
     p_extract_retime.add_argument("--fast", nargs="+", metavar="TIME", help="Same as --slow but alternating normal/fast sections (1st, 3rd, ... retimed) - matches the standalone fffast tool.")
@@ -1845,20 +2157,26 @@ def main():
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     config = load_config()
 
-    global FFMPEG_BIN, FFPROBE_BIN, FFPLAY_BIN
+    global FFMPEG_BIN, FFPROBE_BIN, FFPLAY_BIN, FONT_MAIN_WEIGHT, FONT_ESTIMATOR_WEIGHT, MAX_ATTEMPTS, RETRY_BACKOFF
     FFMPEG_BIN = resolve_ffmpeg_binary(config)
     FFPROBE_BIN = resolve_ffprobe_binary(config)
     FFPLAY_BIN = resolve_ffplay_binary(config)
+    FONT_MAIN_WEIGHT = config.get("font_weight_main", DEFAULT_CONFIG["font_weight_main"])
+    FONT_ESTIMATOR_WEIGHT = config.get("font_weight_estimator", DEFAULT_CONFIG["font_weight_estimator"])
+    MAX_ATTEMPTS = int(config.get("download_max_attempts", DEFAULT_CONFIG["download_max_attempts"]))
+    RETRY_BACKOFF = int(config.get("download_retry_backoff", DEFAULT_CONFIG["download_retry_backoff"]))
 
     if args.command == "setup":
         cmd_setup(args, config)
     elif args.command == "config":
         if args.action == "set" and args.key and args.value:
             cmd_config(args, config)
+        elif args.action == "get" and args.key:
+            cmd_config(args, config)
         elif args.action == "list":
             cmd_config(argparse.Namespace(key=None, value=None), config)
         else:
-            print("Usage: slverse config set <key> <value>")
+            print("Usage: slverse config set <key> <value>, or 'slverse config get <key>'")
     elif args.command == "langs":
         cmd_langs(args, config)
     elif args.command == "sync":
