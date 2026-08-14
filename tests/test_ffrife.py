@@ -271,5 +271,66 @@ class FfrifeCliDispatchTest(unittest.TestCase):
         self.assertEqual(args.fps, 60)
 
 
+class FfrifeCmdBenchmarkSampleTrimTest(unittest.TestCase):
+    """Regression coverage for a real bug hit while actually using this:
+    passing a whole downloaded chapter (minutes long) as --sample multiplied
+    every one of the crf sweep's ~15 encodes by its own full length instead
+    of a few seconds, timing out. cmd_benchmark now trims a long --sample
+    to a short slice first, the same way slverse's own sample-finder does
+    for its cached content."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_long_sample_gets_trimmed_before_benchmarking(self) -> None:
+        calls = []
+
+        def fake_run(cmd, check=True, capture_output=False, timeout=None, text=False):
+            calls.append(cmd)
+            if cmd[0] == "ffprobe":
+                return unittest.mock.Mock(stdout="391.144467\n")
+            # the trim encode - just needs to produce a real (if tiny) file
+            # so run_encoder_benchmark's own reference-encode step succeeds
+            with open(cmd[-1], "wb") as f:
+                f.write(b"\x00")
+            return unittest.mock.Mock(stdout="")
+
+        fake_benchmark_result = [{"hw": "cpu", "codec": "av1", "vcodec": "libsvtav1", "crf": "30", "ok": True, "seconds": 1.0, "size_bytes": 100, "ssim": 0.99, "error": None}]
+
+        with patch.object(self.ffrife, "resolve_ffmpeg_binary", return_value="ffmpeg"), \
+             patch.object(self.ffrife, "resolve_ffprobe_binary", return_value="ffprobe"), \
+             patch.object(self.ffrife.subprocess, "run", fake_run), \
+             patch.object(self.ffrife._jwkit_common, "run_encoder_benchmark", return_value=fake_benchmark_result) as run_bench:
+            self.ffrife.cmd_benchmark(argparse.Namespace(sample="/fake/long_chapter.mp4", apply=False, quick=False), dict(self.ffrife.DEFAULT_CONFIG))
+
+        # The sample path actually handed to run_encoder_benchmark must NOT
+        # be the original long file - it should be the trimmed temp file.
+        actual_sample = run_bench.call_args[0][1]
+        self.assertNotEqual(actual_sample, "/fake/long_chapter.mp4")
+        trim_cmd = next(c for c in calls if c[0] == "ffmpeg")
+        self.assertIn("-t", trim_cmd)
+        self.assertIn("8", trim_cmd)
+
+    def test_short_sample_is_used_as_is(self) -> None:
+        calls = []
+
+        def fake_run(cmd, check=True, capture_output=False, timeout=None, text=False):
+            calls.append(cmd)
+            return unittest.mock.Mock(stdout="6.0\n")
+
+        fake_benchmark_result = [{"hw": "cpu", "codec": "av1", "vcodec": "libsvtav1", "crf": "30", "ok": True, "seconds": 1.0, "size_bytes": 100, "ssim": 0.99, "error": None}]
+
+        with patch.object(self.ffrife, "resolve_ffmpeg_binary", return_value="ffmpeg"), \
+             patch.object(self.ffrife, "resolve_ffprobe_binary", return_value="ffprobe"), \
+             patch.object(self.ffrife.subprocess, "run", fake_run), \
+             patch.object(self.ffrife._jwkit_common, "run_encoder_benchmark", return_value=fake_benchmark_result) as run_bench:
+            self.ffrife.cmd_benchmark(argparse.Namespace(sample="/fake/short_clip.mp4", apply=False, quick=False), dict(self.ffrife.DEFAULT_CONFIG))
+
+        actual_sample = run_bench.call_args[0][1]
+        self.assertEqual(actual_sample, "/fake/short_clip.mp4")  # used as-is, no trim encode was run
+        self.assertFalse(any(c[0] == "ffmpeg" for c in calls))
+
+
 if __name__ == "__main__":
     unittest.main()

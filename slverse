@@ -1767,14 +1767,21 @@ def find_or_generate_bench_sample(config, tmp_dir):
     subprocess.run(cmd, check=True, timeout=60)
     return sample, None
 
+BENCHMARK_CRF_SWEEP = {"h264": ["18", "20", "23"], "hevc": ["20", "23", "26"], "av1": ["24", "27", "30"]}
+BENCHMARK_CRF_QUICK = {"h264": "20", "hevc": "23", "av1": "30"}
+
 def cmd_benchmark(args, config):
     """Times every video encoder this machine's ffmpeg build actually has
     (real hardware encoders included, tried and skipped gracefully if
     claimed-but-not-actually-usable - e.g. nvenc compiled in without an
-    NVIDIA GPU present) against a real sample, measuring size and SSIM.
-    Generalizes the one-time manual benchmark detect_hardware_encoder's own
-    docstring documents for this machine specifically - every machine gets
-    its own real numbers instead of inheriting one machine's conclusion."""
+    NVIDIA GPU present) against a real sample, at a few crf values per
+    codec (BENCHMARK_CRF_SWEEP - a real size/quality tradeoff view, not one
+    guessed point), measuring size and SSIM. Generalizes the one-time
+    manual benchmark detect_hardware_encoder's own docstring documents for
+    this machine specifically - every machine gets its own real numbers
+    instead of inheriting one machine's conclusion. --quick skips the
+    sweep (one crf per codec) for a faster, coarser answer."""
+    crf_map = BENCHMARK_CRF_QUICK if getattr(args, "quick", False) else BENCHMARK_CRF_SWEEP
     with tempfile.TemporaryDirectory(prefix="slverse-bench-") as tmp_dir:
         sample, source_desc = find_or_generate_bench_sample(config, tmp_dir)
         if source_desc:
@@ -1782,7 +1789,7 @@ def cmd_benchmark(args, config):
         else:
             print("Nothing cached yet - benchmarking against a synthetic test clip (run this again once you've extracted something for a more representative result).")
         print("Trying every encoder this machine's ffmpeg supports - this can take a minute or two:\n")
-        results = _jwkit_common.run_encoder_benchmark(FFMPEG_BIN, sample, log=lambda m: print(f"  {m}"))
+        results = _jwkit_common.run_encoder_benchmark(FFMPEG_BIN, sample, crf_map=crf_map, log=lambda m: print(f"  {m}"))
 
     print()
     print(_jwkit_common.format_benchmark_table(results))
@@ -1790,10 +1797,16 @@ def cmd_benchmark(args, config):
     if not best:
         print("\nNo encoder on this machine actually worked - keeping current settings.")
         return None
-    print(f"\n{COLOR.bold(COLOR.green('Recommended:'))} hardware_encoder={best['hw']}, video_codec={best['codec']} (smallest file at SSIM >= 0.98, or highest SSIM available if none cleared that)")
+    print(f"\n{COLOR.bold(COLOR.green('Recommended:'))} hardware_encoder={best['hw']}, video_codec={best['codec']}, video_crf={best['crf']} (smallest file at SSIM >= 0.98, or highest SSIM available if none cleared that)")
     if getattr(args, "apply", False):
         config["hardware_encoder"] = best["hw"]
         config["video_codec"] = best["codec"]
+        # "auto" (not the literal crf value) whenever the winning crf is
+        # just that codec's own normal default - keeps video_crf correctly
+        # adaptive if the codec ever changes later (fallback to a
+        # different codec, or a future re-benchmark), rather than locking
+        # in a number that only made sense for the codec recommended today.
+        config["video_crf"] = "auto" if best["crf"] == _jwkit_common.AUTO_CRF_BY_CODEC.get(best["codec"]) else best["crf"]
         save_config(config)
         print("Applied and saved - run 'slverse config list' to see it, or 'slverse config set video_codec ...' to change it by hand.")
     return best
@@ -2624,7 +2637,8 @@ def main():
     p_inspect.add_argument("file", help="An slverse-generated media file")
 
     p_benchmark = subparsers.add_parser("benchmark", help="Time this machine's video encoders for speed/size/quality and suggest the best default")
-    p_benchmark.add_argument("--apply", action="store_true", help="Save the recommended hardware_encoder/video_codec to config instead of just printing them")
+    p_benchmark.add_argument("--apply", action="store_true", help="Save the recommended hardware_encoder/video_codec/video_crf to config instead of just printing them")
+    p_benchmark.add_argument("--quick", action="store_true", help="Skip the crf sweep (one crf per codec) for a faster, coarser answer")
 
     p_bulk = subparsers.add_parser("bulk", help="Precompute whole chapters (optionally interpolated) ahead of time, instead of extracting on demand")
     p_bulk.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")

@@ -70,6 +70,7 @@ _RESOLVED_ENCODER_CACHE = {}
 _ENCODER_FALLBACK_WARNED = set()
 
 _CODEC_TIERS = ["av1", "hevc", "h264"]
+AUTO_CRF_BY_CODEC = {"h264": "20", "hevc": "23", "av1": "30"}
 _HW_ENCODER_NAMES = {
     "nvenc": {"h264": "h264_nvenc", "hevc": "hevc_nvenc", "av1": "av1_nvenc"},
     "videotoolbox": {"h264": "h264_videotoolbox", "hevc": "hevc_videotoolbox", "av1": "av1_videotoolbox"},
@@ -194,7 +195,7 @@ def build_encode_args(ffmpeg_bin, config, notice=True):
 
     crf = config.get("video_crf", "auto")
     if str(crf).strip().lower() == "auto":
-        crf = {"h264": "20", "hevc": "23", "av1": "30"}.get(actual_codec, "20")
+        crf = AUTO_CRF_BY_CODEC.get(actual_codec, "20")
     preset = config.get("video_preset", "slow")
 
     return _encode_args_for(hw, actual_codec, vcodec, used_hw, crf, preset)
@@ -238,19 +239,26 @@ def measure_ssim(ffmpeg_bin, encoded_path, reference_path):
 
 def run_encoder_benchmark(ffmpeg_bin, sample_path, candidates=None, crf_map=None, preset="slow", log=None):
     """Time + size + SSIM (vs. a lossless re-encode of the sample itself)
-    for every candidate (hw, codec, vcodec, used_hw) combo - real numbers
-    for real hardware, rather than one machine's one-time manual benchmark
+    for every candidate (hw, codec, vcodec, used_hw) combo, at every crf
+    value given for that codec - real numbers for real hardware (and real
+    quality targets), rather than one machine's one-time manual benchmark
     baked in as everyone's default (see slverse's old detect_hardware_encoder
     docstring, which this generalizes). `log(message)` is called once per
-    candidate as it's tried, if given, for progress feedback on what can be
-    a slow (tens of seconds to a few minutes) operation.
+    (candidate, crf) pair as it's tried, if given, for progress feedback on
+    what can be a slow (tens of seconds to a few minutes) operation.
 
-    Returns a list of dicts: {hw, codec, vcodec, ok, seconds, size_bytes,
-    ssim, error}. A candidate that fails to encode at all (hw claimed but
-    not actually usable - the real "is this GPU/driver actually there"
-    test) gets ok=False and an error string instead of raising."""
+    crf_map values may be a single crf (the old shape, one point per codec)
+    or a list (a sweep - e.g. {"av1": ["24", "27", "30"]} to see where the
+    size/quality tradeoff actually bends for this content, instead of
+    guessing at one fixed value).
+
+    Returns a list of dicts: {hw, codec, vcodec, crf, ok, seconds,
+    size_bytes, ssim, error}. A candidate that fails to encode at all (hw
+    claimed but not actually usable - the real "is this GPU/driver actually
+    there" test) gets ok=False and an error string instead of raising."""
     candidates = candidates if candidates is not None else benchmark_candidates(ffmpeg_bin)
-    crf_map = crf_map or {"h264": "20", "hevc": "23", "av1": "30"}
+    crf_map = crf_map or dict(AUTO_CRF_BY_CODEC)
+    crf_map = {codec: (vals if isinstance(vals, (list, tuple)) else [vals]) for codec, vals in crf_map.items()}
     results = []
     with tempfile.TemporaryDirectory(prefix="jwkit-bench-") as tmp_dir:
         tmp = Path(tmp_dir)
@@ -261,26 +269,26 @@ def run_encoder_benchmark(ffmpeg_bin, sample_path, candidates=None, crf_map=None
             check=True, timeout=120,
         )
         for hw, codec, vcodec, used_hw in candidates:
-            if log:
-                log(f"{hw}/{codec} ({vcodec})...")
-            crf = crf_map.get(codec, "23")
-            args = _encode_args_for(hw, codec, vcodec, used_hw, crf, preset)
-            output = tmp / f"{hw}_{codec}.mp4"
-            start = time.time()
-            try:
-                subprocess.run(
-                    [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", str(sample_path)] + args + [str(output)],
-                    check=True, capture_output=True, timeout=300,
-                )
-            except Exception as exc:
-                results.append({"hw": hw, "codec": codec, "vcodec": vcodec, "ok": False,
-                                 "seconds": None, "size_bytes": None, "ssim": None, "error": str(exc)})
-                continue
-            seconds = time.time() - start
-            size_bytes = output.stat().st_size if output.exists() else 0
-            ssim = measure_ssim(ffmpeg_bin, output, reference) if size_bytes else None
-            results.append({"hw": hw, "codec": codec, "vcodec": vcodec, "ok": True,
-                             "seconds": seconds, "size_bytes": size_bytes, "ssim": ssim, "error": None})
+            for crf in crf_map.get(codec, ["23"]):
+                if log:
+                    log(f"{hw}/{codec} crf={crf} ({vcodec})...")
+                args = _encode_args_for(hw, codec, vcodec, used_hw, crf, preset)
+                output = tmp / f"{hw}_{codec}_{crf}.mp4"
+                start = time.time()
+                try:
+                    subprocess.run(
+                        [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", str(sample_path)] + args + [str(output)],
+                        check=True, capture_output=True, timeout=300,
+                    )
+                except Exception as exc:
+                    results.append({"hw": hw, "codec": codec, "vcodec": vcodec, "crf": crf, "ok": False,
+                                     "seconds": None, "size_bytes": None, "ssim": None, "error": str(exc)})
+                    continue
+                seconds = time.time() - start
+                size_bytes = output.stat().st_size if output.exists() else 0
+                ssim = measure_ssim(ffmpeg_bin, output, reference) if size_bytes else None
+                results.append({"hw": hw, "codec": codec, "vcodec": vcodec, "crf": crf, "ok": True,
+                                 "seconds": seconds, "size_bytes": size_bytes, "ssim": ssim, "error": None})
     return results
 
 
@@ -290,27 +298,38 @@ def format_benchmark_table(results):
     clears a reasonable bar), failures listed after."""
     ok = sorted((r for r in results if r["ok"]), key=lambda r: r["size_bytes"])
     failed = [r for r in results if not r["ok"]]
-    lines = [f"{'hw':<12} {'codec':<6} {'time':>8} {'size':>10} {'ssim':>8}"]
+    lines = [f"{'hw':<12} {'codec':<6} {'crf':>4} {'time':>8} {'size':>10} {'ssim':>8}"]
     for r in ok:
-        lines.append(f"{r['hw']:<12} {r['codec']:<6} {r['seconds']:>7.1f}s {r['size_bytes']/1e6:>8.2f}MB {r['ssim']:>8.4f}" if r["ssim"] is not None
-                      else f"{r['hw']:<12} {r['codec']:<6} {r['seconds']:>7.1f}s {r['size_bytes']/1e6:>8.2f}MB {'n/a':>8}")
+        crf = r.get("crf", "")
+        lines.append(f"{r['hw']:<12} {r['codec']:<6} {crf:>4} {r['seconds']:>7.1f}s {r['size_bytes']/1e6:>8.2f}MB {r['ssim']:>8.4f}" if r["ssim"] is not None
+                      else f"{r['hw']:<12} {r['codec']:<6} {crf:>4} {r['seconds']:>7.1f}s {r['size_bytes']/1e6:>8.2f}MB {'n/a':>8}")
     for r in failed:
-        lines.append(f"{r['hw']:<12} {r['codec']:<6} {'unavailable':>8}   ({r['error'].splitlines()[0][:60]})")
+        lines.append(f"{r['hw']:<12} {r['codec']:<6} {r.get('crf', ''):>4} {'unavailable':>8}   ({r['error'].splitlines()[0][:60]})")
     return "\n".join(lines)
 
 
-def recommend_from_benchmark(results, ssim_floor=0.98):
+def recommend_from_benchmark(results, ssim_floor=0.98, size_tolerance=0.15):
     """Smallest file among combos clearing ssim_floor (0.98 - broadly
     considered visually-lossless-to-very-high-quality territory), falling
-    back to the highest-SSIM combo if none clear it. Returns a result dict
-    or None if every candidate failed outright."""
+    back to the highest-SSIM combo if none clear it - but the absolute
+    smallest is a bad tiebreaker once several combos are already this
+    close: a crf sweep across codecs routinely lands two candidates within
+    a few % of the same tiny file size, and picking whichever is smaller by
+    noise-level margins while ignoring that it took 3x longer to encode
+    isn't actually a better recommendation. Among everything within
+    size_tolerance (15%) of the smallest file, the fastest one wins
+    instead. Returns a result dict or None if every candidate failed
+    outright."""
     ok = [r for r in results if r["ok"] and r["ssim"] is not None]
     if not ok:
         return None
     above_floor = [r for r in ok if r["ssim"] >= ssim_floor]
     pool = above_floor or ok
-    key = (lambda r: r["size_bytes"]) if above_floor else (lambda r: -r["ssim"])
-    return min(pool, key=key)
+    if not above_floor:
+        return max(pool, key=lambda r: r["ssim"])
+    smallest = min(r["size_bytes"] for r in pool)
+    near_smallest = [r for r in pool if r["size_bytes"] <= smallest * (1 + size_tolerance)]
+    return min(near_smallest, key=lambda r: r["seconds"])
 
 
 class ProgressETA:
