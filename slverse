@@ -598,12 +598,13 @@ def print_progress(downloaded, total, width=30):
         sys.stdout.write(f"\r{downloaded/1e6:.1f} MB downloaded")
     sys.stdout.flush()
 
-def print_time_progress(current_s, total_s, label="", width=30):
+def print_time_progress(current_s, total_s, label="", width=30, eta_seconds=None):
     """Same bar, driven by seconds-of-output-encoded-so-far instead of
     bytes - for ffmpeg's own -progress pipe (see run_ffmpeg)."""
     frac = (current_s / total_s) if total_s else 0.0
     prefix = f"{label} " if label else ""
-    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current_s:.1f}/{total_s:.1f}s)")
+    eta = f", ETA {int(eta_seconds // 60)}m {int(eta_seconds % 60):02d}s" if eta_seconds is not None else ""
+    sys.stdout.write(f"\r{prefix}[{_progress_bar(frac, width)}] {frac*100:5.1f}% ({current_s:.1f}/{total_s:.1f}s{eta})")
     sys.stdout.flush()
 
 def print_count_progress(current, total, label="", width=30):
@@ -721,6 +722,7 @@ def run_ffmpeg(args, duration=None, slow_after=4.0):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
     start = time.time()
     shown = False
+    samples, last_print = [], 0.0
     for line in proc.stdout:
         line = line.strip()
         if not line.startswith("out_time="):
@@ -731,8 +733,13 @@ def run_ffmpeg(args, duration=None, slow_after=4.0):
             continue
         if not shown and time.time() - start > slow_after:
             shown = True
-        if shown:
-            print_time_progress(current, duration, label="Encoding")
+        if shown and time.time() - last_print >= 5.0:
+            now = time.time(); samples.append((now, current)); samples = samples[-8:]
+            eta = None
+            if len(samples) >= 3 and samples[-1][1] > samples[0][1]:
+                eta = max(0, (duration - current) / ((samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0])))
+            print_time_progress(current, duration, label="Encoding", eta_seconds=eta)
+            last_print = now
     proc.stdout.close()
     proc.wait()
     if shown:
@@ -1780,7 +1787,7 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
     source_labels = [chapters_meta[v]["label"] for v in valid_verses if chapters_meta[v].get("label")]
     return start, end, entry["url"], entry.get("checksum"), valid_verses, source_labels, kept_segments
 
-def overlay_fade_outs(lang, book_num, chapter, valid_verses, start, end, config, keep_end_transition=False, trim_mid_transitions=None):
+def overlay_fade_outs(lang, book_num, chapter, valid_verses, start, end, config, keep_end_transition=False, trim_mid_transitions=None, source_timeline=False):
     """Metadata-derived fade-out intervals, relative to this output window."""
     meta = markers_to_verse_times(load_index(lang).get(f"{book_num}_{chapter}", {}).get("markers", []))
     trim_end = str(config.get("trim_end_transition", DEFAULT_CONFIG["trim_end_transition"])).strip().lower() != "false" and not keep_end_transition
@@ -1793,7 +1800,8 @@ def overlay_fade_outs(lang, book_num, chapter, valid_verses, start, end, config,
         fade_end = meta[v]["end"]
         fade_start = fade_end - transition
         if fade_end > start and fade_start < end:
-            fades.append((max(fade_start, start) - start, min(fade_end, end) - start))
+            left, right = max(fade_start, start), min(fade_end, end)
+            fades.append((left, right) if source_timeline else (left - start, right - start))
     return fades
 
 def resolve_retime_args(args, duration):
@@ -1840,7 +1848,10 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     if not window:
         return lang, None, f"Verses {verses} not found for {lang} (video may not exist for this chapter in this language yet)."
     start_time, end_time, url, checksum, valid_verses, source_labels, kept_segments = window
-    fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None)
+    # drawtext attached directly to an input uses the source PTS despite
+    # input-side -ss; only concat/filter-complex paths reset it to zero.
+    direct_input_timeline = not getattr(args, "trim_mid_transitions", False)
+    fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None, source_timeline=direct_input_timeline)
     verses_str = format_verses_label(valid_verses)
     out_filename = f"{book_name.replace(' ', '_')}_{chapter}_{verses_str}_{lang}.mp4"
     edit_bits = []
@@ -1924,6 +1935,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             print(f"[{lang}] Using cached video file.")
 
         print(f"[{lang}] Source cache: {local_path}")
+        print(f"[{lang}] Source: {url}")
 
         note_cache_use(state, local_path)
         if mode:
