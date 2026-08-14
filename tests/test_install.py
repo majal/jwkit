@@ -15,7 +15,7 @@ MARKER = "# jwkit PATH (added by jwkit's install.sh)"
 
 
 class InstallPathTests(unittest.TestCase):
-    def run_installer(self, home: Path) -> None:
+    def run_installer(self, home: Path) -> subprocess.CompletedProcess[str]:
         install_dir = home / ".jwkit"
         (install_dir / ".git").mkdir(parents=True)
         for name in ("ffrife", "jwdl", "jwvideo-mux", "slverse"):
@@ -24,7 +24,13 @@ class InstallPathTests(unittest.TestCase):
         fake_bin = home / "fake-bin"
         fake_bin.mkdir()
         fake_git = fake_bin / "git"
-        fake_git.write_text("#!/bin/sh\nexit 0\n")
+        fake_git.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do\n"
+            "  [ \"$arg\" = ls-files ] && { echo jwkit-update; exit 0; }\n"
+            "done\n"
+            "exit 0\n"
+        )
         fake_git.chmod(0o755)
 
         env = os.environ | {
@@ -33,7 +39,7 @@ class InstallPathTests(unittest.TestCase):
             "SHELL": "/bin/bash",
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
         }
-        subprocess.run(
+        return subprocess.run(
             ["bash", str(INSTALLER)],
             check=True,
             env=env,
@@ -64,6 +70,18 @@ class InstallPathTests(unittest.TestCase):
             self.assertIn(MARKER, (home / ".bash_profile").read_text())
             self.assertIn(MARKER, (home / ".bashrc").read_text())
             self.assertNotIn(MARKER, (home / ".profile").read_text())
+
+    def test_generated_update_command_does_not_block_an_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".profile").touch()
+            update_command = home / ".jwkit" / "jwkit-update"
+            update_command.parent.mkdir()
+            update_command.write_text("#!/usr/bin/env bash\n")
+
+            result = self.run_installer(home)
+
+            self.assertNotIn("Local changes found", result.stdout)
 
     def test_rejects_filesystem_root_as_install_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
