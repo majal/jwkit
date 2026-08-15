@@ -12,6 +12,8 @@
 - Interpolates the extracted clip to 60fps for smoother sign language playback using `ffmpeg` (minterpolate or framerate) or `rife-ncnn-vulkan` (GPU-accelerated AI).
 - `--slow`/`--fast` split the extracted verse into alternating normal/retimed sections at one or more boundary times, the same sectioned retiming the standalone `ffslow`/`fffast` tools do (`--slow` retimes the 2nd/4th/... section, `--fast` the 1st/3rd/...) - with `interpolation_engine = rife`, the retimed sections get RIFE-interpolated first via `ffrife` for smooth (not choppy) slow-motion.
 - Syncs and extracts across your whole language list in parallel (`slverse sync all`, `slverse extract all "Rev 13:1, 2"`), instead of one language at a time.
+- `slverse extract any ...` tries that configured language list in priority order and stops at the first language that has the requested verse.
+- Resolves book names case-insensitively and without requiring diacritics. Set `api_language` to a priority list such as `V,E` to accept Vietnamese names first and fall back to English.
 - Refreshes your language index automatically, about once a day, whenever you run `extract`/`find`/`bulk` — no need to remember to run `sync` yourself. Skips silently if there's no internet, and never runs more than once a day even if the previous attempt failed or got interrupted.
 - Maintains a local cache of downloaded full-chapter videos, capped by size with oldest-used chapters evicted first, so it can't quietly fill your disk.
 - `slverse find <book> <chapter> <verse>` searches every language you've already synced for who has a given verse, without downloading anything. `<verse>` also accepts a range (`25-27`) or comma list (`1,3,5`). Default output is a compact ✅/❌ table grouped by language; `--verbose` shows the full URL + mpv command per match, and `--json` gives scripts a machine-readable array. `--play` streams every match with `mpv` - with more than one match, each opens windowed (not fullscreen) and paused, cascaded slightly so they don't stack exactly on top of each other, so you can unpause and review each language side by side; a single match still autoplays fullscreen as before. Every window is spawned non-blocking (macOS/Linux/Windows alike), so the command returns immediately instead of waiting on playback.
@@ -71,6 +73,8 @@ You can also set individual options by hand at any time:
 ./slverse config set cache_max_gb 5
 ./slverse config set interpolation_engine rife
 ./slverse config set languages ASL,FSL,BVL,INI,SPE
+./slverse config set api_language V,E
+./slverse config set mpv_options "--screen=1 --speed=1.15"
 ```
 
 ## Configuration
@@ -84,6 +88,8 @@ Nearly every behavior is a config key, not a fixed default meant for one setup. 
 | `sign_lang_ref_language` | `ASL=en,FSL=en,BVL=es,SPE=es,INI=id` | Which spoken language each sign language's burned-in caption is actually written in — used to skip the reference-swap when source and target already match. Add an entry for any other language you use; an unlisted one always gets the full overlay. |
 | `show_source_lang_label` | `true` | The small "which SL this came from" label under the reference — independent of `overlay_source_label_alpha`, which only controls its opacity. |
 | `mpv_show_osc` | `true` | mpv's on-screen controller that appears on mouse movement, for every mpv window `slverse` opens. `slverse` always passes `--no-config` to mpv (for reproducibility across machines), so a personal `mpv.conf` that already disables this doesn't apply — set `false` here instead to match a "nothing shows on hover" setup. This is a per-user preference, not something worth defaulting off for everyone. |
+| `mpv_options` | _(empty)_ | Extra arguments for every mpv launch, e.g. `--screen=1 --speed=1.15`. Parsed without invoking a shell; override once with `--mpv-options`. |
+| `api_language` | `E` | Priority-ordered book-name metadata languages. Use `V,E` for Vietnamese names with English fallback; matching ignores case and diacritics. |
 | `delogo_width_pad` / `delogo_height_pad` | `10` / `10` | Extra px of safety margin beyond the auto-measured source caption size. |
 | `delogo_engine` | `blur` | `blur` is the normal fast filter; `auto` detects likely foreground occlusion and calls configured `ffinpaint`; `inpaint` always tries it. |
 | `font_family` / `font_weight_main` / `font_weight_estimator` | `noto-sans-display` / `600` / `400` | Overlay typography — see `FONT_FAMILIES` in the script for the other Google Fonts options. |
@@ -123,6 +129,12 @@ Do the same for every language in your configured list, in parallel:
 
 ```bash
 ./slverse extract all "Rev 13:1, 2" --interpolate
+```
+
+Play or encode from the first configured language that has the verse:
+
+```bash
+./slverse extract any "phuc truyen luat le 6:4" --play
 ```
 
 Pull a single verse without ever storing the full chapter on disk (this is the default, `--onthefly` is shown for clarity):
@@ -191,7 +203,7 @@ The winner is the smallest file among everything at SSIM ≥ 0.98 - but ties wit
 - Verse start/end times come from JW.org's own API metadata (backfilled into the local index on first use), not from probing a downloaded video file. Book-name lookups are cached per `api_language` too, instead of hitting jw.org on every extract.
 - Encoding quality is configurable (`video_codec`, `video_crf`, `video_preset`) and defaults to `av1` (`libsvtav1 -crf 30 -preset 6` in software - royalty-free and, measured directly, smaller *and* nearly as fast as h264 on this machine; see `docs/ffrife.md`'s codec comparison table for the numbers). This is intentionally higher quality than JW.org's own source encode (~1.07 Mbps H.264 Main@3.1 720p30, per a direct `ffprobe` of a sample video) rather than matching it bitrate-for-bitrate: overlays force a re-encode of an already-lossy source, and re-encoding a second generation at the source's own bitrate would compound visible compression loss. Since clips are short, the absolute file size stays small either way. `video_codec=av1` automatically falls back to `hevc` then `h264` if this machine/ffmpeg build can't actually encode av1 (no hardware AV1 encoder for the configured `hardware_encoder`, and no `libsvtav1`/`libaom-av1` in software) - it prints a one-line notice when that happens. These are still just defaults, not a claim they're best on every machine - GPU vendor/generation, ffmpeg build, and content all change the real answer; run `slverse benchmark` (or accept setup's offer to run it) for this machine's own numbers instead of guessing.
 - Picks a drawtext-capable `ffmpeg` automatically: it prefers an `ffmpeg-full`-style build (or whatever `ffmpeg_binary`/`ffprobe_binary` you set explicitly) over the stock Homebrew `ffmpeg`, which doesn't include `freetype`/`fontconfig`.
-- When applying overlays, the tool expects standard English abbreviations or full names (e.g., "Rev" or "Revelation") by default, or a plain book number.
+- Book-name matching uses the configured `api_language` priority list and ignores case and diacritics. The default `E` accepts English abbreviations/full names or a plain book number; `V,E` adds Vietnamese-first lookup with English fallback.
 - `extract`/`find`/`bulk` trigger a metadata refresh at most once every `auto_sync_interval_hours` (default 24), so verse availability stays current without ever running `slverse sync` by hand. By default (`auto_sync_background = true`) this refresh runs as a detached background process and never blocks the command that triggered it; set `./slverse config set auto_sync_background false` to sync inline and block instead. Disable the refresh entirely per-run with `--no-auto-sync`, or permanently with `./slverse config set auto_sync false`. A failed or offline attempt still resets the timer, so a bad connection doesn't retry (and pause) on every command for the rest of the day.
 - `--slow`/`--fast` need `--write`/`-f` (no live preview for sectioned retiming); boundary times are seconds or `HH:MM:SS`, relative to the verse's own start, and must be strictly increasing and inside the verse's duration. `--speed` defaults to `0.5` for `--slow` and `3` for `--fast` if not given explicitly. Like the standalone `ffslow`/`fffast` tools, sectioned output is video-only (no audio) - the single-window path (without `--slow`/`--fast`) still keeps audio.
 - Preview mode (`extract` without `--write`) defaults to `preview_source = cache`: it downloads the chapter once (if not already cached under `cache_dir`, from a prior `--cache` extract, a `bulk` run, or an earlier preview) and plays that local copy from then on, so previewing more verses from the same chapter costs no further bandwidth. The "Previewing:" line shows the local path being played; a `Source:` line under it has the remote URL too, in case you want to swap it in yourself. Set `./slverse config set preview_source remote` to always stream straight from the URL instead and never touch disk.
