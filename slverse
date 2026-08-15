@@ -2651,10 +2651,11 @@ def main():
     p_find.add_argument("book", help="Book name or number")
     p_find.add_argument("chapter", type=int)
     p_find.add_argument("verse", help="Single verse, a range (25-27), or a comma list (1,3,5)")
-    p_find.add_argument("--play", action="store_true", help="Also stream-preview each match with mpv")
+    p_find.add_argument("-p", "--play", action="store_true", help="Also stream-preview each match with mpv")
     p_find.add_argument("-v", "--verbose", action="store_true", help="Show full match details (URL, mpv command) instead of the compact checkmark list")
     p_find.add_argument("--json", action="store_true", help="Machine-readable JSON instead of the checkmark list (always includes every synced language, found or not)")
     p_find.add_argument("--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
+    add_generic_config_overrides(p_find)
 
     p_cache = subparsers.add_parser("cache", help="Manage cache")
     p_cache.add_argument("action", choices=["clean", "list", "trim"])
