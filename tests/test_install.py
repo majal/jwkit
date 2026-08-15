@@ -19,7 +19,7 @@ class InstallPathTests(unittest.TestCase):
     def run_installer(self, home: Path) -> subprocess.CompletedProcess[str]:
         install_dir = home / ".jwkit"
         (install_dir / ".git").mkdir(parents=True)
-        for name in ("ffinpaint", "ffrife", "jwdl", "jwvideo-mux", "slverse"):
+        for name in ("ffinpaint", "ffrife", "ffv", "jwdl", "jwvideo-mux", "slverse"):
             (install_dir / name).touch()
 
         fake_bin = home / "fake-bin"
@@ -97,7 +97,7 @@ class InstallPathTests(unittest.TestCase):
             home = Path(tmp)
             install_dir = home / ".jwkit"
             (install_dir / ".git").mkdir(parents=True)
-            for name in ("ffinpaint", "ffrife", "jwdl", "jwvideo-mux", "slverse"):
+            for name in ("ffinpaint", "ffrife", "ffv", "jwdl", "jwvideo-mux", "slverse"):
                 (install_dir / name).touch()
             (install_dir / ".jwkit-install-state").write_text("dependency_manager=brew\ndependency=ffmpeg\n")
 

@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import unicodedata
 from fractions import Fraction
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -134,7 +136,7 @@ DEFAULT_CONFIG = {
     "preview_window_size": "65%",  # multi-language preview windows (slverse find --play, or 'ffv all <ref> -p'), as an mpv --autofit percentage of screen size - ignored for a single-language preview, which still autoplays fullscreen
     "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
     "font_family": "noto-sans-display",  # noto-sans-display, inter, google-sans-flex - see FONT_FAMILIES
-    "api_language": "E",  # Language for book names (e.g., E for English)
+    "api_language": "E",  # Priority-ordered language codes for book names (e.g. "V,E" for Vietnamese then English)
     "ffmpeg_binary": "",  # override auto-detection, e.g. /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg-full
     "ffprobe_binary": "",
     "ffplay_binary": "",  # override auto-detection, used for preview (extract without --write)
@@ -153,6 +155,7 @@ DEFAULT_CONFIG = {
     "sign_lang_ref_language": "ASL=en,FSL=en,BVL=es,SPE=es,INI=id",  # spoken/verse-reference language each sign language's burned-in caption is actually written in, e.g. "KEY=VAL,KEY2=VAL2" - NOT derivable from the ISO sign-language code in jwlangs.json (e.g. ASL's is "ase"), so this is a small editable table instead. When source and target share a reference language (e.g. ASL->FSL, both en), delogo/drawtext for the verse reference itself is skipped - only show_source_lang_label's small label still applies. Add an entry for any other language you use; an unlisted language is treated as never matching (falls back to the full overlay).
     "show_source_lang_label": "true",  # the small "which SL this clip came from" label under the verse reference - independent of overlay_source_label_alpha, which only controls its opacity when shown
     "mpv_show_osc": "true",  # mpv's on-screen controller/overlay that pops up on mouse movement, for every mpv window slverse opens (--play, find --play) - slverse always passes --no-config to mpv for reproducibility, so a personal mpv.conf that disables this doesn't apply here; set false to match a "nothing shows on hover" setup. Per-user preference, not something to default off for everyone.
+    "mpv_options": "",  # Extra mpv arguments for every launch, shell-split without invoking a shell (e.g. --screen=1 --speed=1.15)
     "font_weight_main": "600",  # Google Fonts weight for the main drawtext label (book/chapter/verse) - see FONT_FAMILIES
     "font_weight_estimator": "400",  # Google Fonts weight used only to size the delogo box, not to draw anything
     "download_max_attempts": "3",  # retry attempts for a chapter/font download before giving up
@@ -187,7 +190,7 @@ CONFIG_HELP = {
     "font_family": "noto-sans-display, inter, or google-sans-flex",
     "font_weight_main": "Google Fonts weight for the drawn verse-reference label",
     "font_weight_estimator": "Google Fonts weight used only to size the delogo box",
-    "api_language": "Language code for book names (e.g. E for English)",
+    "api_language": "Priority-ordered language codes for book names (e.g. V,E for Vietnamese then English)",
     "ffmpeg_binary": "Override ffmpeg binary auto-detection",
     "ffprobe_binary": "Override ffprobe binary auto-detection",
     "ffplay_binary": "Override ffplay binary auto-detection (used for preview)",
@@ -204,6 +207,7 @@ CONFIG_HELP = {
     "sign_lang_ref_language": "SL-code=spoken-language table (e.g. ASL=en,BVL=es) - skips the reference swap when source/target already share one",
     "show_source_lang_label": "Show the small 'which SL this came from' label",
     "mpv_show_osc": "Show mpv's on-screen controller on mouse movement, for mpv windows slverse opens",
+    "mpv_options": "Extra mpv arguments for every launch (e.g. --screen=1 --speed=1.15)",
     "download_max_attempts": "Retry attempts for a chapter/font download",
     "download_retry_backoff": "Seconds (doubled per attempt) between download retries",
 }
@@ -380,6 +384,8 @@ def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, g
         cmd.append(f"--autofit={autofit}")
     if geometry:
         cmd.append(f"--geometry={geometry}")
+    if config is not None and str(config.get("mpv_options", "")).strip():
+        cmd += shlex.split(str(config["mpv_options"]))
     cmd += list(args)
     proc = subprocess.Popen(cmd)
     focus_process(proc.pid)
@@ -1587,6 +1593,13 @@ def get_chapter_timestamps_ffprobe(input_file):
         print(f"Error reading chapters: {e}")
         return {}
 
+def normalize_book_name(value):
+    """Casefold a book name and remove combining marks for fast typing."""
+    value = str(value).casefold().replace("đ", "d")
+    return "".join(ch for ch in unicodedata.normalize("NFKD", value)
+                   if not unicodedata.combining(ch))
+
+
 def resolve_book_number(book_name, lang="E", state=None):
     """Book names/numbers are static, so the study-bible metadata (one
     network call per language) is cached in state.json instead of being
@@ -1594,18 +1607,20 @@ def resolve_book_number(book_name, lang="E", state=None):
     if book_name.isdigit():
         return int(book_name)
 
-    metadata = state.get("_book_metadata", {}).get(lang) if state is not None else None
-    if metadata is None:
-        metadata = get_bible_metadata(lang)
-        if metadata is not None and state is not None:
-            state.setdefault("_book_metadata", {})[lang] = metadata
-    if not metadata:
-        return None
-    for b_id, b_data in metadata.get("editionData", {}).get("books", {}).items():
-        if book_name.lower() in b_data.get("standardSingularBookName", "").lower():
-            return int(b_id)
-        if book_name.lower() in b_data.get("officialAbbreviation", "").lower():
-            return int(b_id)
+    needle = normalize_book_name(book_name)
+    languages = [item.strip().upper() for item in str(lang).split(",") if item.strip()]
+    for language in languages or ["E"]:
+        metadata = state.get("_book_metadata", {}).get(language) if state is not None else None
+        if metadata is None:
+            metadata = get_bible_metadata(language)
+            if metadata is not None and state is not None:
+                state.setdefault("_book_metadata", {})[language] = metadata
+        if not metadata:
+            continue
+        for b_id, b_data in metadata.get("editionData", {}).get("books", {}).items():
+            candidates = (b_data.get("standardSingularBookName", ""), b_data.get("officialAbbreviation", ""))
+            if any(needle == normalize_book_name(candidate) for candidate in candidates if candidate):
+                return int(b_id)
     return None
 
 def verse_markers(file):
@@ -2274,7 +2289,8 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     return lang, out_filename, None
 
 def cmd_extract(args, config):
-    langs = get_lang_list(config, args.lang) if (args.lang.lower() == "all" or "," in args.lang) else [args.lang.upper()]
+    any_mode = args.lang.lower() == "any"
+    langs = get_lang_list(config) if any_mode else (get_lang_list(config, args.lang) if (args.lang.lower() == "all" or "," in args.lang) else [args.lang.upper()])
     ref = " ".join(args.reference) if isinstance(args.reference, list) else args.reference
 
     book_name, chapter, verses = parse_reference(ref)
@@ -2294,7 +2310,7 @@ def cmd_extract(args, config):
         print(f"Could not resolve book number for {book_name}. Try the book number directly (e.g., '66 13:1, 2').")
         return
 
-    if not args.write and len(langs) > 1:
+    if not args.write and len(langs) > 1 and not any_mode:
         print(f"Preview mode only plays one language at a time (got {', '.join(langs)}).")
         print("Pass --write/-f to batch-export all of them, or give a single language to preview.")
         return
@@ -2304,7 +2320,7 @@ def cmd_extract(args, config):
         print("--output/-o requires --write/-f.")
         return
 
-    if output and len(langs) > 1:
+    if output and len(langs) > 1 and not any_mode:
         print("--output/-o requires one language; use the default names for multi-language exports.")
         return
 
@@ -2313,10 +2329,21 @@ def cmd_extract(args, config):
         return
 
     verb = "Extracting" if args.write else "Previewing"
-    print(f"{verb} {book_name} {chapter}:{format_verses_label(verses)} for {', '.join(langs)}...")
+    target = f"first available of {', '.join(langs)}" if any_mode else ", ".join(langs)
+    print(f"{verb} {book_name} {chapter}:{format_verses_label(verses)} for {target}...")
 
     results = []
-    if len(langs) > 1:
+    if any_mode:
+        failures = []
+        for lang in langs:
+            result = extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state)
+            if result[2] is None:
+                results = [result]
+                break
+            failures.append(result)
+        else:
+            results = failures
+    elif len(langs) > 1:
         workers = int(config.get("extract_workers", DEFAULT_CONFIG["extract_workers"]) or 1)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(extract_one_lang, lang, book_name, book_num, chapter, verses, args, config, state) for lang in langs]
@@ -2594,16 +2621,16 @@ def main():
     p_sync.add_argument("-q", "--quiet", action="store_true", help="Suppress per-language progress output (used internally by the background auto-sync)")
 
     p_extract = subparsers.add_parser("extract", help="Extract and overlay verses from a chapter")
-    p_extract.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
+    p_extract.add_argument("lang", help="Sign language code, comma list, 'all', or 'any' (first available in configured order)")
     p_extract.add_argument("reference", nargs="+", help="Bible reference (e.g., Rev 13:1, 2; quoting is optional)")
     p_extract.add_argument("-f", "--write", action="store_true", help="Encode and save the output file. Default is preview-only: play the verse with its overlay (delogo box shown, not applied) and write nothing.")
     p_extract.add_argument("-o", "--output", help="Output media filename (requires --write and one language)")
     p_extract.add_argument("-q", "--quiet", action="store_true", help="Suppress source/cache status lines (progress and errors still show)")
     p_extract.add_argument("-m", "--play", action="store_true", help="With --write, also play the finished file via mpv. Without --write, preview via mpv instead of ffplay.")
-    p_extract.add_argument("--interpolate", action="store_true", help="Force interpolation on output")
+    p_extract.add_argument("-i", "--interpolate", action="store_true", help="Force interpolation on output")
     p_extract.add_argument("--onthefly", action="store_true", help="Stream-extract from the source URL; never store the full chapter on disk (default)")
-    p_extract.add_argument("--cache", action="store_true", help="Download and keep the full chapter in the local cache instead of streaming on the fly")
-    p_extract.add_argument("--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
+    p_extract.add_argument("-c", "--cache", action="store_true", help="Download and keep the full chapter in the local cache instead of streaming on the fly")
+    p_extract.add_argument("-n", "--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
     p_extract.add_argument("--keep-end-transition", action="store_true", help="Keep the trailing fade-out/copyright-endscreen this once, overriding trim_end_transition for this run only")
     p_extract.add_argument("--trim-mid-transitions", action="store_true", help="Also cut mid-range paragraph transitions inside a multi-verse range this once, overriding trim_mid_transitions for this run only")
     p_extract.add_argument("-s", "--offset-start", type=float, metavar="SECONDS", help="Nudge the verse range's own start by this many seconds (either sign) - e.g. 5.302 to skip the first 5.302s and play to the natural end")

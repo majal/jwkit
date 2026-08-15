@@ -24,6 +24,7 @@ class SmokeTest(unittest.TestCase):
             py_compile.compile(str(REPO_ROOT / "jwvideo-mux"), cfile=f"{tmpdir}/jwvideo_mux.pyc", doraise=True)
             py_compile.compile(str(REPO_ROOT / "slverse"), cfile=f"{tmpdir}/slverse.pyc", doraise=True)
             py_compile.compile(str(REPO_ROOT / "ffrife"), cfile=f"{tmpdir}/ffrife.pyc", doraise=True)
+            py_compile.compile(str(REPO_ROOT / "ffv"), cfile=f"{tmpdir}/ffv.pyc", doraise=True)
             py_compile.compile(str(REPO_ROOT / "ffinpaint"), cfile=f"{tmpdir}/ffinpaint.pyc", doraise=True)
             py_compile.compile(str(REPO_ROOT / "jwdl"), cfile=f"{tmpdir}/jwdl.pyc", doraise=True)
 
@@ -48,6 +49,11 @@ class SmokeTest(unittest.TestCase):
         result = self.run_script("slverse", "benchmark", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--apply", result.stdout)
+
+    def test_ffv_help(self) -> None:
+        result = self.run_script("ffv", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ffv any", result.stdout)
 
     def test_ffinpaint_help(self) -> None:
         result = self.run_script("ffinpaint", "--help")

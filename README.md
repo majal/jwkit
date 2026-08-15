@@ -15,6 +15,7 @@ Each tool below has its own section covering what it does, what it needs, and th
 - [Tools](#tools)
   - [`ffinpaint`](#ffinpaint)
   - [`ffrife`](#ffrife)
+  - [`ffv`](#ffv)
   - [`jwdl`](#jwdl)
   - [`jwpl`](#jwpl)
   - [`jwvideo-mux`](#jwvideo-mux)
@@ -27,7 +28,7 @@ Each tool below has its own section covering what it does, what it needs, and th
 
 ## Quick Install
 
-One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `jwdl`, `jwpl`, `ffinpaint`, `ffrife`, and `jwvideo-mux` just work. No manual downloads, no separate setup steps.
+One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `ffv`, `jwdl`, `jwpl`, `ffinpaint`, `ffrife`, and `jwvideo-mux` just work. No manual downloads, no separate setup steps.
 
 **macOS or Linux** (Terminal):
 
@@ -88,6 +89,14 @@ Full docs: [docs/ffinpaint.md](docs/ffinpaint.md)
 `ffrife` interpolates any video to a higher frame rate using `rife-ncnn-vulkan`, a GPU-accelerated AI model that generates real in-between frames instead of just blending adjacent ones. It works on any local file or URL, JW-related or not — trim a section, add an `ffmpeg` filter, or retime the speed, all in a single pass. `slverse` uses it as a library for its own interpolation instead of duplicating the logic.
 
 Full docs: [docs/ffrife.md](docs/ffrife.md)
+
+[↑ TOC](#table-of-contents)
+
+### [`ffv`](./ffv)
+
+`ffv` preserves the original command name and compact `ffv <language> <reference>` muscle memory while delegating all lookup, playback, and encoding to `slverse`. It also keeps the familiar `any` and `all` selection modes without maintaining a second video engine.
+
+Full docs: [docs/ffv.md](docs/ffv.md)
 
 [↑ TOC](#table-of-contents)
 
