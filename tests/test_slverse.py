@@ -252,15 +252,15 @@ class SlverseBookNameTest(unittest.TestCase):
         }}}}
 
     def test_vietnamese_lookup_ignores_case_and_tone_marks(self) -> None:
-        state = {"_book_metadata": {"V": self.metadata()}}
-        self.assertEqual(self.slverse.resolve_book_number("PHUC TRUYEN LUAT LE", "V", state), 5)
+        state = {"_book_metadata": {"VT": self.metadata()}}
+        self.assertEqual(self.slverse.resolve_book_number("PHUC TRUYEN LUAT LE", "VT", state), 5)
 
     def test_book_language_priority_falls_back(self) -> None:
         state = {"_book_metadata": {
-            "V": self.metadata(),
+            "VT": self.metadata(),
             "E": self.metadata("Deuteronomy", "Deut."),
         }}
-        self.assertEqual(self.slverse.resolve_book_number("Deuteronomy", "V,E", state), 5)
+        self.assertEqual(self.slverse.resolve_book_number("Deuteronomy", "VT,E", state), 5)
 
 
 class SlverseEncodeArgsTest(unittest.TestCase):
