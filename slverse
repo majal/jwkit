@@ -136,7 +136,7 @@ DEFAULT_CONFIG = {
     "preview_window_size": "65%",  # multi-language preview windows (slverse find --play, or 'ffv all <ref> -p'), as an mpv --autofit percentage of screen size - ignored for a single-language preview, which still autoplays fullscreen
     "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
     "font_family": "noto-sans-display",  # noto-sans-display, inter, google-sans-flex - see FONT_FAMILIES
-    "api_language": "E",  # Priority-ordered language codes for book names (e.g. "V,E" for Vietnamese then English)
+    "api_language": "E",  # Priority-ordered language codes for book names (e.g. "VT,E" for Vietnamese then English)
     "ffmpeg_binary": "",  # override auto-detection, e.g. /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg-full
     "ffprobe_binary": "",
     "ffplay_binary": "",  # override auto-detection, used for preview (extract without --write)
@@ -190,7 +190,7 @@ CONFIG_HELP = {
     "font_family": "noto-sans-display, inter, or google-sans-flex",
     "font_weight_main": "Google Fonts weight for the drawn verse-reference label",
     "font_weight_estimator": "Google Fonts weight used only to size the delogo box",
-    "api_language": "Priority-ordered language codes for book names (e.g. V,E for Vietnamese then English)",
+    "api_language": "Priority-ordered language codes for book names (e.g. VT,E for Vietnamese then English)",
     "ffmpeg_binary": "Override ffmpeg binary auto-detection",
     "ffprobe_binary": "Override ffprobe binary auto-detection",
     "ffplay_binary": "Override ffplay binary auto-detection (used for preview)",
