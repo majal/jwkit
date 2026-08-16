@@ -73,7 +73,10 @@ DESCRIPTIONS = {
     "ffprobe": "ffprobe executable used to read media duration",
 }
 
-# Small valid PNG used only if thumbnail extraction fails and --allow-fallback-thumbnail is set.
+# Small valid 1x1 PNG substituted whenever ffmpeg fails to extract a real
+# thumbnail from a source file - see the warning printed at the fallback
+# site in create_playlist, below, so a batch build doesn't hard-fail on one
+# bad file but the operator still finds out a thumbnail is blank.
 DEFAULT_THUMBNAIL = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
@@ -246,7 +249,10 @@ def presentation_labels(media: list[Path], settings: dict[str, Any]) -> list[str
     labels = []
     for position, (path, source_number) in enumerate(zip(media, source_numbers), start=1):
         if settings["video_title_source"] == "metadata" and path.suffix.lower() not in IMAGE_EXTENSIONS:
-            title = _embedded_title(path, settings) or path.stem
+            try:
+                title = _embedded_title(path, settings) or path.stem
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(f"could not read embedded title from {path.name}: {exc}") from exc
         else:
             title = path.name
         if settings["number_titles"]:
@@ -309,16 +315,21 @@ def create_playlist(directory: Path, output: Path, name: str, settings: dict[str
             thumb_mime = "image/jpeg"
             try:
                 _make_thumbnail(source, temp / thumb_name, settings)
-            except (OSError, subprocess.CalledProcessError):
+            except (OSError, subprocess.CalledProcessError) as exc:
                 thumb_name = f"{str(uuid.uuid4()).upper()}.png"
                 thumb_mime = "image/png"
                 (temp / thumb_name).write_bytes(DEFAULT_THUMBNAIL)
+                print(f"Warning: could not extract a thumbnail for {source.name} ({exc}); using a blank one.")
             thumb_id = next_media_id
             next_media_id += 1
             connection.execute("INSERT INTO IndependentMedia VALUES(?,?,?,?,?)", (thumb_id, source.name, thumb_name, thumb_mime, _sha256(temp / thumb_name)))
             item_id = position + 1
             connection.execute("INSERT INTO PlaylistItem VALUES(?,?,?,?,?,?,?)", (item_id, label, None, None, 1, int(settings["end_action"]), thumb_name))
-            connection.execute("INSERT INTO PlaylistItemIndependentMediaMap VALUES(?,?,?)", (item_id, media_id, _duration_ticks(source, settings)))
+            try:
+                duration_ticks = _duration_ticks(source, settings)
+            except (subprocess.CalledProcessError, ValueError) as exc:
+                raise RuntimeError(f"could not read duration from {source.name}: {exc}") from exc
+            connection.execute("INSERT INTO PlaylistItemIndependentMediaMap VALUES(?,?,?)", (item_id, media_id, duration_ticks))
             connection.execute("INSERT INTO TagMap(TagMapId,PlaylistItemId,TagId,Position) VALUES(?,?,1,?)", (item_id, item_id, position))
         connection.execute("UPDATE LastModified SET LastModified=?", (now,))
         connection.commit()
@@ -526,10 +537,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{item['position']:>3}  {item['label']}")
             return 0
         if args.command == "init":
-            path = args.directory.expanduser().resolve() / DIRECTORY_CONFIG
+            resolved_directory = args.directory.expanduser().resolve()
+            path = resolved_directory / DIRECTORY_CONFIG
             if path.exists() and not args.force:
                 raise ValueError(f"already exists: {path} (use --force to replace)")
-            _write_toml(path, {**DEFAULTS, "name": args.directory.resolve().name})
+            _write_toml(path, {**DEFAULTS, "name": resolved_directory.name})
             print(f"Created {path}")
             return 0
         saved = _read_toml(CONFIG_FILE)
@@ -546,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
             _write_toml(CONFIG_FILE, saved)
             print(f"Set {args.key} = {_toml_value(saved[args.key])}")
         return 0
-    except (OSError, ValueError, sqlite3.Error, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
         print(color.red(f"jwpl: {exc}"), file=os.sys.stderr)
         return 2
 

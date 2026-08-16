@@ -1,9 +1,13 @@
 import importlib.util
+import io
+import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
@@ -55,7 +59,8 @@ class JwplTest(unittest.TestCase):
     def test_thumbnail_fallback_is_png_in_database(self):
         (self.root / "01 image.jpg").write_bytes(b"image")
         output = self.root / "fallback.jwlplaylist"
-        with mock.patch.object(module, "_make_thumbnail", side_effect=OSError("no ffmpeg")):
+        buf = io.StringIO()
+        with mock.patch.object(module, "_make_thumbnail", side_effect=OSError("no ffmpeg")), redirect_stdout(buf):
             module.create_playlist(self.root, output, "Fallback", {**module.DEFAULTS, "include": ["*.jpg"]})
         with zipfile.ZipFile(output) as archive:
             archive.extract("userData.db", self.root / "fallback-unpacked")
@@ -64,6 +69,40 @@ class JwplTest(unittest.TestCase):
         mime = db.execute("SELECT MimeType FROM IndependentMedia WHERE FilePath=(SELECT ThumbnailFilePath FROM PlaylistItem)").fetchone()[0]
         self.assertEqual(mime, "image/png")
         db.close()
+        # A silent, unconditional fallback used to leave the operator with
+        # no idea a blank thumbnail was used, or for which file.
+        self.assertIn("01 image.jpg", buf.getvalue())
+
+    def test_duration_failure_names_the_offending_file(self):
+        # Any single bad file's ffprobe failure used to surface as a bare
+        # "could not convert string to float: 'N/A'" with no indication of
+        # which file (out of a potentially large batch) caused it.
+        (self.root / "01 image.jpg").write_bytes(b"image")
+        output = self.root / "bad-duration.jwlplaylist"
+        with mock.patch.object(module, "_make_thumbnail", side_effect=lambda source, destination, settings: destination.write_bytes(module.DEFAULT_THUMBNAIL)), \
+             mock.patch.object(module, "_duration_ticks", side_effect=ValueError("could not convert string to float: 'N/A'")):
+            with self.assertRaises(RuntimeError) as ctx:
+                module.create_playlist(self.root, output, "Bad Duration", {**module.DEFAULTS, "include": ["*.jpg"]})
+        self.assertIn("01 image.jpg", str(ctx.exception))
+
+    def test_embedded_title_failure_names_the_offending_file(self):
+        settings = {**module.DEFAULTS, "video_title_source": "metadata", "number_titles": False}
+        with mock.patch.object(module, "_embedded_title", side_effect=subprocess.CalledProcessError(1, ["ffprobe"])):
+            with self.assertRaises(RuntimeError) as ctx:
+                module.presentation_labels([self.root / "clip.mp4"], settings)
+        self.assertIn("clip.mp4", str(ctx.exception))
+
+    def test_init_expands_tilde_consistently_for_path_and_name(self):
+        # The written config's 'name' field used to skip .expanduser(),
+        # diverging from the path actually written to only when the
+        # directory argument was literally '~' (no subpath).
+        with tempfile.TemporaryDirectory() as home_dir:
+            home = Path(home_dir)
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                rc = module.main(["init", "~"])
+            self.assertEqual(rc, 0)
+            config = module._read_toml(home / module.DIRECTORY_CONFIG)
+            self.assertEqual(config["name"], home.name)
 
     def test_every_default_has_a_create_flag(self):
         create_parser = next(action for action in module.build_parser()._subparsers._group_actions).choices["create"]
