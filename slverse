@@ -118,7 +118,7 @@ FONT_ESTIMATOR_WEIGHT = "400"  # Regular - old ffv's delogo-sizing estimator wei
 DEFAULT_CONFIG = {
     "cache_dir": str(DEFAULT_CACHE_DIR),
     "cache_policy": "lru",  # keep_all, lru, delete_after_use
-    "cache_max_size": "5G",  # unix-style size: K/M/G/T/P/E (decimal SI) or Ki/Mi/Gi/Ti/Pi/Ei (binary IEC) - see _jwkit_common.parse_size
+    "cache_max_size": "1G",  # unix-style size: K/M/G/T/P/E (decimal SI) or Ki/Mi/Gi/Ti/Pi/Ei (binary IEC) - see _jwkit_common.parse_size
     "extract_mode": "cache",  # cache by default: reuse a verified chapter; --onthefly is the explicit streaming escape hatch
     "hardware_encoder": "cpu",  # nvenc, videotoolbox, qsv, cpu
     "video_codec": "av1",  # h264, hevc, av1 - royalty-free and meaningfully smaller than hevc at matched quality; falls back to hevc then h264 automatically if this machine/ffmpeg build can't actually encode it (see build_encode_args)
@@ -394,6 +394,15 @@ def focus_process(pid):
         if result.returncode == 0:
             return
 
+def parse_mpv_options(value):
+    """Parse persisted/CLI mpv options as a shell-style argument list."""
+    value = str(value or "").strip()
+    quote_pairs = {'"': '"', "'": "'", "“": "”", "‘": "’"}
+    if len(value) >= 2 and quote_pairs.get(value[0]) == value[-1]:
+        value = value[1:-1]
+    return shlex.split(value)
+
+
 def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, geometry=None, autofit=None, config=None):
     """Spawn mpv with `args` and try to bring it to the front on every OS.
     --force-window=immediate plus mpv's own --focus-on=open default (mpv
@@ -429,7 +438,7 @@ def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, g
     if geometry:
         cmd.append(f"--geometry={geometry}")
     if config is not None and str(config.get("mpv_options", "")).strip():
-        cmd += shlex.split(str(config["mpv_options"]))
+        cmd += parse_mpv_options(config["mpv_options"])
     cmd += list(args)
     proc = subprocess.Popen(cmd)
     focus_process(proc.pid)
@@ -1723,12 +1732,21 @@ def normalize_book_name(value):
                    if not unicodedata.combining(ch))
 
 
-def resolve_book_number(book_name, lang="E", state=None, config=None):
+BOOK_NAME_FIELDS = (
+    "standardName", "standardAbbreviation", "officialAbbreviation",
+    "standardSingularBookName", "standardSingularAbbreviation",
+    "officialSingularAbbreviation", "standardPluralBookName",
+    "standardPluralAbbreviation", "officialPluralAbbreviation",
+    "bookDisplayTitle",
+)
+
+
+def resolve_book(book_name, lang="E", state=None, config=None):
     """Book names/numbers are static, so the study-bible metadata (one
     network call per language) is cached in state.json instead of being
-    re-fetched on every extract/find."""
-    if book_name.isdigit():
-        return int(book_name)
+    re-fetched on every extract/find. Return the matched standardName too so
+    aliases never leak into rendered references or output metadata."""
+    requested_number = int(book_name) if book_name.isdigit() else None
 
     needle = normalize_book_name(book_name)
     languages = [item.strip().upper() for item in str(lang).split(",") if item.strip()]
@@ -1741,16 +1759,31 @@ def resolve_book_number(book_name, lang="E", state=None, config=None):
         if not metadata:
             continue
         for b_id, b_data in metadata.get("editionData", {}).get("books", {}).items():
-            candidates = (
-                b_data.get("standardName", ""), b_data.get("standardAbbreviation", ""),
-                b_data.get("standardSingularBookName", ""), b_data.get("standardSingularAbbreviation", ""),
-                b_data.get("standardPluralBookName", ""), b_data.get("standardPluralAbbreviation", ""),
-                b_data.get("officialAbbreviation", ""), b_data.get("officialSingularAbbreviation", ""),
-                b_data.get("officialPluralAbbreviation", ""),
-            )
+            candidates = [b_data.get(field, "") for field in BOOK_NAME_FIELDS]
+            number_matches = requested_number is not None and int(b_id) == requested_number
+            name_matches = requested_number is None and any(needle == normalize_book_name(candidate) for candidate in candidates if candidate)
+            if number_matches or name_matches:
+                standard_name = b_data.get("standardName") or b_data.get("standardSingularBookName") or b_data.get("bookDisplayTitle") or book_name
+                return int(b_id), standard_name
+    if requested_number is not None:
+        return requested_number, book_name
+    # Preserve the historical forgiving partial match as a fallback only;
+    # exact aliases above avoid short names selecting an earlier book.
+    for language in languages or ["E"]:
+        metadata = state.get("_book_metadata", {}).get(language) if state is not None else None
+        if not metadata:
+            continue
+        for b_id, b_data in metadata.get("editionData", {}).get("books", {}).items():
+            candidates = [b_data.get(field, "") for field in BOOK_NAME_FIELDS]
             if any(needle in normalize_book_name(candidate) for candidate in candidates if candidate):
-                return int(b_id)
-    return None
+                standard_name = b_data.get("standardName") or b_data.get("standardSingularBookName") or b_data.get("bookDisplayTitle") or book_name
+                return int(b_id), standard_name
+    return None, None
+
+
+def resolve_book_number(book_name, lang="E", state=None, config=None):
+    """Backward-compatible number-only wrapper."""
+    return resolve_book(book_name, lang, state, config)[0]
 
 def verse_markers(file):
     """GETPUBMEDIALINKS wraps the per-verse marker list in a dict alongside
@@ -2459,16 +2492,19 @@ def cmd_extract(args, config):
         return
 
     state = get_state()
-    book_num = resolve_book_number(book_name, config.get("api_language", "E"), state=state, config=config)
+    book_num, standard_book_name = resolve_book(book_name, config.get("api_language", "E"), state=state, config=config)
     if not book_num:
         common = {"gen": 1, "ex": 2, "ps": 19, "psalms": 19, "prov": 20, "matt": 40, "rev": 66, "revelation": 66}
         for k, v in common.items():
             if k in book_name.lower():
                 book_num = v
+                standard_book_name = book_name
                 break
     if not book_num:
         print(f"Could not resolve book number for {book_name}. Try the book number directly (e.g., '66 13:1, 2').")
         return
+
+    book_name = standard_book_name or book_name
 
     if not args.write and len(langs) > 1 and not any_mode:
         print(f"Preview mode only plays one language at a time (got {', '.join(langs)}).")

@@ -288,6 +288,18 @@ class SlverseBookNameTest(unittest.TestCase):
         self.assertEqual(self.slverse.resolve_book_number("Pss", "E", state), 19)
         self.assertEqual(self.slverse.resolve_book_number("psalm", "E", state), 19)
 
+    def test_every_supported_alias_resolves_to_standard_name(self) -> None:
+        book = {
+            "standardName": "Khải huyền", "standardAbbreviation": "Kh", "officialAbbreviation": "Kh.",
+            "standardSingularBookName": "Khải huyền singular", "standardSingularAbbreviation": "Khs", "officialSingularAbbreviation": "Khs.",
+            "standardPluralBookName": "Khải huyền plural", "standardPluralAbbreviation": "Khp", "officialPluralAbbreviation": "Khp.",
+            "bookDisplayTitle": "Sách Khải huyền",
+        }
+        state = {"_book_metadata": {"VT": {"editionData": {"books": {"66": book}}}}}
+        for value in list(book.values()) + ["66"]:
+            with self.subTest(value=value):
+                self.assertEqual(self.slverse.resolve_book(value, "VT", state), (66, "Khải huyền"))
+
 
 class SlverseBibleMetadataUrlTest(unittest.TestCase):
     """get_bible_metadata's URL isn't a simple locale-prefix swap - jw.org
@@ -1618,6 +1630,24 @@ class SlverseLaunchMpvTest(unittest.TestCase):
         self.slverse.launch_mpv(["file.mp4"], config={"mpv_show_osc": "false"})
         self.assertIn("--osc=no", self.captured_cmd[0])
 
+    def test_configured_mpv_options_are_split_into_individual_flags(self) -> None:
+        options = "--no-config --speed=1.0 --no-native-fs --fs --no-border --ontop --no-keep-open --screen=1"
+        self.slverse.launch_mpv(["file.mp4"], config={"mpv_options": options})
+        cmd = self.captured_cmd[0]
+        self.assertEqual(cmd[-9:-1], options.split())
+        self.assertEqual(cmd[-1], "file.mp4")
+
+    def test_mpv_options_loaded_from_config_file_reach_mpv_unchanged(self) -> None:
+        options = "--no-config --speed=1.0 --no-native-fs --fs --no-border --ontop --no-keep-open --screen=1"
+        with tempfile.TemporaryDirectory() as td:
+            self.slverse.CONFIG_FILE = Path(td) / "config.toml"
+            self.slverse.CONFIG_FILE.write_text(f'mpv_options = "{options}"\n')
+            self.slverse.launch_mpv(["file.mp4"], config=self.slverse.load_config())
+        self.assertEqual(self.captured_cmd[0][-9:-1], options.split())
+
+    def test_rich_text_outer_quotes_do_not_become_part_of_mpv_flags(self) -> None:
+        self.assertEqual(self.slverse.parse_mpv_options("“--fs --screen=1”"), ["--fs", "--screen=1"])
+
 
 class SlverseAddToPathProfileTest(unittest.TestCase):
     @classmethod
@@ -1728,7 +1758,7 @@ class SlverseConfigCommandTest(unittest.TestCase):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.slverse.cmd_config(args, dict(self.slverse.DEFAULT_CONFIG))
         output = out.getvalue()
-        self.assertIn("cache_max_size = 5G", output)
+        self.assertIn("cache_max_size = 1G", output)
         self.assertIn("Cache size cap", output)
 
     def test_config_set_updates_and_saves(self) -> None:
