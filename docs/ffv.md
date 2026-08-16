@@ -23,7 +23,7 @@ Install jwkit normally, then configure `slverse` once with `slverse setup`.
 ## Common Usage Examples
 
 ```bash
-ffv FSL Rev. 21:1-3
+ffv FSL Rev 21:1-3
 ffv any 1 Sa-mu-en 2:12-17
 ffv all Ge 10:2 -p
 ```
