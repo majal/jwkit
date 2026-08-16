@@ -28,6 +28,7 @@ class SmokeTest(unittest.TestCase):
             py_compile.compile(str(REPO_ROOT / "ffinpaint"), cfile=f"{tmpdir}/ffinpaint.pyc", doraise=True)
             py_compile.compile(str(REPO_ROOT / "jwdl"), cfile=f"{tmpdir}/jwdl.pyc", doraise=True)
             py_compile.compile(str(REPO_ROOT / "jwpl"), cfile=f"{tmpdir}/jwpl.pyc", doraise=True)
+            py_compile.compile(str(REPO_ROOT / "register-jwplay-launcher"), cfile=f"{tmpdir}/register_jwplay_launcher.pyc", doraise=True)
 
     def test_jwvideo_mux_help(self) -> None:
         result = self.run_script("jwvideo-mux", "--help")
@@ -68,6 +69,11 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("setup", result.stdout)
         self.assertIn("run", result.stdout)
+
+    def test_register_jwplay_launcher_help(self) -> None:
+        result = self.run_script("register-jwplay-launcher", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("jwplay", result.stdout)
 
     def test_slverse_config_defaults(self) -> None:
         result = self.run_script("slverse", "config", "list")

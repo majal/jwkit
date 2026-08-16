@@ -6,7 +6,7 @@
 $ErrorActionPreference = "Stop"
 $JwkitHome = if ($env:JWKIT_HOME) { $env:JWKIT_HOME } else { Join-Path $HOME ".jwkit" }
 $DefaultHome = Join-Path $HOME ".jwkit"
-$Tools = @("ffinpaint", "ffrife", "ffv", "jwdl", "jwpl", "jwvideo-mux", "slverse")
+$Tools = @("ffinpaint", "ffrife", "ffv", "jwdl", "jwpl", "jwvideo-mux", "register-jwplay-launcher", "slverse")
 
 function Stop-Uninstall($msg) { Write-Host "jwkit uninstall: $msg" -ForegroundColor Red; exit 1 }
 function Write-Ok($msg) { Write-Host $msg -ForegroundColor Green }

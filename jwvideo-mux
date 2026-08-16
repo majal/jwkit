@@ -44,7 +44,8 @@ KNOWN_LANGUAGES = {
 
 # Extension for the double-clickable mpv launcher scripts written by write_mpv_command_launcher.
 # A custom extension (rather than reusing .command) lets these carry their own file-association setup
-# (register-jwplay-launcher.sh on macOS/duti, xdg-mime on Linux) distinct from generic shell scripts.
+# (see the sibling register-jwplay-launcher tool - macOS/duti, Linux/xdg-mime, Windows/registry)
+# distinct from generic shell scripts.
 LAUNCHER_EXTENSION = ".jwplay"
 
 # Resolved once at startup by main() -> _jwkit_common.resolve_color_enabled.

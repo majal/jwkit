@@ -130,7 +130,9 @@ Use a pre-downloaded local file:
   directly to the output directory instead of building an unnecessary EDL
   library folder. Play a language with e.g. `mpv presentation-tg.edl
   --audio-file=audio-tg.mka --sub-file=subtitles-tg.srt`, or just
-  double-click the generated `.jwplay` launcher file — no terminal needed.
+  double-click the generated `.jwplay` launcher file — no terminal needed (run
+  [`register-jwplay-launcher`](register-jwplay-launcher.md) once first so your
+  OS knows what to do with the `.jwplay` extension).
   That launcher lands in the *output directory* (the unit root, one level up
   from the library folder) by default, named after the same
   `{docid}_{lang}_{res} (Title)` convention the source downloads and the

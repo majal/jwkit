@@ -16,7 +16,7 @@ $ErrorActionPreference = "Stop"
 $RepoUrl = "https://github.com/majal/jwkit"
 $RepoZip = "$RepoUrl/archive/refs/heads/main.zip"
 $JwkitHome = if ($env:JWKIT_HOME) { $env:JWKIT_HOME } else { Join-Path $HOME ".jwkit" }
-$Tools = @("ffinpaint", "ffrife", "ffv", "jwdl", "jwpl", "jwvideo-mux", "slverse")
+$Tools = @("ffinpaint", "ffrife", "ffv", "jwdl", "jwpl", "jwvideo-mux", "register-jwplay-launcher", "slverse")
 $InstalledPackageIds = @()
 
 function Write-Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
