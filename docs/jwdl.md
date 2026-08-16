@@ -96,7 +96,7 @@ Download at a smaller resolution than the default:
 - `jwdl video` defaults to `720p`; if a specific video doesn't have that exact rendition, it picks the closest one at or below your target, or the smallest available if even that's too big. Videos default to `~/Videos/JW Videos/<category name>`.
 - `jwdl video` with no category (or any category that's just a folder of subcategories, like `VideoOnDemand`) lists what's inside instead of trying to download nothing — keep going deeper (`jwdl video VODBible`, etc.) until you reach one that lists actual videos.
 - `jwdl all` (music), `jwdl periodicals all`, and `jwdl video` are entirely separate commands — `all` never implicitly includes periodicals or video, so anything already scripting `jwdl all` keeps its exact original behavior.
-- A config file at `~/.config/jwkit/jwdl/config.json` can add music pub codes jw.org releases later without touching the script (`{"pubs": {"newcode": "Folder Name"}}`), override `base_dir`/`workers`, or set `periodicals_base_dir`/`video_base_dir`.
+- A config file at `~/.config/jwkit/jwdl/config.json` can add music pub codes jw.org releases later without touching the script (`{"pubs": {"newcode": "Folder Name"}}`), override `base_dir`/`workers`, or set `periodicals_base_dir`/`video_base_dir`. `workers` (parallel downloads per pub, default 4) can also be overridden for a single run with `--workers N`, without touching the config file.
 - Downloads are written to a `.part` file and only renamed into place once the checksum matches, so an interrupted run never leaves a broken file sitting in the library.
 
 ## Notes / Caveats

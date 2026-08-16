@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import io
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 from tests.support import load_script_module
@@ -92,6 +95,90 @@ class JwdlResolvePubsTest(unittest.TestCase):
         pubs = self.jwdl.resolve_pubs({"pubs": {"newcode": "New Collection"}})
         self.assertEqual(pubs["newcode"], "New Collection")
         self.assertNotIn("newcode", self.jwdl.PUBS)
+
+
+class JwdlDownloadWithRetryTest(unittest.TestCase):
+    """download_track/download_periodical_file/download_video all delegate
+    their actual network fetch to this one shared helper now (previously
+    triplicated, full-buffer-then-rehash logic in each) - test the shared
+    streaming/checksum/retry behavior directly here."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    @staticmethod
+    def _fake_response(payload: bytes):
+        class FakeResponse:
+            def __init__(self):
+                self._buf = io.BytesIO(payload)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, size=-1):
+                return self._buf.read(size)
+
+        return FakeResponse()
+
+    def test_streams_content_to_dest_path_and_cleans_up_tmp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "file.mp3"
+            with mock.patch.object(self.jwdl.urllib.request, "urlopen", return_value=self._fake_response(b"hello world")):
+                error = self.jwdl.download_with_retry("http://example/file.mp3", dest)
+            self.assertIsNone(error)
+            self.assertEqual(dest.read_bytes(), b"hello world")
+            self.assertFalse(dest.with_suffix(dest.suffix + ".part").exists())
+
+    def test_correct_checksum_is_accepted(self) -> None:
+        content = b"hello world"
+        digest = hashlib.md5(content).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "file.mp3"
+            with mock.patch.object(self.jwdl.urllib.request, "urlopen", return_value=self._fake_response(content)):
+                error = self.jwdl.download_with_retry("http://example/file.mp3", dest, expected_checksum=digest)
+            self.assertIsNone(error)
+
+    def test_checksum_mismatch_fails_without_leaving_a_partial_or_final_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "file.mp3"
+            with mock.patch.object(self.jwdl.urllib.request, "urlopen", return_value=self._fake_response(b"data")), \
+                 mock.patch.object(self.jwdl.time, "sleep"):
+                error = self.jwdl.download_with_retry("http://example/file.mp3", dest, expected_checksum="deadbeef")
+            self.assertIsNotNone(error)
+            self.assertIn("checksum mismatch", error)
+            self.assertFalse(dest.exists())
+            self.assertFalse(dest.with_suffix(dest.suffix + ".part").exists())
+
+    def test_transient_failure_then_success_retries_and_succeeds(self) -> None:
+        attempts = []
+
+        def flaky_urlopen(req, timeout=None):
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise OSError("network blip")
+            return self._fake_response(b"ok")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "file.mp3"
+            with mock.patch.object(self.jwdl.urllib.request, "urlopen", side_effect=flaky_urlopen), \
+                 mock.patch.object(self.jwdl.time, "sleep"):
+                error = self.jwdl.download_with_retry("http://example/file.mp3", dest)
+            self.assertIsNone(error)
+            self.assertEqual(len(attempts), 2)
+
+    def test_exhausting_all_retries_returns_an_error_string(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "file.mp3"
+            with mock.patch.object(self.jwdl.urllib.request, "urlopen", side_effect=OSError("down")), \
+                 mock.patch.object(self.jwdl.time, "sleep"):
+                error = self.jwdl.download_with_retry("http://example/file.mp3", dest)
+            self.assertIsNotNone(error)
+            self.assertIn("down", error)
+            self.assertFalse(dest.with_suffix(dest.suffix + ".part").exists())
 
 
 class JwdlDownloadTrackTest(unittest.TestCase):
