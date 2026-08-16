@@ -4,8 +4,12 @@
 #
 # Installs Python/ffmpeg/git if missing (via winget), downloads jwkit to
 # %USERPROFILE%\.jwkit, adds it to your PATH, and sets up a jwkit-update
-# command. Safe to re-run - re-running this script (or jwkit-update) updates
-# jwkit in place.
+# command. Safe to re-run to update jwkit in place - but unlike install.sh
+# (a real git checkout, so local edits are detected and preserved), this
+# downloads a fresh zip and replaces %USERPROFILE%\.jwkit's contents
+# outright, so any direct edits made there are discarded. Keep changes of
+# your own outside that folder, or in your own git clone pointed at via
+# JWKIT_HOME.
 
 $ErrorActionPreference = "Stop"
 
@@ -24,6 +28,19 @@ function Test-Command($name) {
     return [bool](Get-Command $name -ErrorAction SilentlyContinue)
 }
 
+function Install-WingetPackage($id) {
+    # $ErrorActionPreference = "Stop" only catches terminating PowerShell
+    # errors - it does NOT catch a non-zero exit code from a native .exe
+    # like winget.exe, so a failed install (network blip, pending-reboot
+    # lock, UAC declined, ...) used to be silently treated as success and
+    # the script kept going, right through writing shims that call a
+    # binary that was never actually installed.
+    winget install --id $id -e --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -ne 0) {
+        throw "winget install --id $id failed (exit code $LASTEXITCODE)"
+    }
+}
+
 Write-Step "Setting up jwkit"
 
 try {
@@ -40,17 +57,17 @@ try {
     $havePython = (Test-Command py) -or (Test-Command python)
     if (-not $havePython) {
         Write-Warn "Installing Python..."
-        winget install --id Python.Python.3 -e --accept-source-agreements --accept-package-agreements
+        Install-WingetPackage "Python.Python.3"
         $InstalledPackageIds += "Python.Python.3"
     }
     if (-not (Test-Command ffmpeg)) {
         Write-Warn "Installing ffmpeg..."
-        winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements
+        Install-WingetPackage "Gyan.FFmpeg"
         $InstalledPackageIds += "Gyan.FFmpeg"
     }
     if (-not (Test-Command git)) {
         Write-Warn "Installing git..."
-        winget install --id Git.Git -e --accept-source-agreements --accept-package-agreements
+        Install-WingetPackage "Git.Git"
         $InstalledPackageIds += "Git.Git"
     }
     if ($havePython -and (Test-Command ffmpeg) -and (Test-Command git)) {
@@ -73,6 +90,21 @@ try {
         try { $previousDependencies = @((Get-Content $statePath -Raw | ConvertFrom-Json).dependencies) } catch { }
     }
     if (Test-Path $JwkitHome) {
+        $dotGit = Join-Path $JwkitHome ".git"
+        if (Test-Path $dotGit) {
+            # A real git checkout at $JwkitHome (e.g. hand-set up by a
+            # developer pointing JWKIT_HOME at their own clone) - mirror
+            # install.sh's own guard rather than blowing away uncommitted
+            # work the way the normal zip-based wipe-and-replace below does.
+            $gitStatus = & git -C $JwkitHome status --porcelain 2>$null
+            if ($gitStatus) {
+                Write-Warn "Local changes found in $JwkitHome (it's a git checkout); leaving it untouched."
+                Write-Warn "Commit, stash, or remove them, then run this installer again."
+                exit 0
+            }
+        } else {
+            Write-Warn "Replacing the existing install at $JwkitHome - this download-and-replace (unlike install.sh's git-based update) discards any direct edits made there, not just installer-managed files."
+        }
         Remove-Item -Recurse -Force $JwkitHome
     }
     New-Item -ItemType Directory -Path $JwkitHome -Force | Out-Null
