@@ -23,7 +23,10 @@ DEFAULT_CONFIG = {
     "e2fgvi_root": "",
     "e2fgvi_checkpoint": "",
     "fallback": "blur",
+    "ffmpeg_binary": "",
+    "ffprobe_binary": "",
 }
+# Resolved once at startup by main() -> _jwkit_common.resolve_ffmpeg_binary/resolve_ffprobe_binary.
 FFMPEG_BIN = "ffmpeg"
 FFPROBE_BIN = "ffprobe"
 
@@ -51,8 +54,12 @@ def configured(config):
 def write_mask(path, width, height, box):
     """Write a binary PGM mask; Pillow in E2FGVI accepts it as an L image."""
     x, y, w, h = box
+    if w <= 0 or h <= 0:
+        raise SystemExit(f"--box width/height must be positive, got {w}x{h}")
     x, y = max(0, x), max(0, y)
     x2, y2 = min(width, x + w), min(height, y + h)
+    if x2 <= x or y2 <= y:
+        raise SystemExit(f"--box {x},{y},{w},{h} doesn't overlap the {width}x{height} frame")
     row = bytearray(width)
     for i in range(x, x2):
         row[i] = 255
@@ -115,6 +122,9 @@ def main(argv=None):
     COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color))
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     config = load_config()
+    global FFMPEG_BIN, FFPROBE_BIN
+    FFMPEG_BIN = _jwkit_common.resolve_ffmpeg_binary(config)
+    FFPROBE_BIN = _jwkit_common.resolve_ffprobe_binary(config)
     if args.command == "setup":
         print(COLOR.yellow("E2FGVI-HQ is CC BY-NC 4.0. Install it and its weights only if that license permits your use."))
         config["e2fgvi_root"] = args.root or input("Path to your E2FGVI checkout: ").strip()

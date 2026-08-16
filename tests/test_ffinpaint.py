@@ -26,6 +26,21 @@ class FfinpaintConfigAndMaskTest(unittest.TestCase):
             payload = path.read_bytes().split(b"\n", 3)[3]
             self.assertEqual(payload, bytes([0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 0]))
 
+    def test_mask_rejects_a_box_entirely_outside_the_frame(self) -> None:
+        # An out-of-frame --box used to silently produce an all-zero mask -
+        # E2FGVI-HQ would then run a full (GPU) pass "inpainting" nothing,
+        # with no diagnostic telling the operator why.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mask.pgm"
+            with self.assertRaises(SystemExit):
+                self.ffinpaint.write_mask(path, 1280, 720, (2000, 2000, 100, 100))
+
+    def test_mask_rejects_non_positive_width_or_height(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mask.pgm"
+            with self.assertRaises(SystemExit):
+                self.ffinpaint.write_mask(path, 1280, 720, (10, 10, 0, 50))
+
 
 class FfinpaintInpaintTest(unittest.TestCase):
     """inpaint() itself was previously untested - only its write_mask/config
