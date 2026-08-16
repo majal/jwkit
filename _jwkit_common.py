@@ -1,5 +1,5 @@
 """_jwkit_common - shared helpers used by every top-level jwkit tool
-(slverse, ffrife, jwdl, jwpl, jwvideo-mux), loaded as a sibling module the same
+(slverse, ffrife, ffinpaint, jwdl, jwpl, jwvideo-mux), loaded as a sibling module the same
 way slverse already loads ffrife (SourceFileLoader, not a real import,
 since these are standalone shebang scripts rather than a package).
 
@@ -9,6 +9,7 @@ tied to any one tool, so new shared cross-tool concerns belong here too.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -440,6 +441,62 @@ def _git_fast_forward_update(root):
         return None  # local edits or a history rewrite - don't force it, just skip quietly
 
     return f"{local[:7]} -> {remote[:7]}"
+
+
+# --- Shared ffmpeg/ffprobe binary resolution ---
+# A stock Homebrew `ffmpeg` doesn't include freetype/fontconfig (no
+# drawtext), so slverse/ffrife prefer an `ffmpeg-full`-style build when one
+# exists. Available here so any tool that shells out to ffmpeg/ffprobe -
+# not just the ones with their own drawtext overlay - can resolve the same
+# way instead of hardcoding a plain "ffmpeg"/"ffprobe" PATH lookup.
+FFMPEG_FULL_KEG_PATHS = [
+    "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg-full",
+    "/usr/local/opt/ffmpeg-full/bin/ffmpeg-full",
+]
+FFPROBE_FULL_KEG_PATHS = [
+    "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe-full",
+    "/usr/local/opt/ffmpeg-full/bin/ffprobe-full",
+]
+
+def command_exists(cmd):
+    return shutil.which(cmd) is not None
+
+def ffmpeg_has_filter(ffmpeg_bin, filter_name):
+    try:
+        result = subprocess.run([ffmpeg_bin, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=10)
+        return filter_name in result.stdout
+    except Exception:
+        return False
+
+def resolve_ffmpeg_binary(config, require_filter=None):
+    """config's ffmpeg_binary override wins if it exists on PATH; otherwise
+    prefers ffmpeg-full over the stock ffmpeg. Pass require_filter (e.g.
+    "drawtext") to skip a candidate build that lacks it - omit it for tools
+    that don't apply ffmpeg filters themselves."""
+    override = config.get("ffmpeg_binary")
+    if override and command_exists(override):
+        return override
+    candidates = [c for c in [
+        shutil.which("ffmpeg-full"),
+        *[p for p in FFMPEG_FULL_KEG_PATHS if os.path.exists(p)],
+        shutil.which("ffmpeg"),
+    ] if c]
+    if require_filter:
+        for c in candidates:
+            if ffmpeg_has_filter(c, require_filter):
+                return c
+    return candidates[0] if candidates else "ffmpeg"
+
+def resolve_ffprobe_binary(config):
+    override = config.get("ffprobe_binary")
+    if override and command_exists(override):
+        return override
+    candidates = [c for c in [
+        shutil.which("ffprobe-full"),
+        *[p for p in FFPROBE_FULL_KEG_PATHS if os.path.exists(p)],
+        shutil.which("ffprobe"),
+    ] if c]
+    return candidates[0] if candidates else "ffprobe"
 
 
 def maybe_auto_update(jwkit_root):
