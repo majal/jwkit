@@ -9,6 +9,7 @@ import argparse
 import collections
 import json
 import os
+import platform
 import re
 import shutil
 import statistics
@@ -1154,7 +1155,27 @@ def write_mpv_command_launcher(
     media_subdir is the path from the launcher's own directory down to where the EDL/audio/subtitle
     files actually live -- "" (default) when the launcher sits alongside them inside the library folder,
     or the library folder's own name when the launcher has been pulled up into the library's parent
-    directory instead (see build_adaptive_library's launchers_at_unit_root)."""
+    directory instead (see build_adaptive_library's launchers_at_unit_root).
+
+    Writes batch syntax on Windows and bash everywhere else -- this always
+    used to write a #!/bin/bash script regardless of platform, which cmd.exe/
+    PowerShell can't run at all. Double-click still needs a one-time
+    .jwplay file-association step (register-jwplay-launcher.sh/duti on
+    macOS, xdg-mime on Linux) that isn't automated for any platform yet
+    including Windows; this only makes the launcher's own content correct
+    once that association exists (or it's run explicitly, e.g. `cmd /c`)."""
+    if platform.system() == "Windows":
+        media_dir = f"%dir%{media_subdir}\\" if media_subdir else "%dir%"
+        args = [f'"{media_dir}{edl_name}"']
+        if audio_name:
+            args.append(f'--audio-file="{media_dir}{audio_name}"')
+        if sub_name:
+            args.append(f'--sub-file="{media_dir}{sub_name}"')
+        args.append(f"--alang={iso}")
+        args.append(f"--slang={iso},eng")
+        lines = ["@echo off", 'set "dir=%~dp0"', "mpv " + " ".join(args)]
+        out_path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+        return
     lines = ["#!/bin/bash", "set -euo pipefail", 'dir="$(cd "$(dirname "$0")" && pwd)"']
     media_dir = f"$dir/{media_subdir}" if media_subdir else "$dir"
     args = [f'"{media_dir}/{edl_name}"']
@@ -1538,11 +1559,12 @@ def main():
 
         # Attempt to find a subtitle sidecar for the base video (same name, .vtt or .srt --
         # jw.org API downloads land as .vtt, but real SCE-layout sources are commonly .srt).
-        for suffix in ('.vtt', '.srt'):
-            base_sub = base_vid_path.with_suffix(suffix)
-            if base_sub.exists():
-                local_files[base_lang]['sub'] = base_sub
-                break
+        if base_lang in sub_langs:
+            for suffix in ('.vtt', '.srt'):
+                base_sub = base_vid_path.with_suffix(suffix)
+                if base_sub.exists():
+                    local_files[base_lang]['sub'] = base_sub
+                    break
 
         for lang in all_langs:
             if lang == base_lang:
