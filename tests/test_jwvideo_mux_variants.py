@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.support import load_script_module
 
@@ -372,6 +373,34 @@ class VideoVariantPureLogicTest(unittest.TestCase):
             content = out_path.read_text()
             self.assertNotIn("--audio-file=", content)
             self.assertNotIn("--sub-file=", content)
+
+    def test_write_mpv_command_launcher_writes_batch_syntax_on_windows(self) -> None:
+        # This used to always write a #!/bin/bash script regardless of
+        # platform - cmd.exe/PowerShell can't run that at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "Play Tagalog.jwplay"
+            with mock.patch.object(self.module.platform, "system", return_value="Windows"):
+                self.module.write_mpv_command_launcher(out_path, "presentation-tg.edl", "audio-tg.mka", "subtitles-tg.srt", "tgl")
+            content = out_path.read_text()
+            self.assertTrue(content.startswith("@echo off"))
+            self.assertNotIn("#!/bin/bash", content)
+            self.assertIn("presentation-tg.edl", content)
+            self.assertIn("--audio-file=", content)
+            self.assertIn("--sub-file=", content)
+            self.assertIn("--alang=tgl", content)
+            # read_text() applies universal-newline translation on its own,
+            # silently normalizing \r\n back to \n - check the raw bytes
+            # actually written to disk instead.
+            self.assertIn(b"\r\n", out_path.read_bytes())
+
+    def test_write_mpv_command_launcher_windows_media_subdir_has_no_double_backslash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "Play English.jwplay"
+            with mock.patch.object(self.module.platform, "system", return_value="Windows"):
+                self.module.write_mpv_command_launcher(out_path, "presentation-e.edl", None, None, "eng", media_subdir="Some Video")
+            content = out_path.read_text()
+            self.assertIn(r"%dir%Some Video\presentation-e.edl", content)
+            self.assertNotIn("\\\\", content)
 
     def test_load_manual_overrides_parses_toml_and_fallback_ok(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
