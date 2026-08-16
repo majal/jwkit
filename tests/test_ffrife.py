@@ -177,6 +177,29 @@ class FfrifeAtempoChainTest(unittest.TestCase):
         self.assertEqual(self.ffrife.atempo_chain(3), "atempo=2.0,atempo=1.5")
 
 
+class FfrifeRetimedDurationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_no_speed_or_unity_speed_leaves_duration_unchanged(self) -> None:
+        self.assertEqual(self.ffrife.retimed_duration(10.0, None), 10.0)
+        self.assertEqual(self.ffrife.retimed_duration(10.0, 1), 10.0)
+
+    def test_half_speed_doubles_the_progress_bar_duration(self) -> None:
+        # setpts=PTS/0.5 makes the OUTPUT run twice as long as the source
+        # window ffmpeg's own out_time= progress is measured against.
+        self.assertAlmostEqual(self.ffrife.retimed_duration(10.0, 0.5), 20.0)
+
+    def test_triple_speed_shrinks_the_progress_bar_duration(self) -> None:
+        self.assertAlmostEqual(self.ffrife.retimed_duration(9.0, 3), 3.0)
+
+    def test_none_duration_passes_through(self) -> None:
+        # No --start/--end given -> duration is None (whole file, unknown
+        # length) - nothing to retime.
+        self.assertIsNone(self.ffrife.retimed_duration(None, 0.5))
+
+
 class FfrifeSpeedRetimingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -197,6 +220,13 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         self.assertIn("setpts=PTS/0.5", vf)
         self.assertEqual(cmd[cmd.index("-af") + 1], "atempo=0.5")
         self.assertNotIn("-c:a", cmd)  # -af and -c:a copy are mutually exclusive for the audio stream
+
+    def test_fallback_path_passes_retimed_duration_to_progress_bar(self) -> None:
+        config = {"rife_binary_path": "", "rife_fallback_engine": "none"}
+        durations = []
+        with patch.object(self.ffrife, "run_ffmpeg", lambda cmd, duration=None: durations.append(duration)):
+            self.ffrife.interpolate("in.mp4", "out.mp4", config, start=0.0, end=10.0, speed=0.5)
+        self.assertAlmostEqual(durations[0], 20.0)
 
     def test_fallback_path_without_speed_keeps_c_a_copy(self) -> None:
         config = {"rife_binary_path": "", "rife_fallback_engine": "none"}
