@@ -10,6 +10,7 @@ is a config key, not a hardcoded default meant for one setup - run
 """
 import argparse
 import concurrent.futures
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -21,6 +22,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -137,6 +139,7 @@ DEFAULT_CONFIG = {
     "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
     "font_family": "noto-sans-display",  # noto-sans-display, inter, google-sans-flex - see FONT_FAMILIES
     "api_language": "E",  # Priority-ordered language codes for book names (e.g. "VT,E" for Vietnamese then English)
+    "bible_book_path_overrides": "",  # MEPS_CODE=jw.org-url-path manual escape hatch, e.g. "VT=thu-vien/kinh-thanh/nwt/cac-sach" - normally unnecessary, since the localized Study Bible 'Books' page path is auto-discovered per language (from a data-bible_data_api attribute jw.org's own homepage embeds per locale) and cached in state.json. Only add an entry here if a language you set in api_language fails to resolve despite having a real Study Bible edition; find the path by opening that language's own jw.org Study Bible 'Books' page and copying everything after the locale segment (e.g. jw.org/vi/thu-vien/kinh-thanh/nwt/cac-sach/ -> thu-vien/kinh-thanh/nwt/cac-sach).
     "ffmpeg_binary": "",  # override auto-detection, e.g. /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg-full
     "ffprobe_binary": "",
     "ffplay_binary": "",  # override auto-detection, used for preview (extract without --write)
@@ -161,6 +164,33 @@ DEFAULT_CONFIG = {
     "download_max_attempts": "3",  # retry attempts for a chapter/font download before giving up
     "download_retry_backoff": "2",  # seconds, doubled (backoff ** attempt) between download retries
 }
+
+# Closed-set DEFAULT_CONFIG keys - code elsewhere compares these against
+# exact strings (config.get("cache_policy") == "lru", etc.), so a typo
+# ("blurr", "lur") used to be accepted silently by both 'config set' and
+# the generic --<key> CLI overrides and just fell through as a no-op
+# rather than doing what was asked. Keys not listed here are free-form
+# (paths, numbers, KEY=VAL tables, prose) and accept any value.
+CONFIG_CHOICES = {
+    "cache_policy": ("keep_all", "lru", "delete_after_use"),
+    "hardware_encoder": ("cpu", "videotoolbox", "nvenc", "qsv"),
+    "video_codec": ("h264", "hevc", "av1"),
+    "interpolation_engine": ("none", "minterpolate", "rife", "framerate"),
+    "delogo_engine": ("blur", "auto", "inpaint"),
+    "delogo_inpaint_fallback": ("blur", "error"),
+    "font_family": ("noto-sans-display", "inter", "google-sans-flex"),
+    "extract_mode": ("cache", "onthefly"),
+    "preview_source": ("cache", "remote"),
+}
+
+def validate_config_value(key, value):
+    """None if `value` is acceptable for `key`, else a ready-to-print error
+    string. Case-insensitive against CONFIG_CHOICES; keys not in
+    CONFIG_CHOICES always pass (see its own docstring)."""
+    choices = CONFIG_CHOICES.get(key)
+    if choices and str(value).strip().lower() not in choices:
+        return f"{key} must be one of {', '.join(choices)} (got {value!r})"
+    return None
 
 # One-line description per DEFAULT_CONFIG key, shown by 'slverse config
 # list'/'slverse config get <key>' so the full config surface is
@@ -191,6 +221,7 @@ CONFIG_HELP = {
     "font_weight_main": "Google Fonts weight for the drawn verse-reference label",
     "font_weight_estimator": "Google Fonts weight used only to size the delogo box",
     "api_language": "Priority-ordered language codes for book names (e.g. VT,E for Vietnamese then English)",
+    "bible_book_path_overrides": "MEPS-code=jw.org-url-path manual escape hatch - normally unnecessary, the path is auto-discovered per language",
     "ffmpeg_binary": "Override ffmpeg binary auto-detection",
     "ffprobe_binary": "Override ffprobe binary auto-detection",
     "ffplay_binary": "Override ffplay binary auto-detection (used for preview)",
@@ -573,6 +604,16 @@ def profile_already_has_dir(existing, target_dir):
 
 def add_to_path_profile():
     script_dir = Path(__file__).resolve().parent
+    if platform.system() == "Windows":
+        # ~/.profile isn't sourced by cmd.exe/PowerShell, and 'source
+        # ~/.profile' isn't even a valid command there - install.ps1
+        # already does this correctly (a real PATH registry edit via
+        # [Environment]::SetEnvironmentVariable); writing an inert file
+        # here and claiming success would just mislead a native-Windows
+        # user running this script directly instead of through it.
+        print(f"On Windows, use install.ps1 (or jwkit-update.cmd, if already installed that way) to add {script_dir} to PATH -")
+        print("editing ~/.profile here wouldn't take effect in cmd.exe or PowerShell.")
+        return
     marker = "# maj-scripts slverse PATH (added by 'slverse setup')"
     profile = Path.home() / ".profile"
     existing = profile.read_text() if profile.exists() else ""
@@ -601,15 +642,69 @@ def fetch_json(url):
         print(f"Error fetching {url}: {e}")
         return None
 
+def fetch_text(url):
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read().decode('utf-8', errors='replace')
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return None
+
 def get_pub_media_links(lang, booknum=None):
     url = f"https://b.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS?output=json&pub=nwt&fileformat=MP4%2CM4V&alllangs=0&langwritten={lang}&txtCMSLang={lang}"
     if booknum:
         url += f"&booknum={booknum}"
     return fetch_json(url)
 
-def get_bible_metadata(lang_code):
-    lc = "en" if lang_code == "E" else lang_code.lower()
-    url = f"https://www.jw.org/{lc}/library/bible/study-bible/books/json/"
+def bible_book_json_url(locale, state=None):
+    """jw.org translates the whole Study Bible 'Books' page path per
+    language, not just the leading locale segment - only
+    .../vi/thu-vien/kinh-thanh/nwt/cac-sach/... exists for Vietnamese,
+    .../vi/library/bible/... 404s - so this can't be derived by pattern
+    substitution. Every jw.org locale homepage (a guaranteed-to-exist,
+    non-localized URL: .../{locale}/) embeds a `data-bible_data_api`
+    attribute on its #pageConfig element pointing at that locale's own
+    Bible data API - the same mechanism jw.org's own frontend JS uses to
+    find it, and how the community jw-api project (github.com/mtdvlpr-org/
+    jw-api) resolves this too. That attribute is the verse-range content
+    API (.../json/data/); stripping its last path segment recovers the
+    'Books' listing page's own JSON endpoint used here. Cached in state,
+    since the mapping only changes when jw.org restructures a language
+    edition's URLs."""
+    cached = state.get("_bible_book_paths", {}).get(locale) if state is not None else None
+    if cached:
+        return cached
+    html = fetch_text(f"https://www.jw.org/{locale}/")
+    if not html:
+        return None
+    match = re.search(r'data-bible_data_api="([^"]+)"', html)
+    if not match:
+        return None  # no Bible edition (or none with per-verse data) in this locale
+    base_path = match.group(1).rstrip("/").rsplit("/", 1)[0] + "/"
+    url = f"https://www.jw.org{base_path}"
+    if state is not None:
+        state.setdefault("_bible_book_paths", {})[locale] = url
+    return url
+
+def get_bible_metadata(lang_code, state=None, config=None):
+    if lang_code == "E":
+        # Known constant - skip the homepage fetch for the common
+        # (default) English-only case.
+        return fetch_json("https://www.jw.org/en/library/bible/study-bible/books/json/")
+    overrides = parse_kv_config(config.get("bible_book_path_overrides", DEFAULT_CONFIG["bible_book_path_overrides"])) if config is not None else {}
+    locale_entry = load_jwlangs().get(lang_code.upper())
+    locale = locale_entry[0].lower() if locale_entry else lang_code.lower()
+    override_path = overrides.get(lang_code.upper())
+    if override_path:
+        return fetch_json(f"https://www.jw.org/{locale}/{override_path}/json/")
+    url = bible_book_json_url(locale, state)
+    if not url:
+        # No Study Bible edition in this language (or its homepage doesn't
+        # expose the pageConfig data this relies on) - nothing to fetch.
+        # bible_book_path_overrides is the manual escape hatch if this
+        # ever happens for a language you actually use.
+        return None
     return fetch_json(url)
 
 def list_all_sign_languages():
@@ -682,8 +777,35 @@ def download_file(url, output_path, expected_checksum=None):
     return False
 
 # --- Cache management ---
+# 'extract all'/'bulk' run each language's download+use in its own thread
+# (extract_workers, default 3) against this one shared state dict and cache
+# directory. Without _CACHE_LOCK, two threads' enforce_cache_budget calls
+# could race on the same access_map/directory scan (lost updates, double
+# eviction accounting); without _CACHE_INUSE, a thread's enforce_cache_budget
+# only protects its OWN just-downloaded file via `protect=`, so a concurrent
+# thread's eviction pass could unlink a file another thread is still actively
+# playing (preview) or feeding to ffmpeg (extract) - not just a hypothetical,
+# since cache_policy defaults to "lru" and extract_workers defaults to 3.
+_CACHE_LOCK = threading.Lock()
+_CACHE_INUSE = set()
+
+@contextlib.contextmanager
+def cache_in_use(path):
+    """Mark a cached file as actively being read (played or fed to ffmpeg)
+    for the duration of the with-block, so no thread's enforce_cache_budget
+    call - not just the current thread's own - can evict it meanwhile."""
+    key = str(Path(path).resolve())
+    with _CACHE_LOCK:
+        _CACHE_INUSE.add(key)
+    try:
+        yield
+    finally:
+        with _CACHE_LOCK:
+            _CACHE_INUSE.discard(key)
+
 def note_cache_use(state, path):
-    state.setdefault("_cache_access", {})[str(path)] = time.time()
+    with _CACHE_LOCK:
+        state.setdefault("_cache_access", {})[str(path)] = time.time()
 
 def enforce_cache_budget(config, state, protect=None):
     if config.get("cache_policy") != "lru":
@@ -696,34 +818,37 @@ def enforce_cache_budget(config, state, protect=None):
     if not cache_dir.exists():
         return
     budget_bytes = max_gb * (1024 ** 3)
-    access_map = state.setdefault("_cache_access", {})
 
-    files = []
-    total = 0
-    for p in cache_dir.rglob("*"):
-        if p.is_file():
-            size = p.stat().st_size
-            total += size
-            last_used = access_map.get(str(p), p.stat().st_mtime)
-            files.append((p, size, last_used))
+    with _CACHE_LOCK:
+        access_map = state.setdefault("_cache_access", {})
 
-    if total <= budget_bytes:
-        return
+        files = []
+        total = 0
+        for p in cache_dir.rglob("*"):
+            if p.is_file():
+                size = p.stat().st_size
+                total += size
+                last_used = access_map.get(str(p), p.stat().st_mtime)
+                files.append((p, size, last_used))
 
-    files.sort(key=lambda f: f[2])  # oldest-used first
-    protect_path = Path(protect).resolve() if protect else None
-    for path, size, _ in files:
         if total <= budget_bytes:
-            break
-        if protect_path and path.resolve() == protect_path:
-            continue
-        try:
-            path.unlink()
-            access_map.pop(str(path), None)
-            total -= size
-            print(f"Cache trim: removed {path.name} ({size/1e6:.1f} MB) to stay under {max_gb}GB.")
-        except OSError:
-            pass
+            return
+
+        files.sort(key=lambda f: f[2])  # oldest-used first
+        protect_paths = {Path(protect).resolve()} if protect else set()
+        protect_paths |= {Path(p) for p in _CACHE_INUSE}
+        for path, size, _ in files:
+            if total <= budget_bytes:
+                break
+            if path.resolve() in protect_paths:
+                continue
+            try:
+                path.unlink()
+                access_map.pop(str(path), None)
+                total -= size
+                print(f"Cache trim: removed {path.name} ({size/1e6:.1f} MB) to stay under {max_gb}GB.")
+            except OSError:
+                pass
     # Mutates state in place; the caller is responsible for save_state(), the
     # same as every other function that touches state — this must never
     # persist on its own, since a caller can pass a throwaway dict (tests do)
@@ -1600,7 +1725,7 @@ def normalize_book_name(value):
                    if not unicodedata.combining(ch))
 
 
-def resolve_book_number(book_name, lang="E", state=None):
+def resolve_book_number(book_name, lang="E", state=None, config=None):
     """Book names/numbers are static, so the study-bible metadata (one
     network call per language) is cached in state.json instead of being
     re-fetched on every extract/find."""
@@ -1612,14 +1737,20 @@ def resolve_book_number(book_name, lang="E", state=None):
     for language in languages or ["E"]:
         metadata = state.get("_book_metadata", {}).get(language) if state is not None else None
         if metadata is None:
-            metadata = get_bible_metadata(language)
+            metadata = get_bible_metadata(language, state, config)
             if metadata is not None and state is not None:
                 state.setdefault("_book_metadata", {})[language] = metadata
         if not metadata:
             continue
         for b_id, b_data in metadata.get("editionData", {}).get("books", {}).items():
-            candidates = (b_data.get("standardSingularBookName", ""), b_data.get("officialAbbreviation", ""))
-            if any(needle == normalize_book_name(candidate) for candidate in candidates if candidate):
+            candidates = (
+                b_data.get("standardName", ""), b_data.get("standardAbbreviation", ""),
+                b_data.get("standardSingularBookName", ""), b_data.get("standardSingularAbbreviation", ""),
+                b_data.get("standardPluralBookName", ""), b_data.get("standardPluralAbbreviation", ""),
+                b_data.get("officialAbbreviation", ""), b_data.get("officialSingularAbbreviation", ""),
+                b_data.get("officialPluralAbbreviation", ""),
+            )
+            if any(needle in normalize_book_name(candidate) for candidate in candidates if candidate):
                 return int(b_id)
     return None
 
@@ -1716,7 +1847,7 @@ def cmd_setup(args, config):
     if ans in ("", "y", "yes"):
         add_to_path_profile()
 
-    # Shared across every jwkit tool (slverse, ffrife, jwdl, jwvideo-mux),
+    # Shared across every jwkit tool (slverse, ffrife, ffinpaint, jwdl, jwpl, jwvideo-mux),
     # not just slverse's own config - see _jwkit_common.py.
     jwkit_config = _jwkit_common.load_jwkit_config()
     default_label = "Y/n" if jwkit_config.get("auto_update", True) else "y/N"
@@ -1737,6 +1868,10 @@ def cmd_setup(args, config):
 
 def cmd_config(args, config):
     if args.key and args.value:
+        error = validate_config_value(args.key, args.value)
+        if error:
+            print(COLOR.red(f"Error: {error}"))
+            return
         config[args.key] = args.value
         save_config(config)
         print(COLOR.green(f"Set {args.key} = {args.value}"))
@@ -1961,8 +2096,8 @@ def clamp_offset_window(natural_start, natural_end, offset_start, offset_end, la
     clamp the result to the verse's own natural window - a 12s verse only
     has 12s to offset within (e.g. offset_start=3.567, offset_end=-1.997
     asks for the 3.567s-10.003s slice, entirely inside those 12s: passes
-    through untouched). An offset that would push start before 0, past the
-    verse's own end, or end before its own start (individually or combined)
+    through untouched). An offset that would push start before the verse's
+    own start, past its own end, or end before its own start (individually or combined)
     is a real overshoot - JW's markers don't tell us anything reliable
     about what comes before/after this verse's own window, so rather than
     silently referencing whatever happens to be there, this clamps back to
@@ -1973,11 +2108,11 @@ def clamp_offset_window(natural_start, natural_end, offset_start, offset_end, la
     natural_duration = natural_end - natural_start
 
     clamped = False
-    if start < 0.0:
-        start = 0.0
+    if start < natural_start:
+        start = natural_start
         clamped = True
     if start > natural_end - min_duration:
-        start = max(0.0, natural_end - min_duration)
+        start = max(natural_start, natural_end - min_duration)
         clamped = True
     if end > natural_end:
         end = natural_end
@@ -2155,9 +2290,12 @@ def apply_generic_config_overrides(args, config):
             continue
         value = getattr(args, key, None)
         if value is not None:
+            error = validate_config_value(key, value)
+            if error:
+                raise SystemExit(f"--{key.replace('_', '-')}: {error}")
             config[key] = value
 
-def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state):
+def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state, require_full_range=False):
     window = resolve_verse_window(
         lang, book_num, chapter, verses, config,
         keep_end_transition=getattr(args, "keep_end_transition", False),
@@ -2169,6 +2307,10 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     if not window:
         return lang, None, f"Verses {verses} not found for {lang} (video may not exist for this chapter in this language yet)."
     start_time, end_time, url, checksum, valid_verses, source_labels, kept_segments = window
+    if require_full_range:
+        missing = sorted(set(verses) - set(valid_verses))
+        if missing:
+            return lang, None, f"{lang} only has {format_verses_label(valid_verses)}, missing {format_verses_label(missing)}."
     # RIFE frame extraction normalizes the trimmed stream to a zero-based
     # timeline, as do concat/filter-complex paths.
     fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None)
@@ -2188,21 +2330,28 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         # streams straight from the URL instead and never touches disk.
         # Either way the remote URL is still shown alongside what's playing.
         source = url
+        cached_path = None
         if config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower() != "remote":
             cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang
             cached = cache_dir / url.split("/")[-1]
             if cached.exists():
                 note_cache_use(state, cached)
                 source = str(cached)
+                cached_path = cached
             else:
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 if download_file(url, cached, expected_checksum=checksum):
                     note_cache_use(state, cached)
                     enforce_cache_budget(config, state, protect=cached)
                     source = str(cached)
+                    cached_path = cached
                 # else: download failed (offline, CDN hiccup, etc) - fall
                 # back to streaming straight from the URL for this preview.
-        preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url, source_labels=source_labels, fade_outs=fade_outs)
+        # cache_in_use holds the file protected from another thread's
+        # concurrent enforce_cache_budget call for as long as this preview
+        # is actually reading it (mpv/ffplay playback can run for a while).
+        with cache_in_use(cached_path) if cached_path else contextlib.nullcontext():
+            preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url, source_labels=source_labels, fade_outs=fade_outs)
         return lang, None, None
 
     mode, boundaries, speed, retime_error = resolve_retime_args(args, end_time - start_time)
@@ -2260,10 +2409,13 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             print(f"[{lang}] Source: {url}")
 
         note_cache_use(state, local_path)
-        if mode:
-            extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
-        else:
-            extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
+        # Protects local_path from a concurrent thread's enforce_cache_budget
+        # call for as long as ffmpeg is actually reading it here.
+        with cache_in_use(local_path):
+            if mode:
+                extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
+            else:
+                extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
 
         key = f"{book_num}_{chapter}"
         index = load_index(lang)
@@ -2299,7 +2451,7 @@ def cmd_extract(args, config):
         return
 
     state = get_state()
-    book_num = resolve_book_number(book_name, config.get("api_language", "E"), state=state)
+    book_num = resolve_book_number(book_name, config.get("api_language", "E"), state=state, config=config)
     if not book_num:
         common = {"gen": 1, "ex": 2, "ps": 19, "psalms": 19, "prov": 20, "matt": 40, "rev": 66, "revelation": 66}
         for k, v in common.items():
@@ -2336,7 +2488,7 @@ def cmd_extract(args, config):
     if any_mode:
         failures = []
         for lang in langs:
-            result = extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state)
+            result = extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state, require_full_range=True)
             if result[2] is None:
                 results = [result]
                 break
@@ -2371,7 +2523,7 @@ def cmd_find(args, config):
     the same syntax extract's reference string uses."""
     state = get_state()
     jwlangs = load_jwlangs()
-    book_num = resolve_book_number(args.book, config.get("api_language", "E"), state=state)
+    book_num = resolve_book_number(args.book, config.get("api_language", "E"), state=state, config=config)
     save_state(state)  # persist any newly-cached book-name metadata even if nothing matches below
     if not book_num:
         print(f"Could not resolve book: {args.book}")
@@ -2412,7 +2564,7 @@ def cmd_find(args, config):
         print("No languages synced yet. Try 'slverse sync all' first.")
         return
     if not any(r["found"] for r in results):
-        verse_label = str(verses[0]) if len(verses) == 1 else f"{verses[0]}-{verses[-1]}"
+        verse_label = format_verses_label(verses)
         print(f"No synced language has {args.book} {args.chapter}:{verse_label} yet.")
         print("Try 'slverse sync all' first, or sync a specific language.")
         return
@@ -2539,7 +2691,7 @@ def bulk_one_lang(lang, books, args, config):
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[{lang}] processing {len(targets)} chapter(s) into {out_dir}...")
 
-    engine = config.get("interpolation_engine", "none") if args.interpolate else "none"
+    engine = config.get("interpolation_engine", "none")
     bulk_config = dict(config, interpolation_engine=engine)
 
     for book_num, chapter, entry in targets:
@@ -2741,6 +2893,8 @@ def main():
             if value is not None:
                 config[config_key] = value
         maybe_auto_sync(args, config)
+        if args.interpolate and config.get("interpolation_engine") == "none":
+            config["interpolation_engine"] = "minterpolate"
         cmd_bulk(args, config)
     else:
         parser.print_help()

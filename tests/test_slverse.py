@@ -76,9 +76,11 @@ class SlverseClampOffsetWindowTest(unittest.TestCase):
         result = self.slverse.clamp_offset_window(100.0, 112.0, 0.0, -20.0)
         self.assertEqual(result, (100.0, 112.0))
 
-    def test_start_never_goes_negative(self) -> None:
+    def test_start_clamps_to_natural_start_not_zero(self) -> None:
+        # natural_start=2.0 sits well inside a longer chapter file; an
+        # overshoot must not splice in footage before the verse's own start.
         result = self.slverse.clamp_offset_window(2.0, 14.0, -10.0, 0.0)
-        self.assertEqual(result[0], 0.0)
+        self.assertEqual(result[0], 2.0)
 
     def test_combined_collapse_falls_back_to_natural_window(self) -> None:
         result = self.slverse.clamp_offset_window(100.0, 112.0, 8.0, -8.0)
@@ -150,14 +152,17 @@ class SlverseResolveVerseWindowTest(unittest.TestCase):
         )
         self.assertAlmostEqual(end, 149.415 + 33.800 - 3.0)
 
-    def test_offset_start_never_goes_negative(self) -> None:
+    def test_offset_start_clamps_to_verse_own_start(self) -> None:
+        # verse 1 starts 2.000s into the chapter file; an overshooting
+        # offset_start must clamp there, not to the file's absolute 0.0 -
+        # otherwise it would splice in whatever precedes this verse.
         self._stub_index([
             {"verseNumber": 1, "startTime": "00:00:02.000", "duration": "00:00:05.000", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:1"},
         ])
         start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
             "ASL", 19, 16, [1], self.config(), offset_start=-10.0,
         )
-        self.assertEqual(start, 0.0)
+        self.assertEqual(start, 2.0)
 
     def test_offsets_stack_with_end_transition_trim(self) -> None:
         self._stub_index([
@@ -261,6 +266,113 @@ class SlverseBookNameTest(unittest.TestCase):
             "E": self.metadata("Deuteronomy", "Deut."),
         }}
         self.assertEqual(self.slverse.resolve_book_number("Deuteronomy", "VT,E", state), 5)
+
+    def test_plural_book_name_and_abbreviation_resolve(self) -> None:
+        # Real JW.org study-bible metadata carries 9 name/abbreviation
+        # fields per book (standard/official x singular/plural, plus a
+        # plain standardName/standardAbbreviation) - only 2 were checked
+        # before, so "Psalms" (the plural form) silently failed to resolve
+        # even though "Psalm" (singular) did.
+        state = {"_book_metadata": {"E": {"editionData": {"books": {"19": {
+            "standardName": "Psalms",
+            "standardAbbreviation": "Ps.",
+            "standardSingularBookName": "Psalm",
+            "standardSingularAbbreviation": "Ps.",
+            "standardPluralBookName": "Psalms",
+            "standardPluralAbbreviation": "Pss.",
+            "officialAbbreviation": "Ps",
+            "officialSingularAbbreviation": "Ps",
+            "officialPluralAbbreviation": "Pss",
+        }}}}}}
+        self.assertEqual(self.slverse.resolve_book_number("Psalms", "E", state), 19)
+        self.assertEqual(self.slverse.resolve_book_number("Pss", "E", state), 19)
+        self.assertEqual(self.slverse.resolve_book_number("psalm", "E", state), 19)
+
+
+class SlverseBibleMetadataUrlTest(unittest.TestCase):
+    """get_bible_metadata's URL isn't a simple locale-prefix swap - jw.org
+    translates the whole Study Bible 'Books' page path per language (e.g.
+    Vietnamese lives at .../vi/thu-vien/kinh-thanh/nwt/cac-sach/json/, not
+    .../vi/library/bible/study-bible/books/json/, which 404s). The real
+    path is auto-discovered from a data-bible_data_api attribute every
+    jw.org locale homepage embeds (same mechanism jw.org's own frontend
+    uses, and how the community jw-api project resolves this too). These
+    tests stub the network entirely and check the URL-building logic only."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    VI_HOMEPAGE_HTML = (
+        '<div id="pageConfig" data-wt_lang="VT" '
+        'data-bible_data_api="/vi/thu-vien/kinh-thanh/nwt/cac-sach/json/data/"></div>'
+    )
+    KO_HOMEPAGE_HTML = (
+        '<div id="pageConfig" data-wt_lang="KO" '
+        'data-bible_data_api="/ko/%EB%9D%BC%EC%9D%B4%EB%B8%8C/json/data/"></div>'
+    )
+
+    def test_english_never_triggers_the_homepage_scrape(self) -> None:
+        text_calls = []
+        json_calls = []
+        self.slverse.fetch_text = lambda url: text_calls.append(url) or self.VI_HOMEPAGE_HTML
+        self.slverse.fetch_json = lambda url: json_calls.append(url) or {"editionData": {}}
+
+        self.slverse.get_bible_metadata("E", state={}, config={})
+
+        self.assertEqual(text_calls, [])
+        self.assertEqual(json_calls, ["https://www.jw.org/en/library/bible/study-bible/books/json/"])
+
+    def test_non_english_language_resolved_from_its_own_homepage(self) -> None:
+        # Vietnamese isn't in jw.org's hreflang alternate-language list
+        # (confirmed against the real page) even though its Study Bible
+        # edition exists - the homepage-scrape approach doesn't depend on
+        # that list at all, so it resolves Vietnamese with zero config.
+        text_calls = []
+        json_calls = []
+        self.slverse.fetch_text = lambda url: text_calls.append(url) or self.VI_HOMEPAGE_HTML
+        self.slverse.fetch_json = lambda url: json_calls.append(url) or {"editionData": {}}
+        state = {}
+
+        self.slverse.get_bible_metadata("VT", state=state, config={})
+
+        self.assertEqual(text_calls, ["https://www.jw.org/vi/"])
+        self.assertEqual(json_calls, ["https://www.jw.org/vi/thu-vien/kinh-thanh/nwt/cac-sach/json/"])
+        # Cached in state - a second lookup for the same locale must not re-scrape.
+        self.slverse.fetch_text = lambda url: (_ for _ in ()).throw(AssertionError("should not re-fetch"))
+        self.slverse.get_bible_metadata("VT", state=state, config={})
+
+    def test_different_locales_resolved_independently(self) -> None:
+        html_by_locale = {"vi": self.VI_HOMEPAGE_HTML, "ko": self.KO_HOMEPAGE_HTML}
+        self.slverse.fetch_text = lambda url: html_by_locale[url.rstrip("/").rsplit("/", 1)[-1]]
+        json_calls = []
+        self.slverse.fetch_json = lambda url: json_calls.append(url) or {"editionData": {}}
+
+        self.slverse.get_bible_metadata("KO", state={}, config={})
+
+        self.assertEqual(json_calls, ["https://www.jw.org/ko/%EB%9D%BC%EC%9D%B4%EB%B8%8C/json/"])
+
+    def test_config_override_skips_the_homepage_scrape_entirely(self) -> None:
+        text_calls = []
+        json_calls = []
+        self.slverse.fetch_text = lambda url: text_calls.append(url) or self.VI_HOMEPAGE_HTML
+        self.slverse.fetch_json = lambda url: json_calls.append(url) or {"editionData": {}}
+        config = {"bible_book_path_overrides": "VT=some/manual/path"}
+
+        self.slverse.get_bible_metadata("VT", state={}, config=config)
+
+        self.assertEqual(text_calls, [])
+        self.assertEqual(json_calls, ["https://www.jw.org/vi/some/manual/path/json/"])
+
+    def test_language_with_no_bible_data_api_attribute_returns_none(self) -> None:
+        json_calls = []
+        self.slverse.fetch_text = lambda url: "<html>no pageConfig here</html>"
+        self.slverse.fetch_json = lambda url: json_calls.append(url) or {"editionData": {}}
+
+        result = self.slverse.get_bible_metadata("ZZZ", state={}, config={})
+
+        self.assertIsNone(result)
+        self.assertEqual(json_calls, [])
 
 
 class SlverseEncodeArgsTest(unittest.TestCase):
@@ -383,6 +495,43 @@ class SlverseCacheBudgetTest(unittest.TestCase):
 
             remaining = sorted(p.name for p in cache_dir.iterdir())
             self.assertEqual(remaining, ["middle.mp4", "newest.mp4"])
+
+    def test_in_use_file_is_never_evicted_even_if_lru_oldest(self) -> None:
+        # 'extract all'/'bulk' run each language's download+use in its own
+        # thread against one shared cache dir (extract_workers, default 3;
+        # cache_policy defaults to lru) - a concurrent thread's own
+        # enforce_cache_budget call must not delete a file THIS thread is
+        # still actively playing/encoding from, even though `protect=`
+        # there only ever names that OTHER thread's own file.
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "cache" / "ASL"
+            cache_dir.mkdir(parents=True)
+            state: dict = {}
+            for name in ("oldest.mp4", "middle.mp4", "newest.mp4"):
+                p = cache_dir / name
+                p.write_bytes(b"0" * (1024 * 1024))
+                self.slverse.note_cache_use(state, p)
+                time.sleep(0.01)
+
+            config = {
+                "cache_dir": str(cache_dir.parent),
+                "cache_policy": "lru",
+                "cache_max_gb": str(2 * 1024 * 1024 / (1024 ** 3)),
+            }
+            oldest = cache_dir / "oldest.mp4"
+            with self.slverse.cache_in_use(oldest):
+                self.slverse.enforce_cache_budget(config, state)
+                remaining = sorted(p.name for p in cache_dir.iterdir())
+
+            self.assertIn("oldest.mp4", remaining)
+            self.assertNotIn("middle.mp4", remaining)  # next-oldest evicted instead
+
+    def test_cache_in_use_clears_even_on_exception(self) -> None:
+        p = Path("/tmp/does-not-need-to-exist-for-this-check.mp4")
+        with self.assertRaises(ValueError):
+            with self.slverse.cache_in_use(p):
+                raise ValueError("boom")
+        self.assertNotIn(str(p.resolve()), self.slverse._CACHE_INUSE)
 
     def test_keep_all_policy_never_evicts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -847,6 +996,42 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIsNotNone(filename)
         self.assertEqual(len(extract_calls), 1)
+
+    def test_partial_range_is_accepted_by_default(self) -> None:
+        # Requesting verses 11-12 but the language only actually has 11
+        # (resolve_verse_window's valid_verses reflects that) is accepted
+        # as-is outside 'any' mode - existing single/all-language behavior.
+        self.slverse.resolve_verse_window = lambda lang, book_num, chapter, verses, config, **kw: (
+            10.0, 20.0, "http://example/vid.mp4", "abc123", [11], ["Psalm 16:11"], [(0.0, 10.0)],
+        )
+        preview_calls = []
+        self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+
+        lang, filename, error = self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11, 12], args, self.base_config(), {})
+
+        self.assertIsNone(error)
+        self.assertEqual(len(preview_calls), 1)
+
+    def test_partial_range_is_rejected_when_full_range_required(self) -> None:
+        # 'any' mode's whole point is picking a language that has the FULL
+        # requested range, not silently truncating to whatever one language
+        # happens to have - so require_full_range=True must fail here
+        # instead of previewing/extracting a partial clip.
+        self.slverse.resolve_verse_window = lambda lang, book_num, chapter, verses, config, **kw: (
+            10.0, 20.0, "http://example/vid.mp4", "abc123", [11], ["Psalm 16:11"], [(0.0, 10.0)],
+        )
+        preview_calls = []
+        self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+
+        lang, filename, error = self.slverse.extract_one_lang(
+            "FSL", "Psalm", 19, 16, [11, 12], args, self.base_config(), {}, require_full_range=True,
+        )
+
+        self.assertIsNotNone(error)
+        self.assertIn("12", error)
+        self.assertEqual(len(preview_calls), 0)
 
 
 class SlverseParseSpeedTest(unittest.TestCase):
@@ -1437,6 +1622,33 @@ class SlverseLaunchMpvTest(unittest.TestCase):
         self.assertIn("--osc=no", self.captured_cmd[0])
 
 
+class SlverseAddToPathProfileTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_windows_skips_writing_dot_profile(self) -> None:
+        # ~/.profile isn't sourced by cmd.exe/PowerShell - writing it there
+        # used to silently claim success with no real effect on Windows.
+        with tempfile.TemporaryDirectory() as home_dir:
+            with mock.patch.object(self.slverse.platform, "system", return_value="Windows"), \
+                 mock.patch.object(self.slverse.Path, "home", return_value=Path(home_dir)), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                self.slverse.add_to_path_profile()
+            self.assertFalse((Path(home_dir) / ".profile").exists())
+            self.assertIn("install.ps1", out.getvalue())
+
+    def test_macos_still_writes_dot_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as home_dir:
+            with mock.patch.object(self.slverse.platform, "system", return_value="Darwin"), \
+                 mock.patch.object(self.slverse.Path, "home", return_value=Path(home_dir)), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.slverse.add_to_path_profile()
+            profile = Path(home_dir) / ".profile"
+            self.assertTrue(profile.exists())
+            self.assertIn("PATH", profile.read_text())
+
+
 class SlverseConfigCommandTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1467,6 +1679,56 @@ class SlverseConfigCommandTest(unittest.TestCase):
             self.slverse.cmd_config(args, config)
         self.assertEqual(config["cache_max_gb"], "10")
         self.assertEqual(saved["cache_max_gb"], "10")
+
+    def test_config_set_rejects_a_typo_in_a_closed_set_key(self) -> None:
+        # cache_policy is compared against exact strings elsewhere
+        # (config.get("cache_policy") == "lru") - a typo used to be
+        # accepted and saved silently, then just never matched anything.
+        args = argparse.Namespace(key="cache_policy", value="lur")
+        saved = {}
+        self.slverse.save_config = lambda config: saved.update(config)
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.slverse.cmd_config(args, config)
+        self.assertEqual(config["cache_policy"], "lru")  # unchanged
+        self.assertEqual(saved, {})  # never persisted
+        self.assertIn("must be one of", out.getvalue())
+
+    def test_config_set_accepts_a_closed_set_value_case_insensitively(self) -> None:
+        args = argparse.Namespace(key="delogo_engine", value="INPAINT")
+        self.slverse.save_config = lambda config: None
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.slverse.cmd_config(args, config)
+        self.assertEqual(config["delogo_engine"], "INPAINT")
+
+
+class SlverseGenericConfigOverrideValidationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_free_form_key_accepts_anything(self) -> None:
+        self.assertIsNone(self.slverse.validate_config_value("cache_max_gb", "not-a-number-but-not-this-functions-job"))
+
+    def test_closed_set_key_rejects_unknown_value(self) -> None:
+        error = self.slverse.validate_config_value("cache_policy", "lur")
+        self.assertIsNotNone(error)
+        self.assertIn("cache_policy", error)
+
+    def test_generic_cli_override_of_a_closed_set_key_with_a_typo_exits_cleanly(self) -> None:
+        args = argparse.Namespace(delogo_engine="blurr")
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        with self.assertRaises(SystemExit) as ctx:
+            self.slverse.apply_generic_config_overrides(args, config)
+        self.assertIn("delogo-engine", str(ctx.exception))
+        self.assertEqual(config["delogo_engine"], "blur")  # untouched by the rejected override
+
+    def test_generic_cli_override_of_a_closed_set_key_with_a_valid_value_applies(self) -> None:
+        args = argparse.Namespace(delogo_engine="inpaint")
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        self.slverse.apply_generic_config_overrides(args, config)
+        self.assertEqual(config["delogo_engine"], "inpaint")
 
 
 class SlverseEditDescriptionTest(unittest.TestCase):
