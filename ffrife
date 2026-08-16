@@ -392,6 +392,17 @@ def atempo_chain(speed):
     filters.append(f"atempo={remaining:.6g}")
     return ",".join(filters)
 
+def retimed_duration(duration, speed):
+    """run_ffmpeg's progress bar reads ffmpeg's own out_time=, which for a
+    setpts=PTS/speed-retimed encode reflects the OUTPUT timeline, not the
+    source-relative `duration` passed in - a half-speed encode (speed=0.5)
+    actually runs twice as long, a 3x encode a third as long. Without this,
+    the bar hits 100% at the halfway point (or overshoots) well before
+    ffmpeg is actually done."""
+    if duration and speed and speed != 1:
+        return duration / speed
+    return duration
+
 # --- Core: single-pass interpolation ---
 def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=60, speed=None, metadata_args=None):
     """Interpolate `source` (local path or remote URL) to `fps`, optionally
@@ -438,7 +449,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         if vf_chain:
             cmd += ["-vf", ",".join(vf_chain)]
         cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"]) + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
-        run_ffmpeg(cmd, duration=duration)
+        run_ffmpeg(cmd, duration=retimed_duration(duration, speed))
         return True
 
     print()
@@ -477,7 +488,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         if has_audio:
             merge_cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"])
         merge_cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]
-        run_ffmpeg(merge_cmd, duration=duration)
+        run_ffmpeg(merge_cmd, duration=retimed_duration(duration, speed))
     return True
 
 # --- CLI ---
