@@ -159,6 +159,43 @@ def fetch_pub_media(pub, lang):
     raise RuntimeError(f"Failed to fetch media list for pub '{pub}': {last_err}")
 
 
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+def download_with_retry(url, dest_path, expected_checksum=None):
+    """Stream `url` to `dest_path` via a `.part` temp file (atomically
+    renamed on success), retrying up to MAX_ATTEMPTS times with backoff.
+    Hashes incrementally while streaming rather than writing the whole
+    response then re-reading the whole file to checksum it - jwdl video
+    downloads can run several hundred MB to multi-GB, and this used to
+    peak near 2x the file size in memory (once for the write, again for
+    the checksum) on the same host that runs 'jwdl all' unattended weekly.
+    Returns None on success, or an error message string on final failure."""
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
+    last_error = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            digest = hashlib.md5() if expected_checksum else None
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp, open(tmp_path, "wb") as f:
+                while True:
+                    chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    if digest is not None:
+                        digest.update(chunk)
+            if digest is not None and digest.hexdigest() != expected_checksum:
+                raise ValueError(f"checksum mismatch (got {digest.hexdigest()}, expected {expected_checksum})")
+            os.replace(tmp_path, dest_path)
+            return None
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            last_error = e
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF ** attempt)
+    return str(last_error)
+
+
 def download_track(entry, dest_dir, dry_run, include_audio_descriptions):
     title = entry.get("title", "")
     if not include_audio_descriptions and is_audio_description(title):
@@ -180,29 +217,10 @@ def download_track(entry, dest_dir, dry_run, include_audio_descriptions):
         return "would-download", filename
 
     expected_checksum = file_info.get("checksum")
-    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp, open(tmp_path, "wb") as f:
-                f.write(resp.read())
-
-            if expected_checksum:
-                digest = hashlib.md5(tmp_path.read_bytes()).hexdigest()
-                if digest != expected_checksum:
-                    raise ValueError(f"checksum mismatch (got {digest}, expected {expected_checksum})")
-
-            os.replace(tmp_path, dest_path)
-            return "downloaded", filename
-        except Exception as e:
-            tmp_path.unlink(missing_ok=True)
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF ** attempt)
-            else:
-                return "error", f"{filename}: {e}"
-
-    return "error", filename
+    error = download_with_retry(url, dest_path, expected_checksum)
+    if error:
+        return "error", f"{filename}: {error}"
+    return "downloaded", filename
 
 
 def download_pub(pub, dest_dir, lang, dry_run, include_audio_descriptions, workers):
@@ -294,29 +312,10 @@ def download_periodical_file(entry, dest_dir, dry_run, include_large_print):
         return "would-download", filename
 
     expected_checksum = file_info.get("checksum")
-    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp, open(tmp_path, "wb") as f:
-                f.write(resp.read())
-
-            if expected_checksum:
-                digest = hashlib.md5(tmp_path.read_bytes()).hexdigest()
-                if digest != expected_checksum:
-                    raise ValueError(f"checksum mismatch (got {digest}, expected {expected_checksum})")
-
-            os.replace(tmp_path, dest_path)
-            return "downloaded", filename
-        except Exception as e:
-            tmp_path.unlink(missing_ok=True)
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF ** attempt)
-            else:
-                return "error", f"{filename}: {e}"
-
-    return "error", filename
+    error = download_with_retry(url, dest_path, expected_checksum)
+    if error:
+        return "error", f"{filename}: {error}"
+    return "downloaded", filename
 
 
 def download_periodical(pub, dest_dir, lang, months, dry_run, include_large_print):
@@ -474,29 +473,10 @@ def download_video(entry, dest_dir, resolution, dry_run):
         return "would-download", filename
 
     expected_checksum = file_entry.get("checksum")
-    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp, open(tmp_path, "wb") as f:
-                f.write(resp.read())
-
-            if expected_checksum:
-                digest = hashlib.md5(tmp_path.read_bytes()).hexdigest()
-                if digest != expected_checksum:
-                    raise ValueError(f"checksum mismatch (got {digest}, expected {expected_checksum})")
-
-            os.replace(tmp_path, dest_path)
-            return "downloaded", filename
-        except Exception as e:
-            tmp_path.unlink(missing_ok=True)
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF ** attempt)
-            else:
-                return "error", f"{filename}: {e}"
-
-    return "error", filename
+    error = download_with_retry(url, dest_path, expected_checksum)
+    if error:
+        return "error", f"{filename}: {error}"
+    return "downloaded", filename
 
 
 def run_video(argv, config):
