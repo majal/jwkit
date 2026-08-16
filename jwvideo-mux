@@ -1496,7 +1496,10 @@ def main():
     parser.add_argument("-S", "--single-streams", action="store_true", help="Also produce multiple separate videos with modified audio streams")
     parser.add_argument("-C", "--cleanup", action="store_true", help="Trash downloaded source files after muxing")
     parser.add_argument("-o", "--output-dir", default=".", help="Directory to save output files")
-    parser.add_argument("-f", "--force", action="store_true", help="Force overwrite if output file exists without asking")
+    parser.add_argument("-f", "--force", action="store_true", help="Force overwrite if output file exists without asking (equivalent to --on-exists overwrite for this run)")
+    parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
+    parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
+    parser.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
     parser.add_argument("--no-default-subs", action="store_true", help="Do not set any subtitle track as default")
     parser.add_argument("--default-video", help="Language code to set as default video track")
     parser.add_argument("--default-audio", help="Language code to set as default audio track")
@@ -1923,13 +1926,21 @@ def main():
     else:
         out_name = f"merged_{'-'.join(langs_loaded)}_output.{args.container}"
     out_path = out_dir / out_name
-    
-    if out_path.exists() and not args.force:
-        ans = input(f"File {out_name} already exists. Overwrite? [y/N] ")
-        if ans.lower() not in ['y', 'yes']:
-            color_print("Aborting muxing.", "31")
-            sys.exit(0)
-            
+
+    if args.force:
+        jwkit_config = {"on_output_exists": "overwrite"}
+    else:
+        jwkit_config = _jwkit_common.load_jwkit_config()
+        for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
+            value = getattr(args, arg_name, None)
+            if value is not None:
+                jwkit_config[config_key] = value
+    resolved_out_path = _jwkit_common.resolve_output_conflict(out_path, jwkit_config)
+    if resolved_out_path is None:
+        color_print("Aborting muxing.", "31")
+        sys.exit(0)
+    out_path = resolved_out_path
+
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + ff_inputs + ff_maps + ff_meta + ["-c:v", "copy", "-c:a", "copy", str(out_path)]
     
     color_print(f"Creating merged {args.container.upper()}: {out_name}", "36")
@@ -1960,11 +1971,19 @@ def main():
 
                 out_single = out_dir / f"single_{lang}_{base_vid.stem}.mp4"
 
-                if out_single.exists() and not args.force:
-                    ans = input(f"File {out_single.name} already exists. Overwrite? [y/N] ")
-                    if ans.lower() not in ['y', 'yes']:
-                        color_print(f"Skipping {out_single.name}", "33")
-                        continue
+                if args.force:
+                    single_jwkit_config = {"on_output_exists": "overwrite"}
+                else:
+                    single_jwkit_config = _jwkit_common.load_jwkit_config()
+                    for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
+                        value = getattr(args, arg_name, None)
+                        if value is not None:
+                            single_jwkit_config[config_key] = value
+                resolved_out_single = _jwkit_common.resolve_output_conflict(out_single, single_jwkit_config)
+                if resolved_out_single is None:
+                    color_print(f"Skipping {out_single.name}", "33")
+                    continue
+                out_single = resolved_out_single
 
                 cmd_single = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(base_vid)]
                 maps = ["-map", "0:v"]

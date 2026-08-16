@@ -24,6 +24,28 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 # Resolved once at startup by main() -> _jwkit_common.resolve_color_enabled.
 COLOR = _jwkit_common.Colorizer(False)
 
+# Resolved once at startup by main()/run_periodicals/run_video, from the
+# shared jwkit config plus this run's --on-exists/--on-exists-unattended/
+# --overwrite-timeout overrides if any - download_track/download_periodical_file/
+# download_video read this directly rather than threading it through every
+# call site (they can run concurrently across a ThreadPoolExecutor).
+JWKIT_CONFIG = None
+
+
+def _apply_overwrite_overrides(args):
+    config = _jwkit_common.load_jwkit_config()
+    for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            config[config_key] = value
+    return config
+
+
+def _add_overwrite_args(parser):
+    parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
+    parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
+    parser.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
+
 
 def migrate_legacy_config_dir():
     """One-time move from the pre-unification ~/.config/maj-scripts/jwdl
@@ -196,6 +218,31 @@ def download_with_retry(url, dest_path, expected_checksum=None):
     return str(last_error)
 
 
+def _resolve_existing_download(dest_path, expected_size, dry_run):
+    """Shared by download_track/download_periodical_file/download_video, all
+    of which repeat this same check: a same-sized existing file needs no
+    work at all (not an overwrite scenario); a differently-sized one is
+    about to be silently clobbered by a fresh download, so it goes through
+    the shared on_output_exists policy instead. Returns ("skip", status) to
+    short-circuit the caller with that status, or ("proceed", dest_path)
+    with dest_path possibly updated by a rename policy. Note: these
+    downloads can run concurrently across a ThreadPoolExecutor, so an
+    on_output_exists=ask policy may show interleaved prompts for the rare
+    case of multiple mismatched files in one run - a real but acceptable
+    rough edge given how uncommon a size mismatch actually is."""
+    if dest_path.exists():
+        if expected_size is None or dest_path.stat().st_size == expected_size:
+            return "skip", "skipped-exists"
+        if not dry_run:
+            resolved = _jwkit_common.resolve_output_conflict(dest_path, JWKIT_CONFIG or _jwkit_common.load_jwkit_config())
+            if resolved is None:
+                return "skip", "skipped-exists"
+            dest_path = resolved
+    if dry_run:
+        return "skip", "would-download"
+    return "proceed", dest_path
+
+
 def download_track(entry, dest_dir, dry_run, include_audio_descriptions):
     title = entry.get("title", "")
     if not include_audio_descriptions and is_audio_description(title):
@@ -210,11 +257,11 @@ def download_track(entry, dest_dir, dry_run, include_audio_descriptions):
     dest_path = dest_dir / filename
     expected_size = entry.get("filesize")
 
-    if dest_path.exists() and (expected_size is None or dest_path.stat().st_size == expected_size):
-        return "skipped-exists", filename
-
-    if dry_run:
-        return "would-download", filename
+    action, result = _resolve_existing_download(dest_path, expected_size, dry_run)
+    if action == "skip":
+        return result, filename
+    dest_path = result
+    filename = dest_path.name  # may have changed under an on_output_exists=rename policy
 
     expected_checksum = file_info.get("checksum")
     error = download_with_retry(url, dest_path, expected_checksum)
@@ -305,11 +352,11 @@ def download_periodical_file(entry, dest_dir, dry_run, include_large_print):
     dest_path = dest_dir / filename
     expected_size = entry.get("filesize")
 
-    if dest_path.exists() and (expected_size is None or dest_path.stat().st_size == expected_size):
-        return "skipped-exists", filename
-
-    if dry_run:
-        return "would-download", filename
+    action, result = _resolve_existing_download(dest_path, expected_size, dry_run)
+    if action == "skip":
+        return result, filename
+    dest_path = result
+    filename = dest_path.name  # may have changed under an on_output_exists=rename policy
 
     expected_checksum = file_info.get("checksum")
     error = download_with_retry(url, dest_path, expected_checksum)
@@ -365,8 +412,12 @@ def run_periodicals(argv, config):
     parser.add_argument("--dir", type=Path, help="override the destination directory for a single periodical")
     parser.add_argument("--base-dir", type=Path, help="override the base periodicals directory")
     parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
+    _add_overwrite_args(parser)
     args = parser.parse_args(argv)
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
+
+    global JWKIT_CONFIG
+    JWKIT_CONFIG = _apply_overwrite_overrides(args)
 
     base_dir = args.base_dir or Path(config.get("periodicals_base_dir", str(DEFAULT_PERIODICALS_BASE_DIR)))
 
@@ -466,11 +517,11 @@ def download_video(entry, dest_dir, resolution, dry_run):
     dest_path = dest_dir / filename
     expected_size = file_entry.get("filesize")
 
-    if dest_path.exists() and (expected_size is None or dest_path.stat().st_size == expected_size):
-        return "skipped-exists", filename
-
-    if dry_run:
-        return "would-download", filename
+    action, result = _resolve_existing_download(dest_path, expected_size, dry_run)
+    if action == "skip":
+        return result, filename
+    dest_path = result
+    filename = dest_path.name  # may have changed under an on_output_exists=rename policy
 
     expected_checksum = file_entry.get("checksum")
     error = download_with_retry(url, dest_path, expected_checksum)
@@ -495,8 +546,12 @@ def run_video(argv, config):
     parser.add_argument("--dir", type=Path, help="override the destination directory")
     parser.add_argument("--base-dir", type=Path, help="override the base video directory")
     parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
+    _add_overwrite_args(parser)
     args = parser.parse_args(argv)
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
+
+    global JWKIT_CONFIG
+    JWKIT_CONFIG = _apply_overwrite_overrides(args)
 
     base_dir = args.base_dir or Path(config.get("video_base_dir", str(DEFAULT_VIDEO_BASE_DIR)))
 
@@ -593,8 +648,12 @@ def main():
     parser.add_argument("--workers", type=int, help="parallel downloads per pub (default: 4)")
     parser.add_argument("--color", action="store_true", help="force colored output for this run (works with 'periodicals'/'video' too - already applied before this parser runs)")
     parser.add_argument("--no-color", action="store_true", help="disable colored output for this run (works with 'periodicals'/'video' too - already applied before this parser runs)")
+    _add_overwrite_args(parser)
     args = parser.parse_args()
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
+
+    global JWKIT_CONFIG
+    JWKIT_CONFIG = _apply_overwrite_overrides(args)
 
     pubs = resolve_pubs(config)
     base_dir = args.base_dir or Path(config["base_dir"])

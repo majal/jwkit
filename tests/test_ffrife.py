@@ -4,7 +4,7 @@ import argparse
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tests.support import load_script_module
 
@@ -249,13 +249,14 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
             if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
                 (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
 
-        def fake_run_rife(rife_path, in_frames, out_frames, target_count, slow_after=4.0):
+        def fake_run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
             (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
             (Path(out_frames) / "00000002.png").write_bytes(b"\x89PNG")
 
         with patch.object(self.ffrife, "command_exists", return_value=True), \
              patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
              patch.object(self.ffrife, "run_rife", fake_run_rife), \
+             patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
              patch.object(self.ffrife.subprocess, "run"):
             ok = self.ffrife.interpolate("in.mp4", "out.mp4", config, speed=0.5, fps=60)
 
@@ -265,6 +266,78 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         merge_cmd = calls[-1]
         vf = merge_cmd[merge_cmd.index("-vf") + 1]
         self.assertIn("setpts=PTS/0.5", vf)
+
+    def test_rife_target_count_matches_a_non_2x_ratio(self) -> None:
+        # 24fps source -> 60fps target is a 2.5x ratio, not RIFE's implicit
+        # 2x default - target_count has to be computed explicitly.
+        config = {"rife_binary_path": "/fake/rife"}
+        rife_calls = []
+
+        def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+            if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
+                for i in range(24):
+                    (Path(cmd[-1]).parent / f"{i:08d}.png").write_bytes(b"\x89PNG")
+
+        def fake_run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
+            rife_calls.append((target_count, model_path))
+            (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
+
+        with patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+             patch.object(self.ffrife, "run_rife", fake_run_rife), \
+             patch.object(self.ffrife, "probe_source_fps", return_value=24.0), \
+             patch.object(self.ffrife.subprocess, "run"):
+            ok = self.ffrife.interpolate("in.mp4", "out.mp4", config, fps=60)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(rife_calls), 1)
+        target_count, model_path = rife_calls[0]
+        self.assertEqual(target_count, 60)  # 24 frames * 60/24
+
+    def test_rife_model_path_derives_from_rife_binary_directory(self) -> None:
+        config = {"rife_binary_path": "/fake/bin/rife-ncnn-vulkan", "rife_model": "rife-v4.6"}
+        rife_calls = []
+
+        def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+            if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
+                (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
+
+        def fake_run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
+            rife_calls.append(model_path)
+            (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
+
+        with patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+             patch.object(self.ffrife, "run_rife", fake_run_rife), \
+             patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
+             patch.object(self.ffrife.subprocess, "run"):
+            self.ffrife.interpolate("in.mp4", "out.mp4", config, fps=60)
+
+        self.assertEqual(len(rife_calls), 1)
+        self.assertEqual(str(rife_calls[0]), "/fake/bin/rife-v4.6")
+
+
+class FfrifePruneUnusedModelsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_keeps_only_the_configured_model_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            models_dir = Path(td)
+            for name in ("rife-v2.3", "rife-v4", "rife-v4.6", "rife-anime"):
+                (models_dir / name).mkdir()
+                (models_dir / name / "flownet.param").write_bytes(b"x")
+            (models_dir / "rife-ncnn-vulkan").write_bytes(b"\x7fELF")  # the executable, a file not a dir
+            (models_dir / "LICENSE").write_bytes(b"MIT")
+
+            self.ffrife.prune_unused_models(models_dir, "rife-v4.6")
+
+            remaining_dirs = {p.name for p in models_dir.iterdir() if p.is_dir()}
+            self.assertEqual(remaining_dirs, {"rife-v4.6"})
+            # non-model files are untouched
+            self.assertTrue((models_dir / "rife-ncnn-vulkan").exists())
+            self.assertTrue((models_dir / "LICENSE").exists())
 
 
 class FfrifeCliDispatchTest(unittest.TestCase):
@@ -298,7 +371,7 @@ class FfrifeCliDispatchTest(unittest.TestCase):
         self.assertEqual(args.command, "run")
         self.assertEqual(args.input, "in.mp4")
         self.assertEqual(args.output, "out.mp4")
-        self.assertEqual(args.fps, 60)
+        self.assertEqual(args.fps, "60")
 
 
 class FfrifeCmdBenchmarkSampleTrimTest(unittest.TestCase):
@@ -360,6 +433,127 @@ class FfrifeCmdBenchmarkSampleTrimTest(unittest.TestCase):
         actual_sample = run_bench.call_args[0][1]
         self.assertEqual(actual_sample, "/fake/short_clip.mp4")  # used as-is, no trim encode was run
         self.assertFalse(any(c[0] == "ffmpeg" for c in calls))
+
+
+class FfrifeResolveTargetFpsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_plain_literal(self) -> None:
+        self.assertEqual(self.ffrife.resolve_target_fps("60", 24.0), 60.0)
+
+    def test_multiplier_suffix(self) -> None:
+        self.assertEqual(self.ffrife.resolve_target_fps("2x", 24.0), 48.0)
+        self.assertEqual(self.ffrife.resolve_target_fps("2.5x", 24.0), 60.0)
+
+    def test_percent_suffix(self) -> None:
+        self.assertEqual(self.ffrife.resolve_target_fps("150%", 24.0), 36.0)
+
+    def test_uppercase_x_suffix(self) -> None:
+        self.assertEqual(self.ffrife.resolve_target_fps("2X", 24.0), 48.0)
+
+
+class FfrifeInterpolateFpsResolutionTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_relative_fps_spec_probes_source_and_resolves_before_rife(self) -> None:
+        config = {"rife_binary_path": "/fake/rife"}
+        rife_calls = []
+
+        def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+            if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
+                (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
+
+        def fake_run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
+            rife_calls.append(target_count)
+            (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
+
+        with patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+             patch.object(self.ffrife, "run_rife", fake_run_rife), \
+             patch.object(self.ffrife, "probe_source_fps", return_value=24.0), \
+             patch.object(self.ffrife.subprocess, "run"):
+            self.ffrife.interpolate("in.mp4", "out.mp4", config, fps="2x")
+
+        # 1 input frame * (2x of 24 = 48fps) / 24fps source = target_count 2
+        self.assertEqual(rife_calls, [2])
+
+
+class FfrifeOldBinaryCapabilityProbeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_returns_true_when_binary_produces_expected_frame_count(self) -> None:
+        def fake_run(cmd, check=False, capture_output=False, text=False, timeout=None):
+            if cmd[0] == self.ffrife.FFMPEG_BIN:
+                out_path = Path(cmd[-1])
+                out_path.write_bytes(b"\x89PNG")
+                return MagicMock(returncode=0)
+            # the RIFE invocation itself - simulate 3 output frames written
+            out_dir = Path(cmd[cmd.index("-o") + 1])
+            for i in range(3):
+                (out_dir / f"{i:08d}.png").write_bytes(b"\x89PNG")
+            return MagicMock(returncode=0)
+
+        with patch.object(self.ffrife.subprocess, "run", fake_run):
+            self.assertTrue(self.ffrife.rife_supports_custom_frame_count("/fake/rife", "/fake/model"))
+
+    def test_returns_false_on_nonzero_exit(self) -> None:
+        def fake_run(cmd, check=False, capture_output=False, text=False, timeout=None):
+            if cmd[0] == self.ffrife.FFMPEG_BIN:
+                Path(cmd[-1]).write_bytes(b"\x89PNG")
+                return MagicMock(returncode=0)
+            return MagicMock(returncode=1, stdout="", stderr="only rife-v4 model support custom numframe and timestep")
+
+        with patch.object(self.ffrife.subprocess, "run", fake_run):
+            self.assertFalse(self.ffrife.rife_supports_custom_frame_count("/fake/rife", "/fake/model"))
+
+    def test_returns_false_on_exception(self) -> None:
+        with patch.object(self.ffrife.subprocess, "run", side_effect=OSError("boom")):
+            self.assertFalse(self.ffrife.rife_supports_custom_frame_count("/fake/rife", "/fake/model"))
+
+
+class FfrifeCmdSetupReinstallOfferTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_offers_reinstall_when_capability_probe_fails(self) -> None:
+        config = {"rife_binary_path": "/fake/bin/old-release/rife-ncnn-vulkan", "rife_model": "rife-v4.6"}
+        with patch.object(self.ffrife, "resolve_ffmpeg_binary", return_value="ffmpeg"), \
+             patch.object(self.ffrife, "ffmpeg_has_filter", return_value=True), \
+             patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "rife_supports_custom_frame_count", return_value=False), \
+             patch.object(self.ffrife, "install_rife", return_value=None) as install_mock, \
+             patch("builtins.input", return_value="y"):
+            self.ffrife.cmd_setup(config)
+        install_mock.assert_called_once()
+
+    def test_skips_reinstall_when_declined(self) -> None:
+        config = {"rife_binary_path": "/fake/bin/old-release/rife-ncnn-vulkan", "rife_model": "rife-v4.6"}
+        with patch.object(self.ffrife, "resolve_ffmpeg_binary", return_value="ffmpeg"), \
+             patch.object(self.ffrife, "ffmpeg_has_filter", return_value=True), \
+             patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "rife_supports_custom_frame_count", return_value=False), \
+             patch.object(self.ffrife, "install_rife") as install_mock, \
+             patch("builtins.input", return_value="n"):
+            self.ffrife.cmd_setup(config)
+        install_mock.assert_not_called()
+
+    def test_no_reinstall_offer_when_capability_probe_succeeds(self) -> None:
+        config = {"rife_binary_path": "/fake/bin/rife-ncnn-vulkan", "rife_model": "rife-v4.6"}
+        with patch.object(self.ffrife, "resolve_ffmpeg_binary", return_value="ffmpeg"), \
+             patch.object(self.ffrife, "ffmpeg_has_filter", return_value=True), \
+             patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "rife_supports_custom_frame_count", return_value=True), \
+             patch.object(self.ffrife, "install_rife") as install_mock, \
+             patch("builtins.input", side_effect=AssertionError("should not prompt")):
+            self.ffrife.cmd_setup(config)
+        install_mock.assert_not_called()
 
 
 if __name__ == "__main__":

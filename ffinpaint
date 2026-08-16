@@ -113,6 +113,9 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     setup = sub.add_parser("setup"); setup.add_argument("--root"); setup.add_argument("--checkpoint")
     run = sub.add_parser("run"); run.add_argument("input"); run.add_argument("-o", "--output", required=True); run.add_argument("--box", required=True); run.add_argument("--start", type=float); run.add_argument("--end", type=float)
+    run.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
+    run.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
+    run.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
     for p in (setup, run):
         color_group = p.add_mutually_exclusive_group()
         color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colored output for this run")
@@ -133,7 +136,17 @@ def main(argv=None):
         save_config(config); return
     box = tuple(int(part) for part in args.box.split(","))
     if len(box) != 4: raise SystemExit("--box must be x,y,w,h")
-    if not inpaint(args.input, args.output, box, config, args.start, args.end):
+
+    jwkit_config = _jwkit_common.load_jwkit_config()
+    for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            jwkit_config[config_key] = value
+    output = _jwkit_common.resolve_output_conflict(args.output, jwkit_config)
+    if output is None:
+        raise SystemExit(1)
+
+    if not inpaint(args.input, output, box, config, args.start, args.end):
         raise SystemExit("E2FGVI-HQ is not configured; run 'ffinpaint setup'.")
 
 if __name__ == "__main__": main()

@@ -322,5 +322,155 @@ class JwkitCommonBenchmarkTest(unittest.TestCase):
         self.assertEqual(results[0]["crf"], "20")
 
 
+class JwkitCommonParseSizeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def test_bare_number_is_bytes(self) -> None:
+        self.assertEqual(self.common.parse_size("100"), 100)
+
+    def test_decimal_si_suffixes(self) -> None:
+        self.assertEqual(self.common.parse_size("1K"), 1000)
+        self.assertEqual(self.common.parse_size("1M"), 1000 ** 2)
+        self.assertEqual(self.common.parse_size("1G"), 1000 ** 3)
+        self.assertEqual(self.common.parse_size("1T"), 1000 ** 4)
+
+    def test_binary_iec_suffixes(self) -> None:
+        self.assertEqual(self.common.parse_size("1Ki"), 1024)
+        self.assertEqual(self.common.parse_size("1Mi"), 1024 ** 2)
+        self.assertEqual(self.common.parse_size("1Gi"), 1024 ** 3)
+
+    def test_case_insensitive(self) -> None:
+        self.assertEqual(self.common.parse_size("1g"), 1000 ** 3)
+        self.assertEqual(self.common.parse_size("1gi"), 1024 ** 3)
+        self.assertEqual(self.common.parse_size("1GI"), 1024 ** 3)
+
+    def test_fractional_values(self) -> None:
+        self.assertEqual(self.common.parse_size("2.5G"), int(2.5 * 1000 ** 3))
+
+    def test_rejects_unknown_unit(self) -> None:
+        with self.assertRaises(ValueError):
+            self.common.parse_size("5X")
+
+    def test_rejects_garbage(self) -> None:
+        with self.assertRaises(ValueError):
+            self.common.parse_size("not-a-size")
+
+
+class JwkitCommonOverwritePolicyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def _existing_file(self, tmp_path):
+        from pathlib import Path
+        p = Path(tmp_path) / "out.mp4"
+        p.write_bytes(b"x")
+        return p
+
+    def test_nonexistent_path_returns_unchanged(self) -> None:
+        with mock.patch("pathlib.Path.exists", return_value=False):
+            result = self.common.resolve_output_conflict("/does/not/exist.mp4", {"on_output_exists": "overwrite"})
+        self.assertEqual(str(result), "/does/not/exist.mp4")
+
+    def test_overwrite_policy_returns_same_path(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            result = self.common.resolve_output_conflict(p, {"on_output_exists": "overwrite"})
+        self.assertEqual(result, p)
+
+    def test_rename_policy_returns_numbered_sibling(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            result = self.common.resolve_output_conflict(p, {"on_output_exists": "rename"})
+        self.assertEqual(result.name, "out (1).mp4")
+        self.assertFalse(result.exists())
+
+    def test_rename_policy_skips_taken_numbers(self) -> None:
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            (Path(td) / "out (1).mp4").write_bytes(b"x")
+            result = self.common.resolve_output_conflict(p, {"on_output_exists": "rename"})
+        self.assertEqual(result.name, "out (2).mp4")
+
+    def test_fail_policy_returns_none(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            result = self.common.resolve_output_conflict(p, {"on_output_exists": "fail"})
+        self.assertIsNone(result)
+
+    def test_trash_policy_moves_existing_and_returns_same_path(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            with mock.patch.object(self.common, "_move_to_trash") as trash_mock:
+                result = self.common.resolve_output_conflict(p, {"on_output_exists": "trash"})
+        trash_mock.assert_called_once_with(p)
+        self.assertEqual(result, p)
+
+    def test_unrecognized_policy_raises(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            with self.assertRaises(ValueError):
+                self.common.resolve_output_conflict(p, {"on_output_exists": "bogus"})
+
+    def test_ask_without_tty_falls_back_to_unattended_policy(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            with mock.patch.object(self.common.sys.stdin, "isatty", return_value=False):
+                result = self.common.resolve_output_conflict(p, {"on_output_exists": "ask", "on_output_exists_unattended": "overwrite"})
+        self.assertEqual(result, p)
+
+    def test_ask_with_tty_and_yes_answer_overwrites(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            with mock.patch.object(self.common.sys.stdin, "isatty", return_value=True), \
+                 mock.patch.object(self.common, "_prompt_yes_no_with_timeout", return_value=True):
+                result = self.common.resolve_output_conflict(p, {"on_output_exists": "ask"})
+        self.assertEqual(result, p)
+
+    def test_ask_with_tty_and_no_answer_falls_back_to_unattended(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            with mock.patch.object(self.common.sys.stdin, "isatty", return_value=True), \
+                 mock.patch.object(self.common, "_prompt_yes_no_with_timeout", return_value=False):
+                result = self.common.resolve_output_conflict(p, {"on_output_exists": "ask", "on_output_exists_unattended": "rename"})
+        self.assertEqual(result.name, "out (1).mp4")
+
+    def test_ask_timeout_falls_back_to_unattended(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._existing_file(td)
+            with mock.patch.object(self.common.sys.stdin, "isatty", return_value=True), \
+                 mock.patch.object(self.common, "_prompt_yes_no_with_timeout", return_value=None):
+                result = self.common.resolve_output_conflict(p, {"on_output_exists": "ask", "on_output_exists_unattended": "fail"})
+        self.assertIsNone(result)
+
+    def test_numbered_alternative_helper(self) -> None:
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "clip.mp4"
+            p.write_bytes(b"x")
+            result = self.common._numbered_alternative(p)
+        self.assertEqual(result.name, "clip (1).mp4")
+
+    def test_datetime_tagged_helper_preserves_stem_and_suffix(self) -> None:
+        from pathlib import Path
+        result = self.common._datetime_tagged(Path("/tmp/clip.mp4"))
+        self.assertTrue(result.name.startswith("clip (trashed "))
+        self.assertTrue(result.name.endswith(").mp4"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,8 @@ jwkit also updates itself automatically — once a day at most, and only when yo
 
 Output is colored by default on a real terminal (auto-disabled when piped/redirected, or when `NO_COLOR` is set). Every tool takes `--color`/`--no-color` for one run, or set `color_output = always`/`never` in `~/.config/jwkit/config.toml` to change the default everywhere.
 
+When an output file already exists, every tool asks before overwriting it by default (`on_output_exists = ask`) — but only when there's actually a human at the keyboard to ask: a background/cron invocation, a declined prompt, or one that goes unanswered for `overwrite_prompt_timeout` seconds (default 20) all fall back to `on_output_exists_unattended` (default `rename`, writing `name (1).ext` instead) rather than hanging or silently clobbering. Set either in `~/.config/jwkit/config.toml`, or override per-run with `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout`. Other values for either: `overwrite` (just clobber it), `trash` (move the old one to your real OS Trash/Recycle Bin first, datetime-tagged if a same-named item is already there), `fail` (leave it alone and report the conflict).
+
 To uninstall, run:
 
 ```bash

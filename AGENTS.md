@@ -39,6 +39,16 @@ Every tool calls `_jwkit_common.maybe_auto_update(jwkit_root)` right after its o
 - `slverse setup` is the one place a user is asked about this interactively (writes to the *shared* `~/.config/jwkit/config.toml` via `_jwkit_common.save_jwkit_config`, not to `slverse`'s own per-tool config) — `ffrife`/`jwdl`/`jwvideo-mux` don't duplicate the question, they just read whatever's already there (or the default, if nothing's been set yet).
 - Never let this raise out into a tool's real command — the whole check is wrapped in a broad `except Exception: pass`. An update check must never be the reason someone's actual command fails.
 
+## Overwrite Handling (`_jwkit_common.py`)
+
+Every tool that writes a final output file calls `_jwkit_common.resolve_output_conflict(path, jwkit_config)` right before writing it, and uses whatever `Path` it returns (or aborts/skips if it returns `None`) instead of writing straight to the caller-supplied path. Controlled by the shared `~/.config/jwkit/config.toml` (`on_output_exists`, default `ask`; `on_output_exists_unattended`, default `rename`; `overwrite_prompt_timeout`, default 20 seconds) - not per-tool config, since this is a cross-cutting concern, same as `auto_update`/`color_output` above.
+
+- `ask` only prompts when `sys.stdin.isatty()` - a cron/systemd invocation (see the unattended jobs noted under Operational Notes) has no TTY to prompt, so it silently falls through to `on_output_exists_unattended` instead. A prompt that goes unanswered for `overwrite_prompt_timeout` seconds (implemented via a daemon reader thread + `queue.Queue(timeout=...)`, since `input()` has no native cross-platform timeout) falls through the same way, as does an explicit "no" answer.
+- `trash` moves the *existing* file to the real OS Trash/Recycle Bin (macOS: `osascript`/Finder delete; Linux: `gio trash`, falling back to a hand-written freedesktop.org trash-spec implementation; Windows: `ctypes` `SHFileOperationW`, unverified on a real machine - same caveat as `install.ps1` above) before the fresh write lands at the canonical path. A same-named collision already in the trash gets a datetime-tagged rename first, not silently clobbered.
+- `rename` returns the first free `name (1).ext`, `name (2).ext`, ... sibling instead of touching the existing file.
+- Add matching `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` flags to a new tool's own output-writing subcommand (see `ffrife run`'s `p_run.add_argument` calls for the pattern) so the shared config stays overridable per-run everywhere, not just in `~/.config/jwkit/config.toml`.
+- Not every `path.exists()` check in these tools is a "real" overwrite scenario worth routing through this - see `slverse bulk`'s own `--overwrite` (a cache-hit skip for a rerunnable batch job) and `jwpl init`'s config-scaffold guard for two deliberate exceptions.
+
 ## Installer (`install.sh` / `install.ps1`)
 
 Root-level one-liner installers for non-technical users (`curl | bash` on macOS/Linux, `irm | iex` on Windows) — see the Quick Install section of `README.md`. They install missing dependencies (Python, `ffmpeg`, `git` via Homebrew/apt/dnf/pacman/winget), download jwkit to `~/.jwkit` (`%USERPROFILE%\.jwkit` on Windows), add it to `PATH`, and drop a `jwkit-update` command that re-runs the same script.
@@ -139,3 +149,4 @@ Same spirit as `maj-scripts`: practical and skimmable, a light touch is fine, bu
 - if the tool has a live external caller (cron/systemd elsewhere), note it under Operational Notes above and keep its CLI surface backward-compatible
 - add the tool to the `TOOLS`/`$Tools` list in both `install.sh` and `install.ps1` (see Installer above) so the one-line installers pick it up
 - wire in `_jwkit_common.maybe_auto_update(...)` right after `parse_args()` (see Auto-Update above) so the new tool participates in the shared update check
+- if the tool writes a final output file, call `_jwkit_common.resolve_output_conflict(...)` right before writing it and add the matching `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` flags (see Overwrite Handling above)

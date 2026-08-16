@@ -28,7 +28,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import unicodedata
-from fractions import Fraction
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -119,13 +118,14 @@ FONT_ESTIMATOR_WEIGHT = "400"  # Regular - old ffv's delogo-sizing estimator wei
 DEFAULT_CONFIG = {
     "cache_dir": str(DEFAULT_CACHE_DIR),
     "cache_policy": "lru",  # keep_all, lru, delete_after_use
-    "cache_max_gb": "5",
+    "cache_max_size": "5G",  # unix-style size: K/M/G/T/P/E (decimal SI) or Ki/Mi/Gi/Ti/Pi/Ei (binary IEC) - see _jwkit_common.parse_size
     "extract_mode": "cache",  # cache by default: reuse a verified chapter; --onthefly is the explicit streaming escape hatch
     "hardware_encoder": "cpu",  # nvenc, videotoolbox, qsv, cpu
     "video_codec": "av1",  # h264, hevc, av1 - royalty-free and meaningfully smaller than hevc at matched quality; falls back to hevc then h264 automatically if this machine/ffmpeg build can't actually encode it (see build_encode_args)
     "video_crf": "auto",  # codec-specific balanced quality: h264=20, hevc=23, av1=30
     "video_preset": "slow",
     "interpolation_engine": "none",  # none, minterpolate, rife, framerate - "rife" delegates to the sibling ffrife tool; see its own config for rife_binary_path/rife_fallback_engine
+    "interpolation_target_fps": "60",  # flat target frame rate for all three interpolation engines - with rife, ffrife's interpolate() computes the exact frame count to hit this at the source's original duration (no speed change, any ratio), not just a source-fps multiple
     "delogo_engine": "blur",  # blur, auto, inpaint; optional inpainting is delegated to ffinpaint
     "delogo_inpaint_fallback": "blur",  # blur or error when auto/inpaint has no configured backend
     "languages": "ASL,FSL,BVL,INI,SPE",
@@ -199,13 +199,14 @@ def validate_config_value(key, value):
 CONFIG_HELP = {
     "cache_dir": "Where cached full-chapter downloads live",
     "cache_policy": "keep_all, lru, delete_after_use - what happens to a cached chapter after use",
-    "cache_max_gb": "Cache size cap in GB - oldest-used chapters evicted first once hit (cache_policy=lru)",
+    "cache_max_size": "Cache size cap, e.g. 500M, 5G, 2Gi - oldest-used chapters evicted first once hit (cache_policy=lru)",
     "extract_mode": "cache (default, reuse downloaded chapters) or onthefly (explicit streaming, no disk use)",
     "hardware_encoder": "cpu, nvenc, videotoolbox, or qsv",
     "video_codec": "h264, hevc, or av1",
     "video_crf": "Encode quality (lower = higher quality/larger file)",
     "video_preset": "ffmpeg encoder preset (e.g. slow, medium, fast)",
     "interpolation_engine": "none, minterpolate, framerate, or rife (delegates to the sibling ffrife tool)",
+    "interpolation_target_fps": "Flat target frame rate for interpolation (default 60)",
     "delogo_engine": "blur (default), auto (detect occlusion), or inpaint (requires the optional ffinpaint backend)",
     "delogo_inpaint_fallback": "blur (default) or error if the optional inpainting backend is unavailable",
     "languages": "Default language list for 'all' and for 'sync'/'langs'",
@@ -248,6 +249,7 @@ def load_config():
     config = DEFAULT_CONFIG.copy()
     if not CONFIG_FILE.exists():
         return config
+    file_keys = set()
     try:
         with open(CONFIG_FILE, "r") as f:
             for line in f:
@@ -259,8 +261,19 @@ def load_config():
                     k = k.strip()
                     v = v.strip().strip("'").strip('"')
                     config[k] = v
+                    file_keys.add(k)
     except Exception as e:
         print(f"Warning: could not parse config: {e}")
+    if "cache_max_gb" in file_keys:
+        # One-time migration: cache_max_gb's old semantics were binary GiB
+        # (see enforce_cache_budget's old `max_gb * 1024**3`), not decimal -
+        # 'Gi' here keeps the migrated value byte-for-byte equivalent to the
+        # old cap rather than silently shrinking it by ~7%.
+        old_value = config.pop("cache_max_gb")
+        if "cache_max_size" not in file_keys:
+            config["cache_max_size"] = f"{old_value}Gi"
+        save_config(config)
+        print(f"Migrated cache_max_gb to cache_max_size = {config['cache_max_size']} ({CONFIG_FILE})")
     return config
 
 def save_config(config):
@@ -810,14 +823,14 @@ def note_cache_use(state, path):
 def enforce_cache_budget(config, state, protect=None):
     if config.get("cache_policy") != "lru":
         return
+    cache_max_size = config.get("cache_max_size", DEFAULT_CONFIG["cache_max_size"])
     try:
-        max_gb = float(config.get("cache_max_gb", DEFAULT_CONFIG["cache_max_gb"]))
+        budget_bytes = _jwkit_common.parse_size(cache_max_size)
     except ValueError:
         return
     cache_dir = Path(config["cache_dir"])
     if not cache_dir.exists():
         return
-    budget_bytes = max_gb * (1024 ** 3)
 
     with _CACHE_LOCK:
         access_map = state.setdefault("_cache_access", {})
@@ -846,7 +859,7 @@ def enforce_cache_budget(config, state, protect=None):
                 path.unlink()
                 access_map.pop(str(path), None)
                 total -= size
-                print(f"Cache trim: removed {path.name} ({size/1e6:.1f} MB) to stay under {max_gb}GB.")
+                print(f"Cache trim: removed {path.name} ({size/1e6:.1f} MB) to stay under {cache_max_size}.")
             except OSError:
                 pass
     # Mutates state in place; the caller is responsible for save_state(), the
@@ -1373,27 +1386,25 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
         if len(segments) > 1:
             print(COLOR.yellow("(trim_mid_transitions doesn't support interpolation_engine=rife yet - mid-range transitions will play through untouched.)"))
         ffrife = load_ffrife()
-        # RIFE always exactly doubles frame count - merging at a fixed 60fps
-        # only preserves duration when the source is exactly 30fps. JW's own
-        # sources are commonly 30000/1001 (29.97fps), so a hardcoded 60
-        # drifts the whole clip (and every overlay fade timestamp in it) by
-        # ~0.1%: a real, cumulative desync, not just an off-by-a-frame
-        # rounding issue. 2x the source's own fps is the only value that
-        # keeps output duration - and therefore fade timing - correct (see
-        # probe_source_fps's docstring / extract_verse_sections' own use of
-        # this same pattern for --slow).
-        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=overlay, fps=probe_source_fps(source) * 2, metadata_args=metadata_args)
+        # ffrife's interpolate() probes the source's own fps and computes the
+        # exact RIFE frame count needed to hit target_fps at the source's
+        # original duration - so a flat target here doesn't drift the clip
+        # (and every overlay fade timestamp in it) the way a hardcoded 60
+        # would if the source isn't exactly 30fps.
+        target_fps = float(config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"]))
+        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=overlay, fps=target_fps, metadata_args=metadata_args)
         return
 
+    target_fps = float(config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"]))
     vf_chain = list(filter(None, [overlay]))
     if engine == "minterpolate":
         print()
         print("Interpolating using ffmpeg minterpolate...")
-        vf_chain.append("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+        vf_chain.append(f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
     elif engine == "framerate":
         print()
         print("Interpolating using ffmpeg framerate...")
-        vf_chain.append("framerate=fps=60")
+        vf_chain.append(f"framerate=fps={target_fps}")
 
     # -ss before -i does an input-side seek; on a remote URL that means the
     # CDN is only asked for bytes from roughly that point on, which is what
@@ -1431,17 +1442,6 @@ def parse_speed(value):
         num, den = s.split("/", 1)
         return float(num) / float(den)
     return float(s)
-
-def probe_source_fps(source):
-    """ffprobe's r_frame_rate comes back as an 'N/D' fraction (e.g.
-    '30000/1001'), not a plain float. Used to size ffrife's merge fps for
-    --slow sections: RIFE always exactly doubles frame count, so requesting
-    2x source fps keeps the pre-retime frame set at the source's original
-    duration - the only fps value that keeps final output duration correct
-    for any --speed (see extract_verse_sections)."""
-    cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(source)]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return float(Fraction(result.stdout.strip()))
 
 def has_audio_stream(source):
     """JW's own Sign Language source videos carry no audio track at all
@@ -1566,7 +1566,7 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
         abs_bounds = [start_time + b for b in boundaries]
         starts = [start_time] + abs_bounds
         ends = abs_bounds + [end_time]
-        source_fps = None
+        target_fps = float(config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"]))
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             pieces = []
@@ -1577,9 +1577,7 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
                 if (i + 1) % 2 == 0:
                     # Slow section: RIFE + retime, one merge encode (see
                     # ffrife.interpolate's `speed` param).
-                    if source_fps is None:
-                        source_fps = probe_source_fps(source)
-                    ffrife.interpolate(source, piece, ffrife_config, start=seg_start, end=seg_end, vf=None, fps=source_fps * 2, speed=speed)
+                    ffrife.interpolate(source, piece, ffrife_config, start=seg_start, end=seg_end, vf=None, fps=target_fps, speed=speed)
                 else:
                     # Normal-speed section: plain cut, no interpolation needed.
                     cmd = ["-ss", str(seg_start), "-to", str(seg_end), "-i", str(source), "-c:a", "copy"] + build_encode_args(config) + [str(piece)]
@@ -1587,7 +1585,7 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
 
             # concat *filter*, not the concat demuxer/-c copy: pieces have
             # different internal frame rates (normal pieces at source fps,
-            # RIFE'd pieces at source_fps*2), and stream-copy concat doesn't
+            # RIFE'd pieces at target_fps), and stream-copy concat doesn't
             # reconcile that - see ffslow's own version of this comment.
             concat_inputs = []
             concat_filter = ""
@@ -1608,12 +1606,12 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
     if mode == "slow" and engine == "minterpolate":
         print()
         print("Interpolating using ffmpeg minterpolate...")
-        prefix = "[0:v]minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1[base];"
+        prefix = f"[0:v]minterpolate=fps={config.get('interpolation_target_fps', DEFAULT_CONFIG['interpolation_target_fps'])}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1[base];"
         base_label = "[base]"
     elif mode == "slow" and engine == "framerate":
         print()
         print("Interpolating using ffmpeg framerate...")
-        prefix = "[0:v]framerate=fps=60[base];"
+        prefix = f"[0:v]framerate=fps={config.get('interpolation_target_fps', DEFAULT_CONFIG['interpolation_target_fps'])}[base];"
         base_label = "[base]"
 
     fc, out_label = build_sectioned_filter_complex(boundaries, speed, mode, base_label)
@@ -1811,9 +1809,9 @@ def cmd_setup(args, config):
     if ans:
         config["languages"] = ",".join(c.strip().upper() for c in ans.split(",") if c.strip())
 
-    ans = input(f"\nHow much disk space can slverse use to cache downloaded chapters, in GB? [{config.get('cache_max_gb', DEFAULT_CONFIG['cache_max_gb'])}]: ").strip()
+    ans = input(f"\nHow much disk space can slverse use to cache downloaded chapters? e.g. 500M, 5G, 2Gi [{config.get('cache_max_size', DEFAULT_CONFIG['cache_max_size'])}]: ").strip()
     if ans:
-        config["cache_max_gb"] = ans
+        config["cache_max_size"] = ans
         config["cache_policy"] = "lru"
 
     print("\n60fps playback options:")
@@ -2354,6 +2352,16 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url, source_labels=source_labels, fade_outs=fade_outs)
         return lang, None, None
 
+    jwkit_config = _jwkit_common.load_jwkit_config()
+    for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            jwkit_config[config_key] = value
+    resolved_output = _jwkit_common.resolve_output_conflict(out_filename, jwkit_config)
+    if resolved_output is None:
+        return lang, None, f"{out_filename} already exists (on_output_exists=fail) - skipped."
+    out_filename = str(resolved_output)
+
     mode, boundaries, speed, retime_error = resolve_retime_args(args, end_time - start_time)
     if retime_error:
         return lang, None, retime_error
@@ -2654,8 +2662,8 @@ def cmd_cache(args, config):
             size = cache_dir_size(lang_dir)
             total += size
             print(f"  {lang_dir.name:8} {size/1e6:8.1f} MB")
-        max_gb = config.get("cache_max_gb", DEFAULT_CONFIG["cache_max_gb"])
-        print(f"Total: {total/1e9:.2f} GB (cap: {max_gb} GB, policy: {config.get('cache_policy')})")
+        cache_max_size = config.get("cache_max_size", DEFAULT_CONFIG["cache_max_size"])
+        print(f"Total: {total/1e9:.2f} GB (cap: {cache_max_size}, policy: {config.get('cache_policy')})")
 
 def parse_book_range(spec):
     if not spec or spec.lower() == "all":
@@ -2711,11 +2719,13 @@ def bulk_one_lang(lang, books, args, config):
                 shutil.copy(tmp_download, out_file)
             elif engine == "rife":
                 ffrife = load_ffrife()
-                # See extract_verse's own comment: fixed 60fps only preserves
-                # duration when the source happens to be exactly 30fps.
-                ffrife.interpolate(str(tmp_download), str(out_file), ffrife_config_for(bulk_config), fps=probe_source_fps(tmp_download) * 2)
+                # See extract_verse's own comment: ffrife.interpolate() probes
+                # the source's own fps and computes the exact frame count
+                # needed to hit target_fps at the source's original duration.
+                ffrife.interpolate(str(tmp_download), str(out_file), ffrife_config_for(bulk_config), fps=float(bulk_config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"])))
             else:
-                minterp = "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1" if engine == "minterpolate" else "framerate=fps=60"
+                target_fps = bulk_config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"])
+                minterp = f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1" if engine == "minterpolate" else f"framerate=fps={target_fps}"
                 run_ffmpeg(["-i", str(tmp_download), "-vf", minterp, "-c:a", "copy"] + build_encode_args(bulk_config) + [str(out_file)], duration=duration)
         print(f"[{lang}] {book_num}_{chapter}: done.")
 
@@ -2797,6 +2807,9 @@ def main():
         p.add_argument("--codec", choices=["h264", "hevc", "av1"], help="Video codec for this run (default: configured video_codec)")
         p.add_argument("--crf", help="Video quality for this run; use 'auto' for the codec default")
         p.add_argument("--preset", help="FFmpeg encoder preset for this run (e.g. slow, medium, fast)")
+        p.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
+        p.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
+        p.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
     add_generic_config_overrides(p_extract)
 
     p_find = subparsers.add_parser("find", help="Search already-synced languages for who has a given verse")
