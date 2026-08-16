@@ -78,6 +78,7 @@ Use a pre-downloaded local file:
 - `-s, --subs`: Comma-separated languages for subtitles. If omitted, automatically fetches subtitles for all requested video and audio languages.
 - `-r, --res`: Target video resolution (default: `720p`)
 - `-c, --container`: Export container format, `mkv` or `mp4` (default: `mkv`). *Note: MKV is recommended for robust multi-track and native WebVTT subtitle support.*
+- `-f, --force` skips the output-already-exists check entirely (same as `--on-exists overwrite` for this run). Without it, an existing output file goes through the shared `on_output_exists` policy (default: ask, with a non-interactive fallback for cron/unattended runs - see the README) - `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` override it for one run.
 - Spoken languages prefer downloading the much smaller MP3 files. Sign languages download the MP4 file to preserve the video track.
 - Automatically tags audio and video streams with ISO 639-2 codes and display names.
 - `--analyze-video-variants` compares selected video-language files without

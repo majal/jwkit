@@ -6,13 +6,17 @@ since these are standalone shebang scripts rather than a package).
 Currently just the on-run auto-update check. Not jw.org-specific and not
 tied to any one tool, so new shared cross-tool concerns belong here too.
 """
+import datetime
 import json
 import os
+import platform
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -24,6 +28,9 @@ DEFAULT_JWKIT_CONFIG = {
     "auto_update": True,
     "auto_update_interval_hours": 24,
     "color_output": "auto",  # auto (color on a real terminal, off when piped/redirected or NO_COLOR is set), always, never
+    "on_output_exists": "ask",  # ask, overwrite, rename, trash, fail - see resolve_output_conflict
+    "on_output_exists_unattended": "rename",  # what "ask" falls back to with no TTY to prompt, a declined/timed-out prompt - never "ask" itself
+    "overwrite_prompt_timeout": 20,  # seconds to wait for an "ask" answer before falling back to on_output_exists_unattended
 }
 
 _COLOR_CODES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
@@ -378,6 +385,15 @@ def load_jwkit_config():
                     config["auto_update_interval_hours"] = float(v)
                 except ValueError:
                     pass
+            elif k == "on_output_exists":
+                config["on_output_exists"] = v
+            elif k == "on_output_exists_unattended":
+                config["on_output_exists_unattended"] = v
+            elif k == "overwrite_prompt_timeout":
+                try:
+                    config["overwrite_prompt_timeout"] = float(v)
+                except ValueError:
+                    pass
     except OSError:
         pass
     return config
@@ -389,6 +405,9 @@ def save_jwkit_config(config):
         f.write(f"auto_update = {'true' if config.get('auto_update', True) else 'false'}\n")
         f.write(f"auto_update_interval_hours = {config.get('auto_update_interval_hours', 24)}\n")
         f.write(f"color_output = {config.get('color_output', 'auto')}\n")
+        f.write(f"on_output_exists = {config.get('on_output_exists', 'ask')}\n")
+        f.write(f"on_output_exists_unattended = {config.get('on_output_exists_unattended', 'rename')}\n")
+        f.write(f"overwrite_prompt_timeout = {config.get('overwrite_prompt_timeout', 20)}\n")
 
 
 def _read_last_checked():
@@ -525,3 +544,196 @@ def maybe_auto_update(jwkit_root):
             print(f"(To turn this off: run 'slverse setup' again, or set auto_update = false in {JWKIT_CONFIG_FILE})")
     except Exception:
         pass
+
+
+# --- Size parsing (cache caps, etc.) ---
+_SIZE_UNITS = {
+    "": 1, "b": 1,
+    "k": 1000, "m": 1000 ** 2, "g": 1000 ** 3, "t": 1000 ** 4, "p": 1000 ** 5, "e": 1000 ** 6,
+    "ki": 1024, "mi": 1024 ** 2, "gi": 1024 ** 3, "ti": 1024 ** 4, "pi": 1024 ** 5, "ei": 1024 ** 6,
+}
+
+
+def parse_size(value):
+    """Unix-style size string -> bytes (int). Bare number is bytes; K/M/G/T/P/E
+    are decimal SI (x1000 per step, e.g. '1G' = 1_000_000_000); Ki/Mi/Gi/Ti/Pi/Ei
+    are binary IEC (x1024 per step, e.g. '1Gi' = 1_073_741_824) - case-insensitive."""
+    s = str(value).strip()
+    m = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*([A-Za-z]*)", s)
+    if not m:
+        raise ValueError(f"not a size: {value!r} (expected e.g. '500M', '5G', '2Gi', or a bare byte count)")
+    number, unit = m.group(1), m.group(2).lower()
+    if unit not in _SIZE_UNITS:
+        raise ValueError(f"unrecognized size unit {unit!r} in {value!r} (expected one of: K M G T P E, or Ki Mi Gi Ti Pi Ei)")
+    return int(float(number) * _SIZE_UNITS[unit])
+
+
+# --- Output-overwrite handling ---
+def _numbered_alternative(path):
+    """The first path.with_name('name (N).ext') that doesn't already exist."""
+    path = Path(path)
+    stem, suffix, n = path.stem, path.suffix, 1
+    while True:
+        candidate = path.with_name(f"{stem} ({n}){suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _datetime_tagged(path):
+    tag = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    path = Path(path)
+    return path.with_name(f"{path.stem} (trashed {tag}){path.suffix}")
+
+
+def _prompt_yes_no_with_timeout(prompt, timeout):
+    """input() has no native cross-platform timeout, so a reader thread does
+    the blocking read and the main thread waits on it with a timeout - works
+    the same on POSIX and Windows (unlike a select()-based approach, which
+    only works with sockets on Windows). Returns True/False, or None on
+    timeout. The reader thread is a daemon: if it times out, it's left
+    blocked on stdin forever, but that's fine since the process moves on and
+    exits soon after either way."""
+    result = queue.Queue(maxsize=1)
+
+    def _read():
+        try:
+            result.put(input(prompt))
+        except Exception:
+            result.put(None)
+
+    threading.Thread(target=_read, daemon=True).start()
+    try:
+        answer = result.get(timeout=timeout)
+    except queue.Empty:
+        return None
+    if answer is None:
+        return None
+    return str(answer).strip().lower() in ("y", "yes")
+
+
+def _move_to_trash_macos(path):
+    path = Path(path)
+    trash_dir = Path.home() / ".Trash"
+    if trash_dir.exists() and (trash_dir / path.name).exists():
+        path = path.rename(_datetime_tagged(path))
+    subprocess.run(
+        ["osascript", "-e", f'tell application "Finder" to delete (POSIX file "{path}")'],
+        capture_output=True, text=True, check=True,
+    )
+
+
+def _move_to_trash_linux(path):
+    path = Path(path)
+    trash_files_dir = Path.home() / ".local" / "share" / "Trash" / "files"
+    if trash_files_dir.exists() and (trash_files_dir / path.name).exists():
+        path = path.rename(_datetime_tagged(path))
+    if shutil.which("gio"):
+        subprocess.run(["gio", "trash", str(path)], capture_output=True, text=True, check=True)
+        return
+    # Minimal freedesktop.org trash-spec fallback for boxes without gio
+    # (plausible on a headless server - see AGENTS.md's unattended jobs).
+    trash_info_dir = Path.home() / ".local" / "share" / "Trash" / "info"
+    trash_files_dir.mkdir(parents=True, exist_ok=True)
+    trash_info_dir.mkdir(parents=True, exist_ok=True)
+    dest = trash_files_dir / path.name
+    n = 1
+    while dest.exists():
+        dest = trash_files_dir / f"{path.stem} ({n}){path.suffix}"
+        n += 1
+    deletion_date = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    (trash_info_dir / f"{dest.name}.trashinfo").write_text(
+        f"[Trash Info]\nPath={path.resolve()}\nDeletionDate={deletion_date}\n"
+    )
+    shutil.move(str(path), str(dest))
+
+
+def _move_to_trash_windows(path):
+    """Windows' Recycle Bin doesn't expose a simple listable "does this name
+    already exist" the way macOS/Linux trash directories do (obfuscated
+    per-SID storage), so datetime-tag unconditionally rather than trying to
+    detect a collision first. Unverified on a real Windows machine - same
+    caveat as install.ps1 (see AGENTS.md)."""
+    import ctypes
+
+    path = Path(path).rename(_datetime_tagged(Path(path)))
+    SHFileOperationW = ctypes.windll.shell32.SHFileOperationW
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p),
+            ("wFunc", ctypes.c_uint),
+            ("pFrom", ctypes.c_wchar_p),
+            ("pTo", ctypes.c_wchar_p),
+            ("fFlags", ctypes.c_uint16),
+            ("fAnyOperationsAborted", ctypes.c_int),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", ctypes.c_wchar_p),
+        ]
+
+    FO_DELETE = 3
+    FOF_ALLOWUNDO = 0x40
+    FOF_NOCONFIRMATION = 0x10
+    op = SHFILEOPSTRUCTW(
+        hwnd=None, wFunc=FO_DELETE, pFrom=str(path) + "\0",
+        pTo=None, fFlags=FOF_ALLOWUNDO | FOF_NOCONFIRMATION,
+    )
+    result = SHFileOperationW(ctypes.byref(op))
+    if result != 0:
+        raise OSError(f"SHFileOperationW failed (code {result}) trashing {path}")
+
+
+def _move_to_trash(path):
+    system = platform.system()
+    if system == "Darwin":
+        _move_to_trash_macos(path)
+    elif system == "Linux":
+        _move_to_trash_linux(path)
+    elif system == "Windows":
+        _move_to_trash_windows(path)
+    else:
+        raise OSError(f"no trash support for platform {system!r}")
+
+
+_VALID_ON_OUTPUT_EXISTS = {"overwrite", "rename", "trash", "fail"}
+
+
+def resolve_output_conflict(path, jwkit_config=None):
+    """Applies on_output_exists's policy when `path` already exists. Returns
+    the Path to actually write to (unchanged for overwrite/trash, a fresh
+    numbered sibling for rename), or None if the caller should skip this
+    write entirely (declined, or policy=fail).
+
+    'ask' only prompts when stdin is a real TTY; a background/cron
+    invocation (no TTY), a declined prompt, or a prompt that times out after
+    overwrite_prompt_timeout seconds all fall back to
+    on_output_exists_unattended instead of hanging or silently clobbering."""
+    path = Path(path)
+    if not path.exists():
+        return path
+
+    jwkit_config = jwkit_config if jwkit_config is not None else load_jwkit_config()
+    policy = str(jwkit_config.get("on_output_exists", "ask")).strip().lower()
+
+    if policy == "ask":
+        timeout = jwkit_config.get("overwrite_prompt_timeout", 20)
+        if sys.stdin.isatty():
+            answer = _prompt_yes_no_with_timeout(f"{path.name} already exists. Overwrite? [y/N] ", timeout)
+            if answer is True:
+                return path
+            if answer is None:
+                print(f"(no answer within {timeout}s - falling back to on_output_exists_unattended)")
+        policy = str(jwkit_config.get("on_output_exists_unattended", "rename")).strip().lower()
+
+    if policy not in _VALID_ON_OUTPUT_EXISTS:
+        raise ValueError(f"invalid on_output_exists/on_output_exists_unattended value {policy!r} (expected one of: {', '.join(sorted(_VALID_ON_OUTPUT_EXISTS))})")
+
+    if policy == "overwrite":
+        return path
+    if policy == "rename":
+        return _numbered_alternative(path)
+    if policy == "trash":
+        _move_to_trash(path)
+        return path
+    print(f"{path} already exists (on_output_exists=fail) - not overwriting.")
+    return None

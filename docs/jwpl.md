@@ -62,6 +62,11 @@ jwpl inspect talk.jwlplaylist --json
 
 ## Important Behavior / Defaults
 
+`create --output` (not `--dry-run`) goes through the shared `on_output_exists` policy when the
+target `.jwlplaylist` already exists (default: ask, with a non-interactive fallback for
+cron/unattended runs - see the README's overwrite paragraph). Override for one run with
+`--on-exists`/`--on-exists-unattended`/`--overwrite-timeout`.
+
 A playlist is a DEFLATE-compressed ZIP containing:
 
 - `manifest.json`

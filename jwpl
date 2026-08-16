@@ -457,6 +457,9 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--config", type=Path, help="use this per-directory TOML file")
     create.add_argument("--no-directory-config", action="store_true")
     create.add_argument("--dry-run", action="store_true", help="show selected media without writing")
+    create.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
+    create.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
+    create.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
     _add_setting_flags(create)
     inspect = sub.add_parser("inspect", help="print archive structure and ordered items")
     inspect.add_argument("playlist", type=Path)
@@ -509,6 +512,16 @@ def main(argv: list[str] | None = None) -> int:
             output = Path(output_value).expanduser() if output_value else directory / f"{name}.jwlplaylist"
             if not output.is_absolute():
                 output = directory / output
+            if not args.dry_run:
+                jwkit_config = _jwkit_common.load_jwkit_config()
+                for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
+                    value = getattr(args, arg_name, None)
+                    if value is not None:
+                        jwkit_config[config_key] = value
+                resolved_output = _jwkit_common.resolve_output_conflict(output, jwkit_config)
+                if resolved_output is None:
+                    raise ValueError(f"{output} already exists (on_output_exists=fail) - not overwriting.")
+                output = resolved_output
             media = create_playlist(directory, output, name, settings, dry_run=args.dry_run)
             if args.dry_run:
                 print(f"Playlist: {name}\nSelected {len(media)} item(s):")

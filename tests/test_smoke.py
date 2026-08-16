@@ -78,7 +78,7 @@ class SmokeTest(unittest.TestCase):
     def test_slverse_config_defaults(self) -> None:
         result = self.run_script("slverse", "config", "list")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("cache_max_gb", result.stdout)
+        self.assertIn("cache_max_size", result.stdout)
         self.assertIn("languages", result.stdout)
         self.assertIn("video_crf", result.stdout)
 

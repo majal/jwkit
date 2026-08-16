@@ -489,7 +489,7 @@ class SlverseCacheBudgetTest(unittest.TestCase):
             config = {
                 "cache_dir": str(cache_dir.parent),
                 "cache_policy": "lru",
-                "cache_max_gb": str(2 * 1024 * 1024 / (1024 ** 3)),
+                "cache_max_size": "2Mi",
             }
             self.slverse.enforce_cache_budget(config, state)
 
@@ -516,7 +516,7 @@ class SlverseCacheBudgetTest(unittest.TestCase):
             config = {
                 "cache_dir": str(cache_dir.parent),
                 "cache_policy": "lru",
-                "cache_max_gb": str(2 * 1024 * 1024 / (1024 ** 3)),
+                "cache_max_size": "2Mi",
             }
             oldest = cache_dir / "oldest.mp4"
             with self.slverse.cache_in_use(oldest):
@@ -540,7 +540,7 @@ class SlverseCacheBudgetTest(unittest.TestCase):
             p = cache_dir / "a.mp4"
             p.write_bytes(b"0" * (1024 * 1024))
             state: dict = {}
-            config = {"cache_dir": str(cache_dir.parent), "cache_policy": "keep_all", "cache_max_gb": "0"}
+            config = {"cache_dir": str(cache_dir.parent), "cache_policy": "keep_all", "cache_max_size": "0"}
             self.slverse.enforce_cache_budget(config, state)
             self.assertTrue(p.exists())
 
@@ -556,7 +556,7 @@ class SlverseCacheBudgetTest(unittest.TestCase):
             p = cache_dir / "a.mp4"
             p.write_bytes(b"0" * (2 * 1024 * 1024))
             state: dict = {}
-            config = {"cache_dir": str(cache_dir.parent), "cache_policy": "lru", "cache_max_gb": str(1 / 1024)}
+            config = {"cache_dir": str(cache_dir.parent), "cache_policy": "lru", "cache_max_size": "1Mi"}
 
             fake_state_file = Path(td) / "should-never-be-created.json"
             original_state_file = self.slverse.STATE_FILE
@@ -1498,9 +1498,8 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
             load_config=lambda: {},
         )
         self.slverse.load_ffrife = lambda: fake_ffrife
-        self.slverse.probe_source_fps = lambda source: 30.0
         self.slverse.run_ffmpeg = lambda cmd, duration=None: piece_ffmpeg_calls.append(cmd)
-        config = {"interpolation_engine": "rife", "default_target_lang": "FSL"}
+        config = {"interpolation_engine": "rife", "default_target_lang": "FSL", "interpolation_target_fps": "60"}
 
         self.slverse.extract_verse_sections(
             "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
@@ -1515,7 +1514,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         self.assertEqual(kwargs["start"], 15.0)  # 10.0 + boundary 5.0
         self.assertEqual(kwargs["end"], 20.0)
         self.assertEqual(kwargs["speed"], 0.5)
-        self.assertEqual(kwargs["fps"], 60.0)  # probe_source_fps() * 2
+        self.assertEqual(kwargs["fps"], 60.0)  # the flat configured interpolation_target_fps, not a source-fps multiple
         self.assertEqual(len(piece_ffmpeg_calls), 2)  # normal-section piece + final concat
 
 
@@ -1563,12 +1562,10 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         )
         self.slverse.load_ffrife = lambda: fake_ffrife
         self.slverse.build_overlay_filter = lambda *a, **k: "drawtext=text='stub'"  # font/measure logic covered elsewhere
-        # RIFE exactly doubles frame count, so the merge fps has to be 2x
-        # the *source's own* fps to preserve duration (a fixed 60 silently
-        # drifts whenever the source isn't exactly 30fps) - see extract_verse's
-        # own comment. Stubbed here rather than hitting real ffprobe.
-        self.slverse.probe_source_fps = lambda source: 25.0
-        config = {"interpolation_engine": "rife", "default_target_lang": "FSL"}
+        # ffrife.interpolate() now probes the source's own fps itself and
+        # computes the exact frame count to hit the flat configured target -
+        # extract_verse just passes interpolation_target_fps straight through.
+        config = {"interpolation_engine": "rife", "default_target_lang": "FSL", "interpolation_target_fps": "50"}
 
         self.slverse.extract_verse("http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config, remote=True)
 
@@ -1649,6 +1646,70 @@ class SlverseAddToPathProfileTest(unittest.TestCase):
             self.assertIn("PATH", profile.read_text())
 
 
+class SlverseCacheMaxSizeMigrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.slverse = load_script_module("slverse")
+
+    def test_migrates_old_gb_value_to_binary_gi(self) -> None:
+        # cache_max_gb's old semantics were binary GiB (max_gb * 1024**3),
+        # not decimal - the migrated value must stay byte-equivalent.
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "config.toml"
+            cfg_file.write_text('cache_max_gb = "10"\n')
+            self.slverse.CONFIG_FILE = cfg_file
+            config = self.slverse.load_config()
+        self.assertEqual(config["cache_max_size"], "10Gi")
+        self.assertNotIn("cache_max_gb", config)
+
+    def test_migration_persists_to_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "config.toml"
+            cfg_file.write_text('cache_max_gb = "5"\n')
+            self.slverse.CONFIG_FILE = cfg_file
+            self.slverse.load_config()
+            self.assertIn('cache_max_size = "5Gi"', cfg_file.read_text())
+            self.assertNotIn("cache_max_gb", cfg_file.read_text())
+
+    def test_explicit_cache_max_size_in_file_wins_over_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "config.toml"
+            cfg_file.write_text('cache_max_gb = "10"\ncache_max_size = "2G"\n')
+            self.slverse.CONFIG_FILE = cfg_file
+            config = self.slverse.load_config()
+        self.assertEqual(config["cache_max_size"], "2G")
+
+    def test_no_migration_when_no_legacy_key_present(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "config.toml"
+            cfg_file.write_text('languages = "ASL,FSL"\n')
+            self.slverse.CONFIG_FILE = cfg_file
+            config = self.slverse.load_config()
+        self.assertEqual(config["cache_max_size"], self.slverse.DEFAULT_CONFIG["cache_max_size"])
+
+
+class SlverseEnforceCacheBudgetSizeUnitsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_respects_decimal_and_binary_suffixes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "cache" / "ASL"
+            cache_dir.mkdir(parents=True)
+            p = cache_dir / "a.mp4"
+            p.write_bytes(b"0" * (2 * 1000 * 1000))  # 2,000,000 bytes
+            state: dict = {}
+            # 2M (decimal, 2,000,000 bytes) - exactly at budget, nothing evicted
+            config = {"cache_dir": str(cache_dir.parent), "cache_policy": "lru", "cache_max_size": "2M"}
+            self.slverse.enforce_cache_budget(config, state)
+            self.assertTrue(p.exists())
+
+            # 1900000 bytes (bare number) - under the file's actual size, evicted
+            config["cache_max_size"] = "1900000"
+            self.slverse.enforce_cache_budget(config, state)
+            self.assertFalse(p.exists())
+
+
 class SlverseConfigCommandTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1663,22 +1724,22 @@ class SlverseConfigCommandTest(unittest.TestCase):
         self.assertEqual(missing, set())
 
     def test_config_get_prints_value_and_help(self) -> None:
-        args = argparse.Namespace(key="cache_max_gb", value=None)
+        args = argparse.Namespace(key="cache_max_size", value=None)
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.slverse.cmd_config(args, dict(self.slverse.DEFAULT_CONFIG))
         output = out.getvalue()
-        self.assertIn("cache_max_gb = 5", output)
+        self.assertIn("cache_max_size = 5G", output)
         self.assertIn("Cache size cap", output)
 
     def test_config_set_updates_and_saves(self) -> None:
-        args = argparse.Namespace(key="cache_max_gb", value="10")
+        args = argparse.Namespace(key="cache_max_size", value="10G")
         saved = {}
         self.slverse.save_config = lambda config: saved.update(config)
         config = dict(self.slverse.DEFAULT_CONFIG)
         with mock.patch("sys.stdout", new_callable=io.StringIO):
             self.slverse.cmd_config(args, config)
-        self.assertEqual(config["cache_max_gb"], "10")
-        self.assertEqual(saved["cache_max_gb"], "10")
+        self.assertEqual(config["cache_max_size"], "10G")
+        self.assertEqual(saved["cache_max_size"], "10G")
 
     def test_config_set_rejects_a_typo_in_a_closed_set_key(self) -> None:
         # cache_policy is compared against exact strings elsewhere
@@ -1709,7 +1770,7 @@ class SlverseGenericConfigOverrideValidationTest(unittest.TestCase):
         cls.slverse = load_script_module("slverse")
 
     def test_free_form_key_accepts_anything(self) -> None:
-        self.assertIsNone(self.slverse.validate_config_value("cache_max_gb", "not-a-number-but-not-this-functions-job"))
+        self.assertIsNone(self.slverse.validate_config_value("cache_max_size", "not-a-number-but-not-this-functions-job"))
 
     def test_closed_set_key_rejects_unknown_value(self) -> None:
         error = self.slverse.validate_config_value("cache_policy", "lur")

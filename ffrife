@@ -15,7 +15,8 @@ other tools (e.g. `ffslow`'s --rife flag) can shell out to this CLI directly.
 
 Options:
   --start SS --end SS   trim window (seconds); omit to process the whole input
-  --fps N                target frame rate (default 60)
+  --fps N                target frame rate: a plain number (60) or
+                          source-relative (2x, 2.5x, 150%) (default 60)
   --speed N               retime the output (0.5 = half-speed slow-motion,
                           3 = 3x fast-forward), folded into the same merge/
                           fallback encode via setpts+atempo - no extra pass
@@ -39,6 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from fractions import Fraction
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -90,6 +92,7 @@ COLOR = _jwkit_common.Colorizer(False)
 DEFAULT_CONFIG = {
     "rife_binary_path": "",
     "rife_fallback_engine": "none",  # none, framerate, minterpolate
+    "rife_model": "rife-v4.6",  # must be an arbitrary-timestep-capable model (rife-v4 or rife-v4.6) - interpolate() always passes an explicit -n/-m to hit an exact target fps, and older models (v2.x/v3.x/HD/UHD/anime) reject that with "only rife-v4 model support custom numframe and timestep"
     "hardware_encoder": "cpu",  # cpu, videotoolbox, nvenc, qsv - see jwsl's detect_hardware_encoder for why cpu is the default
     "video_codec": "av1",  # h264, hevc, av1 - falls back to hevc then h264 automatically if unavailable, see _jwkit_common.build_encode_args
     "video_crf": "auto",  # h264=20, hevc=23, av1=30 unless overridden
@@ -280,6 +283,16 @@ def rife_release_hint():
         return "rife-ncnn-vulkan-*-ubuntu.zip (Linux)"
     return "rife-ncnn-vulkan-*-windows.zip (Windows)"
 
+def prune_unused_models(models_dir, keep_name):
+    """The upstream release zip bundles ~10 model directories (rife-v2.3,
+    rife-v3.1, rife-HD, rife-anime, ...) totaling ~450MB, but interpolate()
+    only ever uses the single configured rife_model. Removes every sibling
+    directory in `models_dir` except `keep_name` - leaves files (the
+    executable, LICENSE, README) untouched."""
+    for entry in Path(models_dir).iterdir():
+        if entry.is_dir() and entry.name != keep_name:
+            shutil.rmtree(entry)
+
 def install_rife(config):
     """Download the platform-matching rife-ncnn-vulkan release, unzip it
     into BIN_DIR, and point rife_binary_path at the extracted executable.
@@ -318,18 +331,28 @@ def install_rife(config):
     if system != "Windows":
         match.chmod(match.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
+    prune_unused_models(match.parent, config.get("rife_model", DEFAULT_CONFIG["rife_model"]))
+
     config["rife_binary_path"] = str(match)
     save_config(config)
     print(f"RIFE installed: {match}")
     return match
 
-def run_rife(rife_path, in_frames, out_frames, target_count, slow_after=4.0):
+def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
     """rife-ncnn-vulkan has no built-in progress output, so this polls the
-    output directory's file count against `target_count` (rife's own
-    default is 2x the input frame count). By far the slowest step in the
-    whole pipeline - measured ~125-130s for a 31s/936-frame clip on an
-    Apple Silicon GPU."""
-    proc = subprocess.Popen([rife_path, "-i", str(in_frames), "-o", str(out_frames)])
+    output directory's file count against `target_count`. By far the
+    slowest step in the whole pipeline - measured ~125-130s for a
+    31s/936-frame clip on an Apple Silicon GPU.
+
+    `-n target_count` asks for an exact (possibly non-2x) output frame
+    count and `-m model_path` selects the model - only rife-v4/rife-v4.6
+    support either; older bundled models (v2.x/v3.x/HD/UHD/anime) reject
+    a non-default -n outright with "only rife-v4 model support custom
+    numframe and timestep"."""
+    cmd = [rife_path, "-i", str(in_frames), "-o", str(out_frames), "-n", str(target_count)]
+    if model_path:
+        cmd += ["-m", str(model_path)]
+    proc = subprocess.Popen(cmd)
     start = time.time()
     shown = False
     eta_estimator = _jwkit_common.ProgressETA(target_count)
@@ -403,6 +426,27 @@ def retimed_duration(duration, speed):
         return duration / speed
     return duration
 
+def probe_source_fps(source):
+    """ffprobe's r_frame_rate comes back as an 'N/D' fraction (e.g.
+    '30000/1001'), not a plain float. Used by interpolate() to size RIFE's
+    -n target frame count so the requested `fps` is hit exactly regardless
+    of the source's real frame rate, instead of relying on RIFE's own
+    implicit 2x-doubling default."""
+    cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(source)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return float(Fraction(result.stdout.strip()))
+
+def resolve_target_fps(fps_spec, source_fps):
+    """`fps_spec` is either a plain literal target ('60') or a source-relative
+    spec: 'Nx' ('2x', '2.5x') or 'N%' ('150%'), resolved against `source_fps`
+    - mirrors parse_speed's percent/plain style."""
+    s = str(fps_spec).strip()
+    if s.lower().endswith("x"):
+        return source_fps * float(s[:-1])
+    if s.endswith("%"):
+        return source_fps * float(s[:-1]) / 100
+    return float(s)
+
 # --- Core: single-pass interpolation ---
 def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=60, speed=None, metadata_args=None):
     """Interpolate `source` (local path or remote URL) to `fps`, optionally
@@ -418,7 +462,16 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
     retimes the output via setpts/atempo folded into that same merge (or
     fallback) ffmpeg command - no separate retiming pass, and thus no extra
     lossy generation beyond the merge/fallback encode this function already
-    does. Returns True on success."""
+    does. Returns True on success.
+
+    `fps` accepts a plain literal target (60) or a source-relative spec
+    ('2x', '2.5x', '150%') - resolved once here against the source's real
+    fps so both the RIFE branch and the ffmpeg-fallback branch below see an
+    already-resolved plain number."""
+    if str(fps).strip().lower().endswith(("x", "%")):
+        fps = resolve_target_fps(fps, probe_source_fps(source))
+    else:
+        fps = float(fps)
     duration = (end - start) if (start is not None and end is not None) else None
     trim_args = []
     if start is not None:
@@ -473,7 +526,14 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         if input_frame_count == 0:
             print("No frames extracted - nothing to interpolate.")
             return False
-        run_rife(rife_path, in_frames, out_frames, target_count=input_frame_count * 2)
+        # Compute the exact frame count needed to hit the requested `fps` at
+        # the source's real duration, rather than relying on RIFE's implicit
+        # 2x-doubling default - that only preserves duration when `fps`
+        # happens to be exactly 2x the source's own fps (see probe_source_fps).
+        source_fps = probe_source_fps(source)
+        target_count = round(input_frame_count * fps / source_fps)
+        model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
+        run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
 
         audio_path = temp_dir_path / "audio.aac"
         audio_cmd = [FFMPEG_BIN, "-y"] + trim_args + ["-i", str(source), "-vn", "-c:a", "copy", str(audio_path)]
@@ -492,6 +552,32 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
     return True
 
 # --- CLI ---
+def rife_supports_custom_frame_count(rife_path, model_path):
+    """interpolate() always passes an explicit -n/-m now (see run_rife) -
+    older bundled models (rife-v2.x/v3.x/HD/UHD/anime) reject that outright
+    ("only rife-v4 model support custom numframe and timestep"), so an
+    install/model predating that change would fail on every real run. Smoke
+    -tests the actual configured binary+model with 2 throwaway synthetic
+    frames, not any real footage."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_frames, out_frames = Path(tmp_dir) / "in", Path(tmp_dir) / "out"
+            in_frames.mkdir()
+            out_frames.mkdir()
+            for i, color in enumerate(("red", "blue"), start=1):
+                subprocess.run(
+                    [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                     "-i", f"color=c={color}:s=32x32", "-frames:v", "1", str(in_frames / f"{i:08d}.png")],
+                    check=True, timeout=15,
+                )
+            result = subprocess.run(
+                [rife_path, "-i", str(in_frames), "-o", str(out_frames), "-n", "3", "-m", str(model_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            return result.returncode == 0 and len(list(out_frames.glob("*.png"))) == 3
+    except Exception:
+        return False
+
 def cmd_setup(config):
     hw = config.get("hardware_encoder", "cpu")
     print(f"Video encoder: {hw}")
@@ -500,7 +586,28 @@ def cmd_setup(config):
         print(f"Note: {ffmpeg_bin} may be missing some filters callers pass via --vf.")
 
     if config.get("rife_binary_path") and command_exists(config["rife_binary_path"]):
-        print(f"RIFE already configured: {config['rife_binary_path']}")
+        model_path = Path(config["rife_binary_path"]).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
+        if rife_supports_custom_frame_count(config["rife_binary_path"], model_path):
+            print(f"RIFE already configured: {config['rife_binary_path']}")
+            return
+        print(f"RIFE is configured ({config['rife_binary_path']}), but this install can't hit an exact")
+        print("target frame count (older releases only support a plain 2x doubling with the default")
+        print("model) - ffrife now always requests an exact target, so every real run against this")
+        print("install would fail.")
+        ans = input("Download and install a fresh release now? [Y/n]: ").strip().lower()
+        if ans in ("", "y", "yes"):
+            old_dir = Path(config["rife_binary_path"]).resolve().parent
+            if install_rife(config):
+                new_dir = Path(config["rife_binary_path"]).resolve().parent
+                if old_dir != new_dir and old_dir.parent == BIN_DIR and old_dir.exists():
+                    shutil.rmtree(old_dir)
+                    print(f"Removed old install directory: {old_dir}")
+            else:
+                print("Automatic install failed. Download it yourself from")
+                print("https://github.com/nihui/rife-ncnn-vulkan/releases, unzip it, then run:")
+                print("  ffrife config set rife_binary_path /path/to/rife-ncnn-vulkan")
+        else:
+            print("Skipping - ffrife run will keep failing against this install until you fix it.")
         return
 
     print(f"\nRIFE isn't installed yet ({rife_release_hint()}).")
@@ -633,7 +740,7 @@ def build_parser():
     p_run.add_argument("-o", "--output", required=True)
     p_run.add_argument("--start", type=float, help="Trim start (seconds)")
     p_run.add_argument("--end", type=float, help="Trim end (seconds)")
-    p_run.add_argument("--fps", type=float, default=60, help="Target frame rate (default: 60)")
+    p_run.add_argument("--fps", default="60", help="Target frame rate: a plain number (60) or source-relative (2x, 2.5x, 150%%) (default: 60)")
     p_run.add_argument("--speed", type=parse_speed, help="Retime the output - decimal (0.5), fraction (1/3), or percent (150%%) - folded into the merge/fallback encode, no extra pass")
     p_run.add_argument("--vf", help="Extra ffmpeg -vf filter chain, applied in the same pass as frame extraction")
     p_run.add_argument("--fallback", choices=["none", "framerate", "minterpolate"], help="Override rife_fallback_engine for this run")
@@ -641,6 +748,9 @@ def build_parser():
     p_run.add_argument("--codec", choices=["h264", "hevc", "av1"], help="Video codec for this run (default: configured video_codec)")
     p_run.add_argument("--crf", help="Video quality for this run; use 'auto' for the codec default")
     p_run.add_argument("--preset", help="FFmpeg encoder preset for this run (e.g. slow, medium, fast)")
+    p_run.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run (default: shared jwkit config, 'ask')")
+    p_run.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run - what 'ask' falls back to with no TTY, a declined prompt, or a timeout")
+    p_run.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back (default: shared jwkit config, 20)")
     add_generic_config_overrides(p_run)
 
     # On every subparser, not the top-level parser: normalize_argv rewrites
@@ -691,7 +801,17 @@ def main():
             value = getattr(args, arg_name)
             if value is not None:
                 config[config_key] = value
-        ok = interpolate(args.input, args.output, config, start=args.start, end=args.end, vf=args.vf, fps=args.fps, speed=args.speed)
+
+        jwkit_config = _jwkit_common.load_jwkit_config()
+        for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
+            value = getattr(args, arg_name, None)
+            if value is not None:
+                jwkit_config[config_key] = value
+        output = _jwkit_common.resolve_output_conflict(args.output, jwkit_config)
+        if output is None:
+            sys.exit(1)
+
+        ok = interpolate(args.input, output, config, start=args.start, end=args.end, vf=args.vf, fps=args.fps, speed=args.speed)
         sys.exit(0 if ok else 1)
     else:
         build_parser().print_help()
