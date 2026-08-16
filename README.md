@@ -19,6 +19,7 @@ Each tool below has its own section covering what it does, what it needs, and th
   - [`jwdl`](#jwdl)
   - [`jwpl`](#jwpl)
   - [`jwvideo-mux`](#jwvideo-mux)
+  - [`register-jwplay-launcher`](#register-jwplay-launcher)
   - [`slverse`](#slverse)
 - [Your Local Setup](#your-local-setup)
   - [Python](#python)
@@ -28,7 +29,7 @@ Each tool below has its own section covering what it does, what it needs, and th
 
 ## Quick Install
 
-One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `ffv`, `jwdl`, `jwpl`, `ffinpaint`, `ffrife`, and `jwvideo-mux` just work. No manual downloads, no separate setup steps.
+One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `ffv`, `jwdl`, `jwpl`, `ffinpaint`, `ffrife`, `jwvideo-mux`, and `register-jwplay-launcher` just work. No manual downloads, no separate setup steps.
 
 **macOS or Linux** (Terminal):
 
@@ -121,6 +122,14 @@ Full docs: [docs/jwpl.md](docs/jwpl.md)
 `jwvideo-mux` downloads a jw.org video and merges the language tracks you want into one file, so you get a single video with selectable audio and subtitles instead of a separate download per language.
 
 Full docs: [docs/jwvideo-mux.md](docs/jwvideo-mux.md)
+
+[↑ TOC](#table-of-contents)
+
+### [`register-jwplay-launcher`](./register-jwplay-launcher)
+
+`register-jwplay-launcher` is a one-time OS file-association setup so a `.jwplay` launcher file (written by `jwvideo-mux --adaptive-mpv-library`) can be double-clicked to play a presentation instead of run from a terminal by hand. Run it once after installing jwkit; safe to re-run any time.
+
+Full docs: [docs/register-jwplay-launcher.md](docs/register-jwplay-launcher.md)
 
 [↑ TOC](#table-of-contents)
 

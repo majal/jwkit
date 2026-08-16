@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""register-jwplay-launcher - one-time OS file-association setup so a
+generated .jwplay launcher (see jwvideo-mux's write_mpv_command_launcher)
+can be double-clicked instead of run from a terminal by hand.
+
+Per platform:
+- macOS: declares a .jwplay UTI conforming to Apple's own
+  com.apple.terminal.shell-script (the same UTI .command files use) via a
+  tiny background-only "type declarer" app bundle in ~/Applications,
+  then sets Terminal.app as the actual handler via duti. Requires duti
+  (brew install duti). The declarer app is never meant to be opened
+  itself - LaunchServices just needs to see its Info.plist once to learn
+  the UTI, via lsregister.
+- Linux: registers a custom MIME type (a shared-mime-info XML package)
+  plus a .desktop entry whose Exec runs the double-clicked file directly
+  (it's already a chmod +x shell script), then sets it default via
+  xdg-mime. Requires xdg-utils/shared-mime-info/desktop-file-utils.
+- Windows: associates .jwplay with cmd.exe via the current user's
+  registry hive (HKEY_CURRENT_USER) - no extra dependency.
+
+Safe to re-run any time to reapply/repair the association. This changes
+OS-level file-type-association state (not just something inside this
+repo or its config), and CLI tools can't always confirm a GUI double-
+click will actually trigger it - each platform's function prints a
+best-effort verification, but if in doubt, just try double-clicking a
+.jwplay file after running this.
+"""
+from __future__ import annotations
+
+import argparse
+import plistlib
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _jwkit_common
+
+JWPLAY_EXTENSION = "jwplay"  # must match jwvideo-mux's LAUNCHER_EXTENSION (".jwplay")
+
+# Resolved once at startup by main() -> _jwkit_common.resolve_color_enabled.
+COLOR = _jwkit_common.Colorizer(False)
+
+LSREGISTER = (
+    "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+    "LaunchServices.framework/Versions/A/Support/lsregister"
+)
+MACOS_UTI = "com.majmirasol.jwplay"
+MACOS_DECLARER_BUNDLE_ID = "com.majmirasol.jwplay-type-declarer"
+MACOS_DECLARER_APP_NAME = "JWPlayLauncherType"
+
+
+def register_macos() -> bool:
+    if not shutil.which("duti"):
+        print(COLOR.red("duti is required on macOS to set the file association. Install it with:"))
+        print("  brew install duti")
+        return False
+
+    app_dir = Path.home() / "Applications" / f"{MACOS_DECLARER_APP_NAME}.app"
+    macos_dir = app_dir / "Contents" / "MacOS"
+    macos_dir.mkdir(parents=True, exist_ok=True)
+
+    executable = macos_dir / MACOS_DECLARER_APP_NAME
+    executable.write_text(
+        "#!/bin/bash\n"
+        "# This app bundle exists solely to declare the .jwplay UTI to LaunchServices; it is never meant to be\n"
+        "# launched itself (Terminal.app is the actual default handler, set via duti). If macOS somehow does\n"
+        "# invoke it, just say so instead of doing nothing silently.\n"
+        'osascript -e \'display alert "JWPlayLauncherType" message "This app only exists to register the .jwplay file type; it is not meant to be opened directly."\' 2>/dev/null\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    info_plist = {
+        "CFBundleIdentifier": MACOS_DECLARER_BUNDLE_ID,
+        "CFBundleName": MACOS_DECLARER_APP_NAME,
+        "CFBundleExecutable": MACOS_DECLARER_APP_NAME,
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": "1.0",
+        "CFBundleVersion": "1",
+        "LSMinimumSystemVersion": "10.13",
+        "LSUIElement": True,
+        "UTExportedTypeDeclarations": [
+            {
+                "UTTypeIdentifier": MACOS_UTI,
+                "UTTypeDescription": "jwvideo-mux launcher",
+                # Conforming to Apple's own terminal-shell-script UTI (the
+                # same one .command files use) is what actually makes
+                # Terminal.app a valid/recognized handler below - a UTI
+                # conforming to something generic like public.data does
+                # not reliably resolve to Terminal via duti.
+                "UTTypeConformsTo": ["com.apple.terminal.shell-script"],
+                "UTTypeTagSpecification": {"public.filename-extension": [JWPLAY_EXTENSION]},
+            }
+        ],
+    }
+    with open(app_dir / "Contents" / "Info.plist", "wb") as f:
+        plistlib.dump(info_plist, f)
+
+    subprocess.run([LSREGISTER, "-f", str(app_dir)], check=True)
+
+    result = subprocess.run(
+        ["duti", "-s", "com.apple.Terminal", f".{JWPLAY_EXTENSION}", "all"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(COLOR.red(f"duti failed: {(result.stderr or result.stdout).strip()}"))
+        return False
+
+    print(COLOR.green(f"Registered .{JWPLAY_EXTENSION} -> Terminal.app (double-click opens Terminal and runs the launcher)."))
+    check = subprocess.run(["duti", "-x", f".{JWPLAY_EXTENSION}"], capture_output=True, text=True)
+    if check.returncode == 0 and check.stdout.strip():
+        print(f"Verified: {check.stdout.splitlines()[0].strip()}")
+    else:
+        print(COLOR.yellow("Could not verify via 'duti -x' - try double-clicking a .jwplay file to confirm it worked."))
+    return True
+
+
+LINUX_MIME_TYPE = f"application/x-{JWPLAY_EXTENSION}"
+LINUX_DESKTOP_NAME = f"{JWPLAY_EXTENSION}.desktop"
+
+
+def register_linux() -> bool:
+    required = ("xdg-mime", "update-mime-database", "update-desktop-database")
+    missing = [cmd for cmd in required if not shutil.which(cmd)]
+    if missing:
+        print(COLOR.red(f"Missing required tool(s): {', '.join(missing)} (part of xdg-utils/shared-mime-info/desktop-file-utils)."))
+        print("Install them with your distro's package manager, e.g.:")
+        print("  sudo apt install xdg-utils shared-mime-info desktop-file-utils")
+        return False
+
+    mime_dir = Path.home() / ".local" / "share" / "mime"
+    apps_dir = Path.home() / ".local" / "share" / "applications"
+    (mime_dir / "packages").mkdir(parents=True, exist_ok=True)
+    apps_dir.mkdir(parents=True, exist_ok=True)
+
+    (mime_dir / "packages" / f"{JWPLAY_EXTENSION}.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">\n'
+        f'  <mime-type type="{LINUX_MIME_TYPE}">\n'
+        "    <comment>jwvideo-mux launcher script</comment>\n"
+        f'    <glob pattern="*.{JWPLAY_EXTENSION}"/>\n'
+        "  </mime-type>\n"
+        "</mime-info>\n",
+        encoding="utf-8",
+    )
+    (apps_dir / LINUX_DESKTOP_NAME).write_text(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=jwplay Launcher\n"
+        "Comment=Run a jwvideo-mux .jwplay launcher script\n"
+        # Exec's first token must itself be a real, resolvable executable -
+        # GNOME's own GIO resolver (unlike xdg-mime/update-desktop-database,
+        # which both accept it) silently refuses to treat a bare field code
+        # like "Exec=%f" as valid and just reports no default application,
+        # even though xdg-mime query still (misleadingly) reports success.
+        # Wrapping it in a real shell command fixes that. Terminal=false
+        # since the .jwplay script's own job is launching mpv (its own GUI
+        # window) - true here relies on the desktop's default terminal
+        # correctly supporting a legacy -e-style invocation, which not
+        # every terminal emulator does (confirmed failing against Warp).
+        "Exec=/bin/sh -c \"exec '%f'\"\n"
+        "Terminal=false\n"
+        f"MimeType={LINUX_MIME_TYPE};\n"
+        "NoDisplay=true\n"
+        "Categories=Utility;\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(["update-mime-database", str(mime_dir)], check=True)
+    subprocess.run(["update-desktop-database", str(apps_dir)], check=True)
+    result = subprocess.run(["xdg-mime", "default", LINUX_DESKTOP_NAME, LINUX_MIME_TYPE], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(COLOR.red(f"xdg-mime failed: {(result.stderr or result.stdout).strip()}"))
+        return False
+
+    print(COLOR.green(f"Registered .{JWPLAY_EXTENSION} -> {LINUX_DESKTOP_NAME} (double-click runs the launcher)."))
+    # xdg-mime query alone isn't a reliable verification - it reported
+    # success even when GIO (what GNOME Files/Nautilus actually resolves
+    # through) couldn't find any default application for the type. Prefer
+    # 'gio mime', when available, since it reflects what a real GNOME
+    # double-click will actually do.
+    if shutil.which("gio"):
+        check = subprocess.run(["gio", "mime", LINUX_MIME_TYPE], capture_output=True, text=True)
+        first_line = check.stdout.splitlines()[0].strip() if check.stdout else ""
+        if check.returncode == 0 and first_line.startswith("Default application"):
+            print(f"Verified: {first_line}")
+        else:
+            print(COLOR.yellow(f"'gio mime {LINUX_MIME_TYPE}' didn't confirm a default application - try double-clicking a .jwplay file to confirm it worked."))
+    else:
+        check = subprocess.run(["xdg-mime", "query", "default", LINUX_MIME_TYPE], capture_output=True, text=True)
+        if check.returncode == 0 and check.stdout.strip():
+            print(f"xdg-mime reports: {check.stdout.strip()} (install glib2/gio for a more reliable check on GNOME)")
+        else:
+            print(COLOR.yellow("Could not verify - try double-clicking a .jwplay file to confirm it worked."))
+    return True
+
+
+def register_windows() -> bool:
+    import winreg  # Windows-only stdlib module - imported lazily so this file still loads elsewhere.
+
+    prog_id = "jwkit.jwplay"
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"Software\Classes\.{JWPLAY_EXTENSION}") as key:
+            winreg.SetValue(key, "", winreg.REG_SZ, prog_id)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"Software\Classes\{prog_id}") as key:
+            winreg.SetValue(key, "", winreg.REG_SZ, "jwvideo-mux launcher")
+        command = r'"%SystemRoot%\System32\cmd.exe" /c "%1"'
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"Software\Classes\{prog_id}\shell\open\command") as key:
+            winreg.SetValue(key, "", winreg.REG_SZ, command)
+    except OSError as e:
+        print(COLOR.red(f"Could not update the registry: {e}"))
+        return False
+
+    print(COLOR.green(f"Registered .{JWPLAY_EXTENSION} -> cmd.exe (double-click runs the launcher's batch commands)."))
+    print(COLOR.yellow("If double-click doesn't pick this up immediately, sign out and back in, or restart explorer.exe."))
+    return True
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="One-time OS file-association setup so a .jwplay launcher (see jwvideo-mux) can be double-clicked instead of run from a terminal by hand."
+    )
+    color_group = parser.add_mutually_exclusive_group()
+    color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colored output for this run")
+    color_group.add_argument("--no-color", dest="color", action="store_false", help="Disable colored output for this run")
+    args = parser.parse_args(argv)
+
+    global COLOR
+    COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color))
+    _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
+
+    import platform
+    system = platform.system()
+    if system == "Darwin":
+        ok = register_macos()
+    elif system == "Linux":
+        ok = register_linux()
+    elif system == "Windows":
+        ok = register_windows()
+    else:
+        raise SystemExit(f"Unsupported platform: {system}")
+    raise SystemExit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
