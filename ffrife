@@ -101,15 +101,22 @@ DEFAULT_CONFIG = {
     "video_preset": "slow",
     "ffmpeg_binary": "",
     "ffprobe_binary": "",
+    "rife_profile": "auto",  # auto, performance, balanced, cool
     "rife_gpu": "auto",  # auto, cpu, or a numeric GPU id
-    "rife_threads": "1:1:1",  # load:process:save; cooler than upstream 1:2:2
-    "chunk_frames": "1200",  # 0 disables chunking
-    "cooldown_seconds": "15",  # between completed RIFE chunks
+    "rife_threads": "auto",  # auto preserves upstream's 1:2:2 default
+    "chunk_frames": "auto",  # profile-selected; 0 disables chunking
+    "cooldown_seconds": "auto",  # profile-selected pause between chunks
+    "long_run_frames": "3600",  # auto switches to cool at roughly 2m of 30fps input
     "resume": "true",  # keep and reuse durable per-output work state
     "keep_work": "false",  # retain completed work state for inspection
 }
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".mts", ".m2ts"}
+RIFE_PROFILES = {
+    "performance": {"rife_threads": "auto", "chunk_frames": "0", "cooldown_seconds": "0"},
+    "balanced": {"rife_threads": "auto", "chunk_frames": "1200", "cooldown_seconds": "15"},
+    "cool": {"rife_threads": "1:1:1", "chunk_frames": "1200", "cooldown_seconds": "15"},
+}
 
 def config_bool(config, key, default=False):
     return str(config.get(key, str(default))).strip().lower() in {"1", "true", "yes", "on"}
@@ -125,6 +132,21 @@ def config_float(config, key, default=0.0, minimum=0.0):
         return max(minimum, float(config.get(key, default)))
     except (TypeError, ValueError):
         return max(minimum, default)
+
+def resolve_rife_policy(config, input_frame_count):
+    requested = str(config.get("rife_profile", "auto")).lower()
+    if requested not in {"auto", *RIFE_PROFILES}:
+        raise ValueError("rife_profile must be auto, performance, balanced, or cool")
+    profile = requested
+    if profile == "auto":
+        threshold = config_int(config, "long_run_frames", 3600, minimum=2)
+        profile = "balanced" if config.get("_batch_mode") or input_frame_count >= threshold else "performance"
+    effective = dict(config)
+    for key, profile_value in RIFE_PROFILES[profile].items():
+        configured = str(config.get(key, "auto")).lower()
+        effective[key] = profile_value if configured == "auto" else config.get(key)
+    effective["resolved_rife_profile"] = profile
+    return effective
 
 # --- Config ---
 def load_config():
@@ -378,7 +400,7 @@ def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, sl
     cmd = [rife_path, "-i", str(in_frames), "-o", str(out_frames), "-n", str(target_count)]
     if model_path:
         cmd += ["-m", str(model_path)]
-    if threads:
+    if threads and str(threads).lower() != "auto":
         if not re.fullmatch(r"\d+:\d+:\d+", str(threads)):
             raise ValueError("rife_threads must be load:process:save, for example 1:1:1")
         if any(int(value) < 1 for value in str(threads).split(":")):
@@ -526,7 +548,7 @@ def _chunk_ranges(frame_count, chunk_frames):
 
 def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, config, state_path):
     inputs = sorted(Path(in_frames).glob("*.png"))
-    ranges = _chunk_ranges(len(inputs), config_int(config, "chunk_frames", 1200))
+    ranges = _chunk_ranges(len(inputs), config_int(config, "chunk_frames", 0))
     completed = set()
     if state_path.exists():
         try:
@@ -566,7 +588,7 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         completed.add(chunk_key)
         _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int)})
         shutil.rmtree(chunk_in, ignore_errors=True)
-        cooldown = config_float(config, "cooldown_seconds", 15)
+        cooldown = config_float(config, "cooldown_seconds", 0)
         if cooldown and index + 1 < len(ranges):
             print(f"Cooling down for {cooldown}s before the next chunk (Ctrl-C is safe; resume later)...")
             time.sleep(cooldown)
@@ -641,7 +663,11 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     if "chunk_frames" not in config:
         run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
     else:
-        _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, config,
+        effective = resolve_rife_policy(config, input_frame_count)
+        print(f"RIFE profile: {effective['resolved_rife_profile']} "
+              f"(threads={effective['rife_threads']}, chunks={effective['chunk_frames']}, "
+              f"cooldown={effective['cooldown_seconds']}s)")
+        _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, effective,
                             frames_root / "rife-state.json")
     return out_frames, fps, retimed_duration(duration, speed)
 
@@ -708,7 +734,9 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
 
     options = {"start": start, "end": end, "vf": vf, "fps": fps, "speed": speed,
                "model": config.get("rife_model"), "threads": config.get("rife_threads"),
-               "gpu": config.get("rife_gpu"), "chunk_frames": config.get("chunk_frames")}
+               "gpu": config.get("rife_gpu"), "profile": config.get("rife_profile"),
+               "chunk_frames": config.get("chunk_frames"), "long_run_frames": config.get("long_run_frames"),
+               "batch": bool(config.get("_batch_mode"))}
     signature = _job_signature(source, output_file, options)
     durable = config_bool(config, "resume", False)
     work_path = _work_dir_for(output_file, signature) if durable else Path(tempfile.mkdtemp(prefix="ffrife-"))
@@ -900,7 +928,8 @@ def cmd_config(args, config):
 # excluded from the generic --<key> override loop (see slverse's own
 # GENERIC_OVERRIDE_EXCLUDED_KEYS for the same pattern).
 GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset",
-                                  "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds", "resume", "keep_work"}
+                                  "rife_profile", "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds",
+                                  "resume", "keep_work"}
 
 def add_generic_config_overrides(parser):
     for key in DEFAULT_CONFIG:
@@ -961,6 +990,8 @@ def apply_run_overrides(args, config):
         value = getattr(args, arg_name, None)
         if value is not None:
             config[config_key] = value
+    if getattr(args, "rife_profile", None):
+        config["rife_profile"] = args.rife_profile
 
 def add_processing_arguments(parser, include_trim=True):
     if include_trim:
@@ -974,9 +1005,16 @@ def add_processing_arguments(parser, include_trim=True):
     parser.add_argument("--codec", choices=["h264", "hevc", "av1"])
     parser.add_argument("--crf", help="Video quality for this run; use 'auto' for codec default")
     parser.add_argument("--preset", help="FFmpeg encoder preset")
+    profile_group = parser.add_mutually_exclusive_group()
+    profile_group.add_argument("--profile", dest="rife_profile", choices=["auto", "performance", "balanced", "cool"],
+                               help="Long-run policy profile (default: auto)")
+    profile_group.add_argument("--cool", dest="rife_profile", action="store_const", const="cool",
+                               help="Cool profile: 1:1:1 workers, chunks, and 15s rests")
+    profile_group.add_argument("--performance", "--perf", dest="rife_profile", action="store_const", const="performance",
+                               help="Upstream worker defaults with no chunk rests")
     parser.add_argument("--rife-gpu", help="RIFE GPU: auto, cpu, or numeric device id")
-    parser.add_argument("-j", "--rife-threads", help="RIFE load:process:save threads (default: 1:1:1)")
-    parser.add_argument("-c", "--chunk-frames", help="Source frames per resumable chunk; 0 disables")
+    parser.add_argument("-j", "--rife-threads", help="RIFE load:process:save threads; auto lets the profile choose")
+    parser.add_argument("-c", "--chunk-frames", help="Source frames per resumable chunk; auto uses profile, 0 disables")
     parser.add_argument("--cooldown", "--cooldown-seconds", dest="cooldown_seconds", help="Seconds to rest between chunks")
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument("--resume", dest="resume", action="store_const", const="true", default=None)
@@ -1077,6 +1115,7 @@ def main():
         sys.exit(0 if ok else 1)
     elif args.command in ("batch", "bulk"):
         apply_run_overrides(args, config)
+        config["_batch_mode"] = True
         sources = collect_batch_inputs(args.inputs, args.patterns, args.list_files, args.recursive)
         if not sources:
             print("No supported video files found.", file=sys.stderr)
@@ -1090,6 +1129,7 @@ def main():
                 jwkit_config[config_key] = value
         failures = []
         completed = skipped = 0
+        batch_pause = config_float(resolve_rife_policy(config, 2), "cooldown_seconds", 0)
         print(f"Batch: {len(sources)} file(s), processed sequentially to limit sustained load.")
         for index, source in enumerate(sources, 1):
             print(f"\n[{index}/{len(sources)}] {source}")
@@ -1111,6 +1151,9 @@ def main():
                 print(f"Failed: {exc}", file=sys.stderr)
                 if args.fail_fast:
                     break
+            if batch_pause and index < len(sources):
+                print(f"Cooling down for {batch_pause}s before the next file (Ctrl-C is safe)...")
+                time.sleep(batch_pause)
         print(f"\nBatch summary: {completed} completed, {skipped} skipped, {len(failures)} failed.")
         for source, error in failures:
             print(f"  FAILED {source}: {error}")
