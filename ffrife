@@ -448,6 +448,56 @@ def resolve_target_fps(fps_spec, source_fps):
     return float(s)
 
 # --- Core: single-pass interpolation ---
+def render_rife_frames(source, frames_root, config, start=None, end=None, vf=None, fps=60, speed=None, source_fps=None):
+    """Decode a source window, synthesize its final retimed RIFE frame
+    sequence, and return ``(out_frames, resolved_fps, duration)``.
+
+    The caller owns ``frames_root`` and the final encode. This lets sectioned
+    editors concatenate multiple lossless RIFE sequences and encode only once.
+    Returns ``None`` when RIFE is unavailable; callers can then apply their
+    configured ffmpeg fallback without creating an intermediate video.
+    """
+    if str(fps).strip().lower().endswith(("x", "%")):
+        fps = resolve_target_fps(fps, probe_source_fps(source))
+    else:
+        fps = float(fps)
+    rife_path = config.get("rife_binary_path")
+    if not rife_path or not command_exists(rife_path):
+        return None
+
+    print()
+    print("Interpolating using rife-ncnn-vulkan...")
+    frames_root = Path(frames_root)
+    in_frames = frames_root / "in"
+    out_frames = frames_root / "out"
+    in_frames.mkdir(parents=True)
+    out_frames.mkdir(parents=True)
+    trim_args = []
+    if start is not None:
+        trim_args += ["-ss", str(start)]
+    if end is not None:
+        trim_args += ["-to", str(end)]
+    duration = (end - start) if (start is not None and end is not None) else None
+    extract_cmd = trim_args + ["-i", str(source)]
+    if vf:
+        extract_cmd += ["-vf", vf]
+    extract_cmd += [f"{in_frames}/%08d.png"]
+    run_ffmpeg(extract_cmd, duration=duration, label="Extracting")
+
+    input_frame_count = len(list(in_frames.glob("*.png")))
+    if input_frame_count == 0:
+        print("No frames extracted - nothing to interpolate.")
+        return None
+    source_fps = float(source_fps) if source_fps is not None else probe_source_fps(source)
+    # Generate the final temporal samples directly. For half speed this is
+    # twice the normal target count, avoiding setpts-driven frame duplication.
+    speed_factor = speed if speed and speed != 1 else 1.0
+    target_count = round(input_frame_count * fps / source_fps / speed_factor)
+    model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
+    run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
+    return out_frames, fps, retimed_duration(duration, speed)
+
+
 def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=60, speed=None, metadata_args=None):
     """Interpolate `source` (local path or remote URL) to `fps`, optionally
     trimmed to [start, end] and with an extra ffmpeg -vf filter chain
@@ -459,10 +509,9 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
     installed/configured.
 
     `speed` (e.g. 0.5 for half-speed slow-motion, 3 for 3x fast-forward)
-    retimes the output via setpts/atempo folded into that same merge (or
-    fallback) ffmpeg command - no separate retiming pass, and thus no extra
-    lossy generation beyond the merge/fallback encode this function already
-    does. Returns True on success.
+    changes RIFE's requested output-frame count directly; audio uses atempo.
+    The ffmpeg fallback uses setpts/atempo in its one encode. Neither path
+    needs a separate retiming pass. Returns True on success.
 
     `fps` accepts a plain literal target (60) or a source-relative spec
     ('2x', '2.5x', '150%') - resolved once here against the source's real
@@ -505,35 +554,12 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         run_ffmpeg(cmd, duration=retimed_duration(duration, speed))
         return True
 
-    print()
-    print("Interpolating using rife-ncnn-vulkan...")
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir_path = Path(temp_dir)
-        in_frames = temp_dir_path / "in"
-        out_frames = temp_dir_path / "out"
-        in_frames.mkdir()
-        out_frames.mkdir()
-
-        # Single pass: trim + filter + frame extraction together, straight
-        # from the source - no intermediate re-encoded mp4 generation.
-        extract_cmd = trim_args + ["-i", str(source)]
-        if vf:
-            extract_cmd += ["-vf", vf]
-        extract_cmd += [f"{in_frames}/%08d.png"]
-        run_ffmpeg(extract_cmd, duration=duration, label="Extracting")
-
-        input_frame_count = len(list(in_frames.glob("*.png")))
-        if input_frame_count == 0:
-            print("No frames extracted - nothing to interpolate.")
+        rendered = render_rife_frames(source, temp_dir_path, config, start=start, end=end, vf=vf, fps=fps, speed=speed)
+        if not rendered:
             return False
-        # Compute the exact frame count needed to hit the requested `fps` at
-        # the source's real duration, rather than relying on RIFE's implicit
-        # 2x-doubling default - that only preserves duration when `fps`
-        # happens to be exactly 2x the source's own fps (see probe_source_fps).
-        source_fps = probe_source_fps(source)
-        target_count = round(input_frame_count * fps / source_fps)
-        model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
-        run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
+        out_frames, fps, _ = rendered
 
         audio_path = temp_dir_path / "audio.aac"
         audio_cmd = [FFMPEG_BIN, "-y"] + trim_args + ["-i", str(source), "-vn", "-c:a", "copy", str(audio_path)]
@@ -543,8 +569,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         has_audio = audio_path.exists() and audio_path.stat().st_size > 0
         if has_audio:
             merge_cmd += ["-i", str(audio_path)]
-        if speed_vf:
-            merge_cmd += ["-vf", speed_vf]
+        # RIFE already generated the retimed video frame count above.
         if has_audio:
             merge_cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"])
         merge_cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]

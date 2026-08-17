@@ -1837,9 +1837,16 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
     def test_slow_mode_with_rife_engine_delegates_per_section_to_ffrife(self) -> None:
         ffrife_calls = []
         piece_ffmpeg_calls = []
+        def render(source, root, config, **kwargs):
+            frames = Path(root) / "out"
+            frames.mkdir(parents=True)
+            ffrife_calls.append((source, kwargs))
+            return frames, kwargs["fps"], 5.0
         fake_ffrife = argparse.Namespace(
-            interpolate=lambda *a, **k: ffrife_calls.append((a, k)),
-            load_config=lambda: {},
+            render_rife_frames=render,
+            load_config=lambda: {"rife_binary_path": "/fake/rife"},
+            command_exists=lambda path: True,
+            probe_source_fps=lambda source: 30.0,
         )
         self.slverse.load_ffrife = lambda: fake_ffrife
         self.slverse.run_ffmpeg = lambda cmd, duration=None: piece_ffmpeg_calls.append(cmd)
@@ -1853,21 +1860,28 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         # With whole-clip RIFE enabled, both pieces are interpolated so the
         # final concat has one real 60fps cadence; only piece 2 is retimed.
         self.assertEqual(len(ffrife_calls), 2)
-        args, kwargs = ffrife_calls[1]
+        _, kwargs = ffrife_calls[1]
         self.assertEqual(kwargs["start"], 15.0)  # 10.0 + boundary 5.0
         self.assertEqual(kwargs["end"], 20.0)
         self.assertEqual(kwargs["speed"], 0.5)
         self.assertEqual(kwargs["fps"], 60.0)  # the flat configured interpolation_target_fps, not a source-fps multiple
-        self.assertEqual(len(piece_ffmpeg_calls), 1)  # final concat only
+        self.assertEqual(len(piece_ffmpeg_calls), 1)  # one final encode only
         fc = piece_ffmpeg_calls[0][piece_ffmpeg_calls[0].index("-filter_complex") + 1]
-        self.assertIn("fps=60,settb=AVTB,setpts=PTS-STARTPTS", fc)
+        self.assertIn("settb=AVTB,setpts=PTS-STARTPTS", fc)
+        self.assertNotIn("fps=", fc)
 
     def test_slow_smoothing_uses_rife_without_whole_clip_interpolation(self) -> None:
         ffrife_calls = []
         ffmpeg_calls = []
+        def render(source, root, config, **kwargs):
+            frames = Path(root) / "out"
+            frames.mkdir(parents=True)
+            ffrife_calls.append((source, kwargs))
+            return frames, kwargs["fps"], 10.0
         fake_ffrife = argparse.Namespace(
-            interpolate=lambda *a, **k: ffrife_calls.append((a, k)),
-            load_config=lambda: {},
+            render_rife_frames=render,
+            load_config=lambda: {"rife_binary_path": "/fake/rife"},
+            command_exists=lambda path: True,
             probe_source_fps=lambda source: 30000 / 1001,
         )
         self.slverse.load_ffrife = lambda: fake_ffrife

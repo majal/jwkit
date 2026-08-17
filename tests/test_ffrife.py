@@ -237,12 +237,13 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-c:a") + 1], "copy")
         self.assertNotIn("-vf", cmd)
 
-    def test_rife_path_folds_setpts_into_the_merge_command(self) -> None:
+    def test_rife_path_generates_retimed_frames_before_the_merge(self) -> None:
         # RIFE installed/configured -> the PNG-extract-then-RIFE-then-merge
-        # path. speed should land on the merge command's -vf, not a
-        # separate ffmpeg pass after it.
+        # path. RIFE should generate the retimed count directly, without a
+        # setpts filter that would duplicate frames in the merge.
         config = {"rife_binary_path": "/fake/rife"}
         calls = []
+        target_counts = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
             calls.append(cmd)
@@ -250,6 +251,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
                 (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
 
         def fake_run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
+            target_counts.append(target_count)
             (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
             (Path(out_frames) / "00000002.png").write_bytes(b"\x89PNG")
 
@@ -264,8 +266,8 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         # extract call, then merge call - never a third (retiming) pass
         self.assertEqual(len(calls), 2)
         merge_cmd = calls[-1]
-        vf = merge_cmd[merge_cmd.index("-vf") + 1]
-        self.assertIn("setpts=PTS/0.5", vf)
+        self.assertNotIn("-vf", merge_cmd)
+        self.assertEqual(target_counts, [4])  # one 30fps input frame -> 60fps, then 2x duration
 
     def test_rife_target_count_matches_a_non_2x_ratio(self) -> None:
         # 24fps source -> 60fps target is a 2.5x ratio, not RIFE's implicit
