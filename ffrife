@@ -35,6 +35,7 @@ import platform
 import re
 import shutil
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -112,6 +113,11 @@ DEFAULT_CONFIG = {
     "keep_work": "false",  # retain completed work state for inspection
     "scene_detection": "true",  # do not synthesize hybrid frames across hard cuts
     "scene_threshold": "0.35",  # ffmpeg scene score in [0, 1]; lower is more sensitive
+    "gradual_transition_detection": "true",
+    "transition_min_duration": "0.25",  # seconds
+    "transition_sensitivity": "1.35",  # change magnitude relative to recent motion
+    "transition_alignment": "0.80",  # successive pixel-change vector cosine similarity
+    "transition_ranges": "",  # explicit START:END seconds, comma-separated
 }
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".mts", ".m2ts"}
@@ -562,6 +568,87 @@ def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_
                 replaced += 1
     return replaced
 
+def detect_gradual_transitions(in_frames, source_fps, min_duration=0.25,
+                               sensitivity=1.35, alignment=0.80):
+    """Find conservative fade/dissolve frame intervals as ``(start, end)``.
+
+    Tiny grayscale frames make this cheap. A transition is a sustained run
+    whose pixel-change vectors point in a consistent direction and are
+    stronger than the clip's immediately preceding motion baseline.
+    """
+    width, height = 32, 18
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-framerate",
+           f"{float(source_fps):.12g}", "-i", str(Path(in_frames) / "%08d.png"),
+           "-vf", f"scale={width}:{height},format=gray", "-f", "rawvideo", "-"]
+    size = width * height
+    minimum = max(3, round(float(min_duration) * float(source_fps)))
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    previous_frame = previous_delta = None
+    frame_count = 0
+    magnitudes = []
+    candidates = []
+    while True:
+        frame = proc.stdout.read(size)
+        if len(frame) != size:
+            break
+        frame_count += 1
+        if previous_frame is not None:
+            delta = [b - a for a, b in zip(previous_frame, frame)]
+            magnitude = sum(abs(value) for value in delta) / (size * 255)
+            magnitudes.append(magnitude)
+            if previous_delta is not None:
+                index = len(magnitudes) - 1
+                left_energy = sum(value * value for value in previous_delta)
+                right_energy = sum(value * value for value in delta)
+                cosine = (sum(a * b for a, b in zip(previous_delta, delta)) /
+                          math.sqrt(left_energy * right_energy) if left_energy and right_energy else 0.0)
+                history_end = max(1, index - minimum)
+                history = magnitudes[max(0, history_end - max(24, minimum * 3)):history_end]
+                baseline = statistics.median(history) if history else magnitudes[index - 1]
+                active = magnitude >= max(0.003, baseline * float(sensitivity))
+                candidates.append((index + 1, active and cosine >= float(alignment),
+                                   magnitude >= 0.003 and cosine >= float(alignment)))
+            previous_delta = delta
+        previous_frame = frame
+    proc.stdout.close()
+    if proc.wait() != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    if frame_count < 3:
+        return []
+    runs = []
+    start = previous = None
+    gaps = 0
+    for frame_index, begins, continues in candidates + [(frame_count, False, False), (frame_count + 1, False, False)]:
+        accepted = begins if start is None else continues
+        if accepted:
+            start = frame_index if start is None else start
+            previous = frame_index
+            gaps = 0
+            continue
+        if start is not None:
+            gaps += 1
+            if gaps <= 1:
+                continue
+            if previous - start + 1 >= minimum:
+                runs.append((max(0, start - 1), min(frame_count - 1, previous + 1)))
+            start = previous = None
+            gaps = 0
+    return runs
+
+def parse_transition_ranges(value, source_fps, input_count):
+    ranges = []
+    for item in str(value or "").split(","):
+        if not item.strip():
+            continue
+        try:
+            start, end = (float(part) for part in item.split(":", 1))
+        except ValueError as exc:
+            raise ValueError("transition_ranges must be comma-separated START:END seconds") from exc
+        if start < 0 or end <= start:
+            raise ValueError("each transition range must satisfy 0 <= START < END")
+        ranges.append((max(0, round(start * source_fps)), min(input_count - 1, round(end * source_fps))))
+    return ranges
+
 def _job_signature(source, output_file, options):
     source_path = Path(str(source)).expanduser()
     source_identity = str(source_path.resolve()) if source_path.exists() else str(source)
@@ -702,10 +789,14 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     speed_factor = speed if speed and speed != 1 else 1.0
     target_count = round(input_frame_count * fps / source_fps / speed_factor)
     scene_threshold = None
+    explicit_transitions = []
     if config_bool(config, "scene_detection", True) and input_frame_count > 1:
         scene_threshold = config_float(config, "scene_threshold", 0.35)
         if not 0 <= scene_threshold <= 1:
             raise ValueError("scene_threshold must be between 0 and 1")
+        explicit_transitions = parse_transition_ranges(
+            config.get("transition_ranges", ""), source_fps, input_frame_count
+        )
     model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
     # Library callers historically pass only the settings they own. Keep that
     # API compatible; the full ffrife config enables resumable chunking.
@@ -721,10 +812,22 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     if scene_threshold is not None:
         print(f"Detecting hard scene cuts (threshold={scene_threshold:g})...")
         cuts = detect_scene_cuts(in_frames, source_fps, scene_threshold)
+        transitions = list(explicit_transitions)
+        if config_bool(config, "gradual_transition_detection", True):
+            transitions += detect_gradual_transitions(
+                in_frames, source_fps,
+                config_float(config, "transition_min_duration", 0.25),
+                config_float(config, "transition_sensitivity", 1.35),
+                config_float(config, "transition_alignment", 0.80),
+            )
+        for start_frame, end_frame in transitions:
+            cuts.extend(range(start_frame + 1, end_frame + 1))
+        cuts = sorted(set(cuts))
         replaced = suppress_scene_cut_interpolation(
             in_frames, out_frames, input_frame_count, target_count, cuts
         )
-        print(f"Scene cuts: {len(cuts)} detected; {replaced} interpolated frame(s) replaced.")
+        print(f"Transitions: {len(transitions)} gradual interval(s), {len(cuts)} protected boundary/boundaries; "
+              f"{replaced} interpolated frame(s) replaced.")
     return out_frames, fps, retimed_duration(duration, speed)
 
 
@@ -794,7 +897,12 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
                "chunk_frames": config.get("chunk_frames"), "long_run_frames": config.get("long_run_frames"),
                "batch": bool(config.get("_batch_mode")),
                "scene_detection": config.get("scene_detection"),
-               "scene_threshold": config.get("scene_threshold")}
+               "scene_threshold": config.get("scene_threshold"),
+               "gradual_transition_detection": config.get("gradual_transition_detection"),
+               "transition_min_duration": config.get("transition_min_duration"),
+               "transition_sensitivity": config.get("transition_sensitivity"),
+               "transition_alignment": config.get("transition_alignment"),
+               "transition_ranges": config.get("transition_ranges")}
     signature = _job_signature(source, output_file, options)
     durable = config_bool(config, "resume", False)
     work_path = _work_dir_for(output_file, signature) if durable else Path(tempfile.mkdtemp(prefix="ffrife-"))
@@ -987,7 +1095,7 @@ def cmd_config(args, config):
 # GENERIC_OVERRIDE_EXCLUDED_KEYS for the same pattern).
 GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset",
                                   "rife_profile", "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds",
-                                  "resume", "keep_work", "scene_detection"}
+                                  "resume", "keep_work", "scene_detection", "gradual_transition_detection"}
 
 def add_generic_config_overrides(parser):
     for key in DEFAULT_CONFIG:
@@ -1052,6 +1160,8 @@ def apply_run_overrides(args, config):
         config["rife_profile"] = args.rife_profile
     if getattr(args, "scene_detection", None) is not None:
         config["scene_detection"] = args.scene_detection
+    if getattr(args, "gradual_transition_detection", None) is not None:
+        config["gradual_transition_detection"] = args.gradual_transition_detection
 
 def add_processing_arguments(parser, include_trim=True):
     if include_trim:
@@ -1088,6 +1198,13 @@ def add_processing_arguments(parser, include_trim=True):
                              help="Detect hard cuts and replace RIFE hybrids (default)")
     scene_group.add_argument("--no-scene-detection", dest="scene_detection", action="store_const", const="false",
                              help="Skip scene-cut detection and postprocessing")
+    gradual_group = parser.add_mutually_exclusive_group()
+    gradual_group.add_argument("--gradual-transition-detection", dest="gradual_transition_detection",
+                               action="store_const", const="true", default=None,
+                               help="Detect fades/dissolves as well as hard cuts (default)")
+    gradual_group.add_argument("--no-gradual-transition-detection", dest="gradual_transition_detection",
+                               action="store_const", const="false",
+                               help="Protect hard cuts only")
     parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"])
     parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"])
     parser.add_argument("--overwrite-timeout", type=float)

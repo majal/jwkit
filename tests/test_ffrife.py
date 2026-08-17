@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -238,7 +239,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         self.assertNotIn("-vf", cmd)
 
     def test_output_filter_is_applied_only_in_the_final_encode(self) -> None:
-        config = {"rife_binary_path": "/fake/rife"}
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
         calls = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
@@ -294,7 +295,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
     def test_rife_target_count_matches_a_non_2x_ratio(self) -> None:
         # 24fps source -> 60fps target is a 2.5x ratio, not RIFE's implicit
         # 2x default - target_count has to be computed explicitly.
-        config = {"rife_binary_path": "/fake/rife"}
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
         rife_calls = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
@@ -516,6 +517,25 @@ class FfrifeLongRunTest(unittest.TestCase):
         config = dict(self.ffrife.DEFAULT_CONFIG)
         self.ffrife.apply_run_overrides(disabled, config)
         self.assertEqual(config["scene_detection"], "false")
+
+    def test_gradual_transition_detector_finds_aligned_elevated_changes(self) -> None:
+        # 12 tiny grayscale frames: still, then a linear fade. Mock rawvideo
+        # keeps this unit test independent of an ffmpeg installation.
+        frames = [bytes([20] * (32 * 18)) for _ in range(5)]
+        frames += [bytes([value] * (32 * 18)) for value in (30, 40, 50, 60, 70, 80, 90)]
+        process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
+        process.wait.return_value = 0
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
+            intervals = self.ffrife.detect_gradual_transitions(
+                "frames", source_fps=10, min_duration=0.3, sensitivity=1.2, alignment=0.8
+            )
+        self.assertEqual(intervals, [(5, 11)])
+
+    def test_explicit_transition_ranges_are_seconds(self) -> None:
+        self.assertEqual(self.ffrife.parse_transition_ranges("1.0:1.5, 3:4", 30, 200),
+                         [(30, 45), (90, 120)])
+        with self.assertRaisesRegex(ValueError, "START < END"):
+            self.ffrife.parse_transition_ranges("2:1", 30, 200)
 
     def test_batch_collects_folder_glob_and_list_without_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as td:
