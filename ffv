@@ -31,11 +31,11 @@ This is a compatibility launcher. Run 'slverse extract --help' and
 
 def slverse_path() -> str:
     sibling = Path(__file__).resolve().with_name("slverse")
+    if sibling.is_file():
+        return str(sibling)
     found = shutil.which("slverse")
     if found and Path(found).resolve() != Path(__file__).resolve():
         return found
-    if sibling.is_file():
-        return str(sibling)
     raise SystemExit("ffv: cannot find slverse beside ffv or on PATH")
 
 

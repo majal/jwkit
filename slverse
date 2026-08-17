@@ -119,7 +119,7 @@ DEFAULT_CONFIG = {
     "cache_dir": str(DEFAULT_CACHE_DIR),
     "cache_policy": "lru",  # keep_all, lru, delete_after_use
     "cache_max_size": "1G",  # unix-style size: K/M/G/T/P/E (decimal SI) or Ki/Mi/Gi/Ti/Pi/Ei (binary IEC) - see _jwkit_common.parse_size
-    "extract_mode": "cache",  # cache by default: reuse a verified whole chapter - worth it once you're pulling several different verses from it; --segment caches just the requested window instead (cheaper for a one-off or a few verses spread across languages); --onthefly is the explicit streaming escape hatch that never touches disk
+    "extract_mode": "segment",  # cache only the requested window by default; use --cache when several verses from one chapter will amortize the full download
     "hardware_encoder": "cpu",  # nvenc, videotoolbox, qsv, cpu
     "video_codec": "av1",  # h264, hevc, av1 - royalty-free and meaningfully smaller than hevc at matched quality; falls back to hevc then h264 automatically if this machine/ffmpeg build can't actually encode it (see build_encode_args)
     "video_crf": "auto",  # codec-specific balanced quality: h264=20, hevc=23, av1=30
@@ -151,8 +151,8 @@ DEFAULT_CONFIG = {
     "overlay_fontsize": "34",
     "overlay_alpha": "0.66",
     "overlay_source_label_alpha": "0.5",  # small "which SL is this" label under the reference
-    "delogo_width_pad": "10",   # extra px beyond the auto-measured text width, in case the source's own caption runs a bit longer
-    "delogo_height_pad": "10",
+    "delogo_width_pad": "2",   # small antialiasing margin beyond the dynamically measured source-label proxy
+    "delogo_height_pad": "2",
     "default_target_lang": "FSL",  # requesting this SL skips delogo/drawtext entirely - its own burned-in caption is already correct
     "trim_end_transition": "true",  # exclude JW's own trailing fade-out/copyright-endscreen transition (endTransitionDuration in the verse marker metadata - confirmed empirically to cover exactly the fade-to-black + JW.org copyright card after a chapter's/paragraph's last verse) from the very end of the extracted window - the right default for a cut that ends there. false (or --keep-end-transition for one run) restores the old behavior of extracting through the full marker duration, transition included. Only ever touches the LAST selected verse - see trim_mid_transitions for transitions in the middle of a multi-verse range.
     "trim_mid_transitions": "false",  # a verse range spanning multiple paragraphs plays through any mid-range paragraph transition untouched by default (it's one continuous scene, not something to cut) - set true (or --trim-mid-transitions for one run) to also cut those out, jump-cutting straight from one paragraph's last kept frame to the next paragraph's first. Never touches the range's own trailing transition - that's trim_end_transition's job. Not supported together with interpolation_engine=rife or --slow/--fast in this pass; both silently keep mid-range transitions in that combination.
@@ -217,7 +217,7 @@ CONFIG_HELP = {
     "cache_dir": "Where cached full-chapter downloads live",
     "cache_policy": "keep_all, lru, delete_after_use - what happens to a cached chapter after use",
     "cache_max_size": "Cache size cap, e.g. 500M, 5G, 2Gi - oldest-used chapters evicted first once hit (cache_policy=lru)",
-    "extract_mode": "cache (default, reuse downloaded whole chapters), segment (cache just the requested verse window), or onthefly (explicit streaming, no disk use)",
+    "extract_mode": "segment (default, cache just the requested window), cache (reuse whole chapters), or onthefly (no disk use)",
     "hardware_encoder": "cpu, nvenc, videotoolbox, or qsv",
     "video_codec": "h264, hevc, or av1",
     "video_crf": "Encode quality (lower = higher quality/larger file)",
@@ -1267,6 +1267,17 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     target_ref = ref_lang_map.get(target_lang) if target_lang else None
     skip_reference = bool(source_ref) and source_ref == target_ref
 
+    # The marker API gives us the exact caption text burned into the source.
+    # For a single caption, compare it directly with the replacement we were
+    # about to draw. This automatically handles same-reference-language pairs
+    # without requiring a permanent SL-code mapping. Keep the mapping as a
+    # fallback for spelling/abbreviation differences and multi-label ranges.
+    label_text = f"{book_name} {chapter}:{verse_label}"
+    def normalized_caption(text):
+        return " ".join(unicodedata.normalize("NFKC", str(text)).casefold().split())
+    if len(source_labels or []) == 1 and normalized_caption(source_labels[0]) == normalized_caption(label_text):
+        skip_reference = True
+
     show_label = str(config.get("show_source_lang_label", DEFAULT_CONFIG["show_source_lang_label"])).strip().lower() != "false"
     if skip_reference and not show_label:
         return None
@@ -1308,8 +1319,6 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
         return expr
     width_pad = int(config.get("delogo_width_pad", DEFAULT_CONFIG["delogo_width_pad"]))
     height_pad = int(config.get("delogo_height_pad", DEFAULT_CONFIG["delogo_height_pad"]))
-
-    label_text = f"{book_name} {chapter}:{verse_label}"
 
     def esc(text):
         return text.replace(":", "\\:").replace("'", "\\'")
@@ -2483,6 +2492,26 @@ def apply_generic_config_overrides(args, config):
                 raise SystemExit(f"--{key.replace('_', '-')}: {error}")
             config[key] = value
 
+def apply_interpolation_overrides(args, config):
+    """Resolve the independent enable toggle and engine selector once.
+
+    Mutates only this invocation's in-memory config; saved config is never
+    changed by --interpolate/--no-interpolate. Legacy engine=none remains an
+    off alias. Returning the enabled state makes the contract directly
+    testable instead of inferring it from which encoding branch ran.
+    """
+    selected = getattr(args, "interpolation_engine", None)
+    if selected is not None:
+        config["interpolation_engine"] = selected
+    cli_enabled = getattr(args, "interpolate", None)
+    enabled = str(config.get("interpolate", "false")).strip().lower() in ("true", "1", "yes", "on") if cli_enabled is None else cli_enabled
+    if config.get("interpolation_engine") == "none":
+        enabled = False
+    config["interpolate"] = "true" if enabled else "false"
+    if not enabled:
+        config["interpolation_engine"] = "none"
+    return enabled
+
 def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state, require_full_range=False):
     window = resolve_verse_window(
         lang, book_num, chapter, verses, config,
@@ -3146,14 +3175,7 @@ def main():
                 config[config_key] = value
         if args.output:
             args.write = True
-        if args.interpolation_engine is not None:
-            config["interpolation_engine"] = args.interpolation_engine
-        enabled = str(config.get("interpolate", "false")).lower() in ("true", "1", "yes", "on") if args.interpolate is None else args.interpolate
-        if config.get("interpolation_engine") == "none":
-            enabled = False
-        config["interpolate"] = "true" if enabled else "false"
-        if not enabled:
-            config["interpolation_engine"] = "none"
+        apply_interpolation_overrides(args, config)
         maybe_auto_sync(args, config)
         cmd_extract(args, config)
     elif args.command == "find":
@@ -3170,14 +3192,7 @@ def main():
             value = getattr(args, arg_name)
             if value is not None:
                 config[config_key] = value
-        if args.interpolation_engine is not None:
-            config["interpolation_engine"] = args.interpolation_engine
-        enabled = str(config.get("interpolate", "false")).lower() in ("true", "1", "yes", "on") if args.interpolate is None else args.interpolate
-        if config.get("interpolation_engine") == "none":
-            enabled = False
-        config["interpolate"] = "true" if enabled else "false"
-        if not enabled:
-            config["interpolation_engine"] = "none"
+        apply_interpolation_overrides(args, config)
         maybe_auto_sync(args, config)
         cmd_bulk(args, config)
     else:

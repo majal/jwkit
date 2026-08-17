@@ -5,6 +5,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from tests.support import REPO_ROOT, load_script_module
 
@@ -62,6 +64,12 @@ class SmokeTest(unittest.TestCase):
         reference, flags = ffv.split_all_reference(["1", "Timothy", "1:11", "--future-option", "value", "--json"])
         self.assertEqual(reference, ["1 Timothy", "1", "11"])
         self.assertEqual(flags, ["--future-option", "value", "--json"])
+
+    def test_ffv_prefers_its_sibling_slverse_over_path(self) -> None:
+        ffv = load_script_module("ffv")
+        sibling = (REPO_ROOT / "slverse").resolve()
+        with mock.patch.object(ffv.shutil, "which", return_value="/other/install/slverse"):
+            self.assertEqual(Path(ffv.slverse_path()).resolve(), sibling)
 
     def test_jwpl_help(self) -> None:
         result = self.run_script("jwpl", "--help")
