@@ -415,6 +415,38 @@ class FfrifeLongRunTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.ffrife._chunk_ranges(10, 1)
 
+    def test_auto_profile_preserves_upstream_defaults_for_short_single_run(self) -> None:
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        policy = self.ffrife.resolve_rife_policy(config, 300)
+        self.assertEqual(policy["resolved_rife_profile"], "performance")
+        self.assertEqual(policy["rife_threads"], "auto")
+        self.assertEqual(policy["chunk_frames"], "0")
+        self.assertEqual(policy["cooldown_seconds"], "0")
+
+    def test_auto_profile_uses_balanced_policy_for_long_or_batch_work(self) -> None:
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        long_policy = self.ffrife.resolve_rife_policy(config, 3600)
+        config["_batch_mode"] = True
+        batch_policy = self.ffrife.resolve_rife_policy(config, 30)
+        for policy in (long_policy, batch_policy):
+            self.assertEqual(policy["resolved_rife_profile"], "balanced")
+            self.assertEqual(policy["rife_threads"], "auto")
+            self.assertEqual(policy["chunk_frames"], "1200")
+            self.assertEqual(policy["cooldown_seconds"], "15")
+
+    def test_low_level_settings_override_profile_independently(self) -> None:
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        config.update({"rife_profile": "cool", "rife_threads": "1:3:2", "cooldown_seconds": "2.5"})
+        policy = self.ffrife.resolve_rife_policy(config, 10)
+        self.assertEqual(policy["rife_threads"], "1:3:2")
+        self.assertEqual(policy["chunk_frames"], "1200")
+        self.assertEqual(policy["cooldown_seconds"], "2.5")
+
+    def test_profile_convenience_flags(self) -> None:
+        parser = self.ffrife.build_parser()
+        self.assertEqual(parser.parse_args(["run", "in", "-o", "out", "--cool"]).rife_profile, "cool")
+        self.assertEqual(parser.parse_args(["run", "in", "-o", "out", "--perf"]).rife_profile, "performance")
+
     def test_chunks_assemble_exact_target_and_resume(self) -> None:
         calls = []
         with tempfile.TemporaryDirectory() as td:
