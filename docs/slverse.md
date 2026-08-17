@@ -72,6 +72,7 @@ You can also set individual options by hand at any time:
 ```bash
 ./slverse config set cache_max_size 5G
 ./slverse config set interpolation_engine rife
+./slverse config set interpolate true
 ./slverse config set languages ASL,FSL,BVL,INI,SPE
 ./slverse config set api_language VT,E
 ./slverse config set mpv_options "--screen=1 --speed=1.15"
@@ -83,6 +84,8 @@ Nearly every behavior is a config key, not a fixed default meant for one setup. 
 
 | Key | Default | What it's for |
 | --- | --- | --- |
+| `interpolate` | `false` | Whether saved clips are interpolated. Override with `--interpolate` or `--no-interpolate`. |
+| `interpolation_engine` | `rife` | Engine used when interpolation is enabled: `rife`, `minterpolate`, or `framerate`. Legacy `none` remains an off alias. |
 | `trim_end_transition` | `true` | Cut the trailing fade-out/copyright-endscreen off a chapter's/paragraph's last verse. `--keep-end-transition` overrides for one run. |
 | `trim_mid_transitions` | `false` | Also cut paragraph transitions in the *middle* of a multi-verse range (a jump cut, straight to the next paragraph's first kept frame). Off by default — a range spanning multiple paragraphs is normally meant to play through as one continuous scene. `--trim-mid-transitions` overrides for one run. |
 | `sign_lang_ref_language` | `ASL=en,FSL=en,BVL=es,SPE=es,INI=id` | Which spoken language each sign language's burned-in caption is actually written in — used to skip the reference-swap when source and target already match. Add an entry for any other language you use; an unlisted one always gets the full overlay. |
@@ -123,7 +126,7 @@ Every `slverse config list` setting has a matching `--<dashed-key>` flag on `ext
 Save a single extraction under an explicit filename:
 
 ```bash
-./slverse extract FSL "Psalm 16:11" --write --output psalm-16-11.mkv
+./slverse extract FSL "Psalm 16:11" --output psalm-16-11.mkv
 ```
 
 Do the same for every language in your configured list, in parallel:
@@ -211,6 +214,7 @@ The winner is the smallest file among everything at SSIM ≥ 0.98 - but ties wit
 - Book references accept JW.org's standard, official, singular, plural, display-title, and numeric variants. The rendered overlay, output metadata, chapter titles, and default filename always use the matched book's `standardName`, regardless of which accepted variant you typed.
 - Encoding quality is configurable (`video_codec`, `video_crf`, `video_preset`) and defaults to `av1` (`libsvtav1 -crf 30 -preset 6` in software - royalty-free and, measured directly, smaller *and* nearly as fast as h264 on this machine; see `docs/ffrife.md`'s codec comparison table for the numbers). This is intentionally higher quality than JW.org's own source encode (~1.07 Mbps H.264 Main@3.1 720p30, per a direct `ffprobe` of a sample video) rather than matching it bitrate-for-bitrate: overlays force a re-encode of an already-lossy source, and re-encoding a second generation at the source's own bitrate would compound visible compression loss. Since clips are short, the absolute file size stays small either way. `video_codec=av1` automatically falls back to `hevc` then `h264` if this machine/ffmpeg build can't actually encode av1 (no hardware AV1 encoder for the configured `hardware_encoder`, and no `libsvtav1`/`libaom-av1` in software) - it prints a one-line notice when that happens. These are still just defaults, not a claim they're best on every machine - GPU vendor/generation, ffmpeg build, and content all change the real answer; run `slverse benchmark` (or accept setup's offer to run it) for this machine's own numbers instead of guessing.
 - The interpolation target frame rate is configurable via `interpolation_target_fps` (default `60`, e.g. `./slverse config set interpolation_target_fps 120` or `--interpolation-target-fps 120` for one run) and applies to all three engines (`rife`, `minterpolate`, `framerate`). With `interpolation_engine = rife`, `ffrife`'s `interpolate()` probes the source's real frame rate and computes the exact RIFE frame count needed to hit this target at the source's original duration - so it lands on the flat number you asked for (not a source-fps multiple like 59.94) with no speed change, for any source/target ratio.
+- Interpolation enablement is separate from engine selection: new users default to `interpolate = false` and `interpolation_engine = rife`. Use `--interpolate` or `--no-interpolate` for one run and `-I`/`--interpolation-engine` to select the engine. Existing configs migrate their old engine-only behavior automatically; `interpolation_engine = none` remains accepted as a compatibility alias for off.
 - Picks a drawtext-capable `ffmpeg` automatically: it prefers an `ffmpeg-full`-style build (or whatever `ffmpeg_binary`/`ffprobe_binary` you set explicitly) over the stock Homebrew `ffmpeg`, which doesn't include `freetype`/`fontconfig`.
 - Book-name matching uses the configured `api_language` priority list and ignores case and diacritics. The default `E` accepts English abbreviations/full names or a plain book number; `VT,E` adds Vietnamese-first lookup with English fallback.
 - `extract`/`find`/`bulk` trigger a metadata refresh at most once every `auto_sync_interval_hours` (default 24), so verse availability stays current without ever running `slverse sync` by hand. By default (`auto_sync_background = true`) this refresh runs as a detached background process and never blocks the command that triggered it; set `./slverse config set auto_sync_background false` to sync inline and block instead. Disable the refresh entirely per-run with `--no-auto-sync`, or permanently with `./slverse config set auto_sync false`. A failed or offline attempt still resets the timer, so a bad connection doesn't retry (and pause) on every command for the rest of the day.

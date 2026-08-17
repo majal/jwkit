@@ -29,6 +29,7 @@ ffv all Ge 10:2 -p
 ```
 
 Every `slverse extract` option works in the normal and `any` forms. Use `slverse extract --help` for the complete list.
+Options are passed through unchanged, so newly added `slverse extract` flags work without an `ffv` update. In the `all` form, put options after the complete Bible reference; the option tail is forwarded intact to `slverse find`.
 
 ## Important Behavior / Defaults
 

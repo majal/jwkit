@@ -2190,13 +2190,7 @@ class SlverseGenericConfigOverrideTest(unittest.TestCase):
 
 
 class SlverseExtractCliParsingTest(unittest.TestCase):
-    """-I/--interpolation-engine takes a value; -i/--interpolate is an
-    unrelated boolean ("force interpolation on"). They used to share the
-    same mnemonic with no short flag for the former, so typing -i where
-    -I was meant (e.g. `-i none` intending to select the 'none' engine)
-    left an unconsumed 'none' positional and a confusing argparse error.
-    -I is the dedicated fix - these lock in that it actually reaches
-    config as 'interpolation_engine', separately from -i/--interpolate."""
+    """Interpolation enablement and engine selection stay independent."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -2215,7 +2209,7 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
     def test_short_I_flag_sets_interpolation_engine(self) -> None:
         args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-I", "none"])
         self.assertEqual(args["interpolation_engine"], "none")
-        self.assertFalse(args["interpolate"])  # -i/--interpolate untouched
+        self.assertIsNone(args["interpolate"])  # use saved preference
 
     def test_long_interpolation_engine_flag_still_works(self) -> None:
         args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--interpolation-engine", "rife"])
@@ -2225,6 +2219,18 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
         args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-i"])
         self.assertTrue(args["interpolate"])
         self.assertIsNone(args["interpolation_engine"])
+
+    def test_no_interpolate_forces_boolean_off(self) -> None:
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--no-interpolate"])
+        self.assertFalse(args["interpolate"])
+
+    def test_output_implies_write(self) -> None:
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-o", "clip.mp4"])
+        self.assertTrue(args["write"])
+
+    def test_source_modes_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--cache", "--segment"])
 
     def test_segment_flag_is_parsed(self) -> None:
         args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--segment"])

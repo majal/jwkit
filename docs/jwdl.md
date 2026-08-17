@@ -89,6 +89,8 @@ Download at a smaller resolution than the default:
 
 ## Important Behavior / Defaults
 
+Persistent download preferences live in `~/.config/jwkit/jwdl/config.json`. Use `jwdl config list|get|set`; matching per-run flags override them. Boolean preferences use paired flags such as `--include-audio-descriptions`/`--no-include-audio-descriptions` and `--include-large-print`/`--no-include-large-print`. Positional publication/category/language identifiers and one-shot `--dry-run` remain CLI-only. Existing `jwdl <pub> [lang]`, `jwdl all`, and `jwdl list` behavior is unchanged.
+
 - Default destination is `~/Music/Watchtower Music/<collection>`; override it for every collection with `--base-dir`, or for a single pub with `--dir`. Periodicals default to `~/Documents/JW Periodicals/<publication>` and take the same `--base-dir`/`--dir` overrides.
 - Default language is `E` (English); pass a language code as the second positional argument (e.g. `./jwdl osg S`, `./jwdl periodicals w S`).
 - Audio-description tracks are excluded by default for music; use `--include-audio-descriptions` when you specifically want them.

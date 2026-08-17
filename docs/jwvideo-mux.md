@@ -73,6 +73,8 @@ Use a pre-downloaded local file:
 
 ## Important Behavior / Defaults
 
+Persistent mux preferences live in `~/.config/jwkit/jwvideo-mux/config.toml`. Use `jwvideo-mux config list|get|set`; every persistent key also has a same-named per-run flag (with compatibility aliases such as `--res`/`--resolution`). Boolean preferences have positive and negative forms. The input identifier, manual evidence files, analysis actions, and overwrite decisions are deliberately one-run inputs rather than saved defaults.
+
 - `-v, --video`: Comma-separated languages for video tracks (default: `E`)
 - `-a, --audio`: Comma-separated languages for audio tracks (default: `E,TG,CV,HV,SA`)
 - `-s, --subs`: Comma-separated languages for subtitles. If omitted, automatically fetches subtitles for all requested video and audio languages.

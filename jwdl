@@ -114,7 +114,12 @@ def echo_r(msg):
 
 
 def load_config():
-    config = {"base_dir": str(DEFAULT_BASE_DIR), "pubs": {}, "workers": 4}
+    config = {
+        "base_dir": str(DEFAULT_BASE_DIR), "periodicals_base_dir": str(DEFAULT_PERIODICALS_BASE_DIR),
+        "video_base_dir": str(DEFAULT_VIDEO_BASE_DIR), "workers": 4, "pubs": {},
+        "include_audio_descriptions": False, "periodical_months": 5,
+        "include_large_print": False, "video_resolution": DEFAULT_VIDEO_RESOLUTION,
+    }
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE) as f:
@@ -124,6 +129,28 @@ def load_config():
         except (json.JSONDecodeError, OSError) as e:
             echo_r(f"Warning: could not read {CONFIG_FILE}: {e}")
     return config
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+def run_config(argv, config):
+    parser = argparse.ArgumentParser(prog="jwdl config", description="Show or edit saved jwdl defaults")
+    parser.add_argument("action", choices=("list", "get", "set"), nargs="?", default="list")
+    parser.add_argument("key", nargs="?"); parser.add_argument("value", nargs="?")
+    args = parser.parse_args(argv)
+    if args.action == "list": print(json.dumps(config, indent=2, sort_keys=True)); return 0
+    if not args.key or args.key not in config: raise SystemExit(f"Unknown config key: {args.key}")
+    if args.action == "get": print(json.dumps(config[args.key])); return 0
+    if args.value is None: raise SystemExit("jwdl config set requires KEY VALUE")
+    old = config[args.key]
+    if isinstance(old, bool):
+        if args.value.lower() not in ("true", "false"): raise SystemExit("Boolean values must be true or false")
+        value = args.value.lower() == "true"
+    elif isinstance(old, int): value = int(args.value)
+    elif isinstance(old, dict): raise SystemExit("Edit structured pubs directly in config.json")
+    else: value = args.value
+    config[args.key] = value; save_config(config); print(f"Set {args.key} = {value}"); return 0
 
 
 def resolve_pubs(config):
@@ -407,8 +434,8 @@ def run_periodicals(argv, config):
     )
     parser.add_argument("code", nargs="?", help="periodical code (see 'jwdl periodicals list'), or 'all'")
     parser.add_argument("lang", nargs="?", default="E", help="language code (default: E)")
-    parser.add_argument("--months", type=int, default=5, help="how many issues to fetch starting this month (default: 5)")
-    parser.add_argument("--include-large-print", action="store_true", help="also download the large-print edition where available")
+    parser.add_argument("--months", type=int, default=None, help="issues to fetch; default from periodical_months config")
+    parser.add_argument("--include-large-print", action=argparse.BooleanOptionalAction, default=None, help="include or exclude the large-print edition")
     parser.add_argument("--dir", type=Path, help="override the destination directory for a single periodical")
     parser.add_argument("--base-dir", type=Path, help="override the base periodicals directory")
     parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
@@ -419,7 +446,9 @@ def run_periodicals(argv, config):
     global JWKIT_CONFIG
     JWKIT_CONFIG = _apply_overwrite_overrides(args)
 
-    base_dir = args.base_dir or Path(config.get("periodicals_base_dir", str(DEFAULT_PERIODICALS_BASE_DIR)))
+    base_dir = args.base_dir or Path(config["periodicals_base_dir"])
+    months = config["periodical_months"] if args.months is None else args.months
+    include_large_print = config["include_large_print"] if args.include_large_print is None else args.include_large_print
 
     if not args.code or args.code == "list":
         cmd_periodicals_list()
@@ -435,7 +464,7 @@ def run_periodicals(argv, config):
     all_errors = []
     for pub, name in targets:
         dest_dir = args.dir if (args.dir and len(targets) == 1) else base_dir / name
-        errors = download_periodical(pub, dest_dir, args.lang, args.months, args.dry_run, args.include_large_print)
+        errors = download_periodical(pub, dest_dir, args.lang, months, args.dry_run, include_large_print)
         all_errors.extend(errors)
         print()
 
@@ -542,7 +571,7 @@ def run_video(argv, config):
              "of subcategories (like VideoOnDemand itself), lists them instead.",
     )
     parser.add_argument("lang", nargs="?", default="E", help="language code (default: E)")
-    parser.add_argument("--resolution", default=DEFAULT_VIDEO_RESOLUTION, help=f"target resolution: 144p/240p/360p/480p/720p/1080p when available (default: {DEFAULT_VIDEO_RESOLUTION}; falls back to the closest available)")
+    parser.add_argument("--resolution", help="target resolution; default from video_resolution config")
     parser.add_argument("--dir", type=Path, help="override the destination directory")
     parser.add_argument("--base-dir", type=Path, help="override the base video directory")
     parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
@@ -553,7 +582,8 @@ def run_video(argv, config):
     global JWKIT_CONFIG
     JWKIT_CONFIG = _apply_overwrite_overrides(args)
 
-    base_dir = args.base_dir or Path(config.get("video_base_dir", str(DEFAULT_VIDEO_BASE_DIR)))
+    base_dir = args.base_dir or Path(config["video_base_dir"])
+    resolution = args.resolution or config["video_resolution"]
 
     cat = fetch_video_category(args.category, args.lang)
     if cat is None:
@@ -585,7 +615,7 @@ def run_video(argv, config):
     counts = {}
     errors = []
     for entry in media:
-        status, detail = download_video(entry, dest_dir, args.resolution, args.dry_run)
+        status, detail = download_video(entry, dest_dir, resolution, args.dry_run)
         counts[status] = counts.get(status, 0) + 1
         if status == "downloaded":
             echo_g(f"  downloaded: {detail}")
@@ -623,6 +653,8 @@ def main():
 
     migrate_legacy_config_dir()
     config = load_config()
+    if len(sys.argv) > 1 and sys.argv[1] == "config":
+        return run_config(sys.argv[2:], config)
 
     # 'periodicals' and 'video' are separate command families (different
     # content types/API shapes) rather than being folded into the same
@@ -641,11 +673,12 @@ def main():
     parser.add_argument("--base-dir", type=Path, help="override the base Watchtower Music directory")
     parser.add_argument(
         "--include-audio-descriptions",
-        action="store_true",
-        help="also download the audio-description ('for the blind') variants, excluded by default",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="include or exclude audio-description variants",
     )
     parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
     parser.add_argument("--workers", type=int, help="parallel downloads per pub (default: 4)")
+    parser.add_argument("--pub-folder", action="append", metavar="CODE=FOLDER", help="add/override a configured music publication folder for this run; repeatable")
     parser.add_argument("--color", action="store_true", help="force colored output for this run (works with 'periodicals'/'video' too - already applied before this parser runs)")
     parser.add_argument("--no-color", action="store_true", help="disable colored output for this run (works with 'periodicals'/'video' too - already applied before this parser runs)")
     _add_overwrite_args(parser)
@@ -655,9 +688,15 @@ def main():
     global JWKIT_CONFIG
     JWKIT_CONFIG = _apply_overwrite_overrides(args)
 
+    if args.pub_folder:
+        config["pubs"] = dict(config.get("pubs", {}))
+        for item in args.pub_folder:
+            if "=" not in item: raise SystemExit("--pub-folder must be CODE=FOLDER")
+            code, folder = item.split("=", 1); config["pubs"][code.strip()] = folder.strip()
     pubs = resolve_pubs(config)
     base_dir = args.base_dir or Path(config["base_dir"])
     workers = args.workers or config.get("workers", 4)
+    include_audio_descriptions = config["include_audio_descriptions"] if args.include_audio_descriptions is None else args.include_audio_descriptions
 
     if not args.pub or args.pub == "list":
         cmd_list(pubs)
@@ -673,7 +712,7 @@ def main():
     all_errors = []
     for pub, folder in targets:
         dest_dir = args.dir if (args.dir and len(targets) == 1) else base_dir / folder
-        errors = download_pub(pub, dest_dir, args.lang, args.dry_run, args.include_audio_descriptions, workers)
+        errors = download_pub(pub, dest_dir, args.lang, args.dry_run, include_audio_descriptions, workers)
         all_errors.extend(errors)
         print()
 

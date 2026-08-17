@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import io
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 
 from tests.support import load_script_module
+from pathlib import Path
 
 
 class JwvideoMuxColorOutputTest(unittest.TestCase):
@@ -39,6 +41,20 @@ class JwvideoMuxColorOutputTest(unittest.TestCase):
         with redirect_stdout(out):
             self.mux.color_print("hello")
         self.assertNotIn("\033[", out.getvalue())
+
+    def test_config_defaults_and_roundtrip_cover_behavior_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_file, old_dir = self.mux.CONFIG_FILE, self.mux.CONFIG_DIR
+            self.addCleanup(setattr, self.mux, "CONFIG_FILE", old_file)
+            self.addCleanup(setattr, self.mux, "CONFIG_DIR", old_dir)
+            self.mux.CONFIG_DIR = Path(tmp)
+            self.mux.CONFIG_FILE = Path(tmp) / "config.toml"
+            defaults = self.mux.load_config()
+            self.assertEqual(defaults, self.mux.DEFAULT_CONFIG)
+            defaults["cleanup"] = True
+            defaults["res"] = "1080p"
+            self.mux.save_config(defaults)
+            self.assertEqual(self.mux.load_config(), defaults)
 
 
 if __name__ == "__main__":

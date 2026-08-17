@@ -40,14 +40,17 @@ def slverse_path() -> str:
 
 
 def split_all_reference(tokens: list[str]) -> tuple[list[str], list[str]]:
-    flags = []
-    words = []
+    """Split only at the first option and pass the entire option tail on.
+
+    This deliberately does not maintain a second copy of slverse's option
+    schema: options may take values now or in the future, and ffv must not
+    mistake those values for words in the Bible reference. Put compatibility
+    options after the reference, as shown in the usage examples.
+    """
+    split = next((i for i, token in enumerate(tokens) if token.startswith("-") and token != "-"), len(tokens))
+    words, flags = tokens[:split], tokens[split:]
     aliases = {"-p": "--play", "-m": "--play"}
-    for token in tokens:
-        if token.startswith("-") and not re.fullmatch(r"-?\d+(?:\.\d+)?", token):
-            flags.append(aliases.get(token, token))
-        else:
-            words.append(token)
+    flags = [aliases.get(token, token) for token in flags]
     match = re.fullmatch(r"(.+?)\s+(\d+):(.+)", " ".join(words).strip())
     if not match:
         raise SystemExit("ffv all: use a reference such as 'Ge 10:2' or '1 Sa-mu-en 2:12-17'")
