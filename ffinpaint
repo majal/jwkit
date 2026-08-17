@@ -94,6 +94,8 @@ def inpaint(source, output, box, config, start=None, end=None):
     """
     if not configured(config):
         return False
+    print()
+    print(COLOR.header("Inpainting using E2FGVI-HQ..."))
     root = Path(config["e2fgvi_root"])
     checkpoint = Path(config["e2fgvi_checkpoint"])
     width, height, fps = probe_size(source)

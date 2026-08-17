@@ -577,6 +577,11 @@ def load_ffrife():
         loader.exec_module(module)
         module.FFMPEG_BIN = FFMPEG_BIN
         module.FFPROBE_BIN = FFPROBE_BIN
+        # Otherwise ffrife's own module-level COLOR stays permanently
+        # disabled here - it's only ever set by ffrife's own main(), which
+        # this library usage never calls - so every header/progress bar it
+        # prints would come out uncolored regardless of slverse's setting.
+        module.COLOR = COLOR
         _FFRIFE_MODULE = module
     return _FFRIFE_MODULE
 
@@ -591,6 +596,7 @@ def load_ffinpaint():
         loader.exec_module(module)
         module.FFMPEG_BIN = FFMPEG_BIN
         module.FFPROBE_BIN = FFPROBE_BIN
+        module.COLOR = COLOR  # see load_ffrife's identical sync for why
         _FFINPAINT_MODULE = module
     return _FFINPAINT_MODULE
 
@@ -612,7 +618,7 @@ def ffrife_config_for(config):
     return ffrife_config
 
 def setup_dependencies(config):
-    print("Setting up dependencies...")
+    print(COLOR.header("Setting up dependencies..."))
     system = platform.system()
     ffmpeg_bin = resolve_ffmpeg_binary(config)
     has_ffmpeg = command_exists(ffmpeg_bin) or os.path.exists(ffmpeg_bin)
@@ -809,7 +815,7 @@ def download_file(url, output_path, expected_checksum=None):
     tmp_path = Path(str(output_path) + ".part")
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            print(f"Downloading {url}...")
+            print(COLOR.header(f"Downloading {url}..."))
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_path, "wb") as f:
                 total = int(resp.headers.get("Content-Length") or 0)
@@ -1008,12 +1014,12 @@ def download_segment(url, output_path, start_time, end_time):
     tmp_path = Path(str(output_path) + ".part")
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            print(f"Fetching segment {start_time:.3f}-{end_time:.3f} from {url}...")
+            print(COLOR.header(f"Fetching segment {start_time:.3f}-{end_time:.3f} from {url}..."))
             # -f mp4 forces the muxer explicitly - ffmpeg otherwise guesses
             # the container from the output filename's extension, and
             # ".part" (appended for the same atomic-write-then-rename safety
             # download_file uses) isn't one it recognizes.
-            run_ffmpeg(["-ss", str(start_time), "-to", str(end_time), "-i", url, "-c", "copy", "-reset_timestamps", "1", "-f", "mp4", str(tmp_path)], duration=end_time - start_time)
+            run_ffmpeg(["-ss", str(start_time), "-to", str(end_time), "-i", url, "-c", "copy", "-reset_timestamps", "1", "-f", "mp4", str(tmp_path)], duration=end_time - start_time, label="Fetching")
             os.replace(tmp_path, output_path)
             return True
         except subprocess.CalledProcessError as e:
@@ -1044,7 +1050,7 @@ def resolve_segment_source(url, lang, book_num, chapter, start_time, end_time, c
     return url, None
 
 # --- Video Processing ---
-def run_ffmpeg(args, duration=None, slow_after=4.0):
+def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     """Runs ffmpeg. Most extract/interpolate steps finish in a few seconds
     and stay quiet; pass `duration` (expected output seconds, known by the
     caller from the verse's own start/end times) to show a minimal live
@@ -1053,6 +1059,7 @@ def run_ffmpeg(args, duration=None, slow_after=4.0):
     a CPU-bound filter)."""
     base = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y"]
     print()
+    print(COLOR.header(f"{label}..."))
     print(f"Running: {' '.join(base + args)}")
 
     if not duration:
@@ -1077,12 +1084,12 @@ def run_ffmpeg(args, duration=None, slow_after=4.0):
         now = time.time(); eta = eta_estimator.update(current, now)
         if now - last_eta >= 5.0: eta_display, last_eta = eta, now
         if shown and now - last_print >= 1.0:
-            print_time_progress(current, duration, label="Encoding", eta_seconds=eta_display)
+            print_time_progress(current, duration, label=label, eta_seconds=eta_display)
             last_print = now
     proc.stdout.close()
     proc.wait()
     if shown:
-        print_time_progress(duration, duration, label="Encoding", done=True)
+        print_time_progress(duration, duration, label=label, done=True)
         print()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
@@ -1690,11 +1697,11 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     vf_chain = list(filter(None, [overlay]))
     if engine == "minterpolate":
         print()
-        print("Interpolating using ffmpeg minterpolate...")
+        print(COLOR.header("Interpolating using ffmpeg minterpolate..."))
         vf_chain.append(f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
     elif engine == "framerate":
         print()
-        print("Interpolating using ffmpeg framerate...")
+        print(COLOR.header("Interpolating using ffmpeg framerate..."))
         vf_chain.append(f"framerate=fps={target_fps}")
 
     # -ss before -i does an input-side seek; on a remote URL that means the
@@ -1941,12 +1948,12 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
     prefix = ""
     if mode == "slow" and slow_engine == "minterpolate":
         print()
-        print("Interpolating using ffmpeg minterpolate...")
+        print(COLOR.header("Interpolating using ffmpeg minterpolate..."))
         prefix = f"[0:v]minterpolate=fps={config.get('interpolation_target_fps', DEFAULT_CONFIG['interpolation_target_fps'])}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1[base];"
         base_label = "[base]"
     elif mode == "slow" and slow_engine == "framerate":
         print()
-        print("Interpolating using ffmpeg framerate...")
+        print(COLOR.header("Interpolating using ffmpeg framerate..."))
         prefix = f"[0:v]framerate=fps={config.get('interpolation_target_fps', DEFAULT_CONFIG['interpolation_target_fps'])}[base];"
         base_label = "[base]"
 
@@ -2300,7 +2307,7 @@ def cmd_benchmark(args, config):
             print(f"Benchmarking against a real sample from: {source_desc}")
         else:
             print("Nothing cached yet - benchmarking against a synthetic test clip (run this again once you've extracted something for a more representative result).")
-        print("Trying every encoder this machine's ffmpeg supports - this can take a minute or two:\n")
+        print(COLOR.header("Trying every encoder this machine's ffmpeg supports - this can take a minute or two:\n"))
         results = _jwkit_common.run_encoder_benchmark(FFMPEG_BIN, sample, crf_map=crf_map, log=lambda m: print(f"  {m}"))
 
     print()

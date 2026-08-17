@@ -254,7 +254,7 @@ def download_file(url, output_path, expected_checksum=None):
     tmp_path = Path(str(output_path) + ".part")
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            print(f"Downloading {url}...")
+            print(COLOR.header(f"Downloading {url}..."))
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_path, "wb") as f:
                 total = int(resp.headers.get("Content-Length") or 0)
@@ -297,6 +297,7 @@ def build_encode_args(config, notice=True):
 def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     base = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y"]
     print()
+    print(COLOR.header(f"{label}..."))
     print(f"Running: {' '.join(base + args)}")
 
     if not duration:
@@ -807,7 +808,7 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         return None
 
     print()
-    print("Interpolating using rife-ncnn-vulkan...")
+    print(COLOR.header("Interpolating using rife-ncnn-vulkan..."))
     frames_root = Path(frames_root)
     in_frames = frames_root / "in"
     out_frames = frames_root / "out"
@@ -1117,7 +1118,7 @@ def cmd_benchmark(args, config):
                 )
                 print(f"--sample is {duration:.0f}s long - using an 8s slice from its middle instead of the whole thing.")
                 sample = trimmed
-        print("Trying every encoder this machine's ffmpeg supports - this can take a minute or two:\n")
+        print(COLOR.header("Trying every encoder this machine's ffmpeg supports - this can take a minute or two:\n"))
         results = _jwkit_common.run_encoder_benchmark(ffmpeg_bin, sample, crf_map=crf_map, log=lambda m: print(f"  {m}"))
 
     print()

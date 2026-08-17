@@ -54,6 +54,12 @@ class Colorizer:
     def yellow(self, text): return self._wrap(_COLOR_CODES["yellow"], text)
     def cyan(self, text): return self._wrap(_COLOR_CODES["cyan"], text)
 
+    def header(self, text):
+        """Bold cyan - a major pipeline-step announcement (Interpolating,
+        Encoding, Downloading, ...), distinct from green/yellow/red's
+        success/warning/error meaning. One spot to change the look."""
+        return self.bold(self.cyan(text))
+
 
 def resolve_color_enabled(jwkit_config, cli_override=None):
     """cli_override (True/False from --color/--no-color) wins outright.
