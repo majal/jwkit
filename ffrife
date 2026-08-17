@@ -498,10 +498,12 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     return out_frames, fps, retimed_duration(duration, speed)
 
 
-def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=60, speed=None, metadata_args=None):
+def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=60, speed=None, metadata_args=None, output_vf=None):
     """Interpolate `source` (local path or remote URL) to `fps`, optionally
     trimmed to [start, end] and with an extra ffmpeg -vf filter chain
-    applied - in ONE pass that extracts frames directly from the source
+    applied before RIFE. ``output_vf`` is instead applied after RIFE in the
+    final encode, which is preferable for static text/overlays that the model
+    should not reinterpret. Frame extraction is directly from the source
     (trim + filter baked in), so there's no intermediate lossy re-encode
     generation before RIFE ever sees the footage. The only lossy encode is
     the final merge. Falls back to a plain ffmpeg filter (or no
@@ -547,6 +549,8 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
             print("rife_fallback_engine=none: keeping native frame rate, no interpolation applied.")
         if speed_vf:
             vf_chain.append(speed_vf)
+        if output_vf:
+            vf_chain.append(output_vf)
         cmd = trim_args + ["-i", str(source)]
         if vf_chain:
             cmd += ["-vf", ",".join(vf_chain)]
@@ -570,6 +574,8 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         if has_audio:
             merge_cmd += ["-i", str(audio_path)]
         # RIFE already generated the retimed video frame count above.
+        if output_vf:
+            merge_cmd += ["-vf", output_vf]
         if has_audio:
             merge_cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"])
         merge_cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]

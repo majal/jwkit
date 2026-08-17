@@ -1896,8 +1896,10 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         self.assertEqual(len(ffrife_calls), 1)
         self.assertAlmostEqual(ffrife_calls[0][1]["fps"], 30000 / 1001)
         self.assertEqual(ffrife_calls[0][1]["speed"], 0.5)
+        self.assertEqual(len(ffmpeg_calls), 1)  # normal section is a direct input to the final encode
         final_fc = ffmpeg_calls[-1][ffmpeg_calls[-1].index("-filter_complex") + 1]
         self.assertIn("settb=AVTB", final_fc)
+        self.assertIn("fps=29.97", final_fc)
 
 
 class SlverseFfrifeIntegrationTest(unittest.TestCase):
@@ -1957,8 +1959,27 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         self.assertEqual(args[1], "out.mp4")
         self.assertEqual(kwargs["start"], 10.0)
         self.assertEqual(kwargs["end"], 20.0)
-        self.assertEqual(kwargs["vf"], "drawtext=text='stub'")
+        self.assertEqual(kwargs["output_vf"], "drawtext=text='stub'")
+        self.assertNotIn("vf", kwargs)
         self.assertEqual(kwargs["fps"], 50.0)
+
+    def test_rife_mid_transition_cuts_use_lossless_section_pipeline(self) -> None:
+        calls = []
+        fake_ffrife = argparse.Namespace(load_config=lambda: {})
+        self.slverse.load_ffrife = lambda: fake_ffrife
+        self.slverse.ffrife_config_for = lambda config: {"rife_binary_path": "/fake/rife"}
+        self.slverse.build_overlay_filter = lambda *a, **k: None
+        self.slverse.encode_rife_frame_sections = lambda *a, **k: calls.append((a, k))
+        config = {"interpolation_engine": "rife", "interpolation_target_fps": "60"}
+
+        self.slverse.extract_verse(
+            "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
+            kept_segments=[(0.0, 4.0), (6.0, 10.0)],
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][2], [(10.0, 14.0, None, True), (16.0, 20.0, None, True)])
+        self.assertEqual(calls[0][0][3], 60.0)
 
 
 class SlverseLaunchMpvTest(unittest.TestCase):
@@ -2018,6 +2039,31 @@ class SlverseLaunchMpvTest(unittest.TestCase):
     def test_rich_text_outer_quotes_do_not_become_part_of_mpv_flags(self) -> None:
         self.assertEqual(self.slverse.parse_mpv_options("“--fs --screen=1”"), ["--fs", "--screen=1"])
 
+    def test_overlay_free_preview_plays_source_without_temp_encode(self) -> None:
+        self.slverse.command_exists = lambda name: True
+        self.slverse.detect_caption_box = lambda *a, **k: None
+        self.slverse.build_overlay_filter = lambda *a, **k: None
+        self.slverse.run_ffmpeg = lambda *a, **k: self.fail("overlay-free preview must not encode")
+
+        self.slverse.preview_verse("source.mp4", 10.0, 15.0, "Psalm", 16, "11", "FSL", {}, use_mpv=True)
+
+        cmd = self.captured_cmd[0]
+        self.assertIn("--start=10.0", cmd)
+        self.assertIn("--length=5.0", cmd)
+        self.assertEqual(cmd[-1], "source.mp4")
+
+    def test_overlay_preview_keeps_compatible_external_ffmpeg_encode(self) -> None:
+        self.slverse.command_exists = lambda name: True
+        self.slverse.detect_caption_box = lambda *a, **k: None
+        self.slverse.build_overlay_filter = lambda *a, **k: "drawtext=text='ASL'"
+        ffmpeg_calls = []
+        self.slverse.run_ffmpeg = lambda cmd, duration=None: ffmpeg_calls.append(cmd)
+
+        self.slverse.preview_verse("source.mp4", 10.0, 15.0, "Psalm", 16, "11", "ASL", {}, use_mpv=True)
+
+        self.assertEqual(len(ffmpeg_calls), 1)
+        self.assertEqual(ffmpeg_calls[0][ffmpeg_calls[0].index("-vf") + 1], "drawtext=text='ASL'")
+        self.assertIn("ultrafast", ffmpeg_calls[0])
 
 class SlverseAddToPathProfileTest(unittest.TestCase):
     @classmethod

@@ -158,7 +158,7 @@ DEFAULT_CONFIG = {
     "delogo_height_pad": "2",
     "default_target_lang": "FSL",  # requesting this SL skips delogo/drawtext entirely - its own burned-in caption is already correct
     "trim_end_transition": "true",  # exclude JW's own trailing fade-out/copyright-endscreen transition (endTransitionDuration in the verse marker metadata - confirmed empirically to cover exactly the fade-to-black + JW.org copyright card after a chapter's/paragraph's last verse) from the very end of the extracted window - the right default for a cut that ends there. false (or --keep-end-transition for one run) restores the old behavior of extracting through the full marker duration, transition included. Only ever touches the LAST selected verse - see trim_mid_transitions for transitions in the middle of a multi-verse range.
-    "trim_mid_transitions": "false",  # a verse range spanning multiple paragraphs plays through any mid-range paragraph transition untouched by default (it's one continuous scene, not something to cut) - set true (or --trim-mid-transitions for one run) to also cut those out, jump-cutting straight from one paragraph's last kept frame to the next paragraph's first. Never touches the range's own trailing transition - that's trim_end_transition's job. Not supported together with interpolation_engine=rife or --slow/--fast in this pass; both silently keep mid-range transitions in that combination.
+    "trim_mid_transitions": "false",  # a verse range spanning multiple paragraphs plays through any mid-range paragraph transition untouched by default (it's one continuous scene, not something to cut) - set true (or --trim-mid-transitions for one run) to also cut those out, jump-cutting straight from one paragraph's last kept frame to the next paragraph's first. Never touches the range's own trailing transition - that's trim_end_transition's job. Not supported together with --slow/--fast; that combination keeps mid-range transitions.
     "sign_lang_ref_language": "ASL=en,FSL=en,BVL=es,SPE=es,INI=id",  # spoken/verse-reference language each sign language's burned-in caption is actually written in, e.g. "KEY=VAL,KEY2=VAL2" - NOT derivable from the ISO sign-language code in jwlangs.json (e.g. ASL's is "ase"), so this is a small editable table instead. When source and target share a reference language (e.g. ASL->FSL, both en), delogo/drawtext for the verse reference itself is skipped - only show_source_lang_label's small label still applies. Add an entry for any other language you use; an unlisted language is treated as never matching (falls back to the full overlay).
     "show_source_lang_label": "true",  # the small "which SL this clip came from" label under the verse reference - independent of overlay_source_label_alpha, which only controls its opacity when shown
     "mpv_show_osc": "true",  # mpv's on-screen controller/overlay that pops up on mouse movement, for every mpv window slverse opens (--play, find --play) - slverse always passes --no-config to mpv for reproducibility, so a personal mpv.conf that disables this doesn't apply here; set false to match a "nothing shows on hover" setup. Per-user preference, not something to default off for everyone.
@@ -1464,10 +1464,10 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
     """Default 'slverse extract' behavior (no --write): play the verse with
     its overlay applied live - including a visible box where delogo would
     remove the source caption - without writing anything to disk. Mirrors
-    old ffv's play_video(): ffplay applies -vf directly against the stream
-    (fastest - no encode at all), while mpv can't take -vf on a remote/
-    local source directly, so --play/-m instead makes a quick ultrafast
-    temp clip first, the same tradeoff the old script made."""
+    old ffv's play_video(): ffplay applies -vf directly against the stream.
+    mpv can accept libavfilter graphs, but its embedded FFmpeg may lack
+    drawtext even when the external ffmpeg-full has it, so --play/-m makes a
+    quick compatibility preview clip first."""
     detected_box = detect_caption_box(source, start_time, end_time, config)
     overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
     duration = end_time - start_time
@@ -1482,6 +1482,9 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
             print(f"Previewing: {source}")
             if from_cache:
                 print(f"Source: {source_url}")
+            if not overlay:
+                launch_mpv([f"--start={start_time}", f"--length={duration}", str(source)], config=config)
+                return
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_out = Path(tmp_dir) / "preview.mkv"
                 cmd = ["-ss", str(start_time), "-t", str(duration), "-i", str(source)]
@@ -1660,8 +1663,6 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
         print(COLOR.yellow("(inpainting backend is not configured; using the normal delogo blur)"))
 
     if engine == "rife":
-        if len(segments) > 1:
-            print(COLOR.yellow("(trim_mid_transitions doesn't support interpolation_engine=rife yet - mid-range transitions will play through untouched.)"))
         ffrife = load_ffrife()
         # ffrife's interpolate() probes the source's own fps and computes the
         # exact RIFE frame count needed to hit target_fps at the source's
@@ -1669,7 +1670,15 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
         # (and every overlay fade timestamp in it) the way a hardcoded 60
         # would if the source isn't exactly 30fps.
         target_fps = float(config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"]))
-        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=overlay, fps=target_fps, metadata_args=metadata_args)
+        if len(segments) > 1:
+            absolute_sections = [(start_time + seg_start, start_time + seg_end, None, True) for seg_start, seg_end in segments]
+            encode_rife_frame_sections(
+                source, output_file, absolute_sections, target_fps, config,
+                overlay=overlay, metadata_args=metadata_args, ffrife=ffrife,
+                ffrife_config=ffrife_config_for(config),
+            )
+            return
+        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, output_vf=overlay, fps=target_fps, metadata_args=metadata_args)
         return
 
     target_fps = float(config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"]))
@@ -1822,6 +1831,56 @@ def build_sectioned_filter_complex(boundaries, speed, mode, base_label):
     fc += "".join(f"[{l}]" for l in labels) + f"concat=n={n}:v=1:a=0[out]"
     return fc, "[out]"
 
+
+def encode_rife_frame_sections(source, output_file, sections, target_fps, config, overlay=None, metadata_args=None, ffrife=None, ffrife_config=None, source_fps=None):
+    """Prepare section frame sequences losslessly, then encode once.
+
+    ``sections`` contains ``(start, end, speed, use_rife)`` tuples. A speed
+    of ``None`` keeps normal duration. Untouched sections stay as direct source
+    inputs; RIFE sections synthesize their final retimed PNG sequence. Overlay,
+    concat, metadata, and compression all happen in the sole final encode.
+    """
+    ffrife = ffrife or load_ffrife()
+    ffrife_config = ffrife_config or ffrife_config_for(config)
+    source_fps = float(source_fps) if source_fps is not None else float(ffrife.probe_source_fps(source))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        prepared_inputs = []
+        for i, (seg_start, seg_end, speed, use_rife) in enumerate(sections):
+            section_root = Path(tmp_dir) / f"section_{i}"
+            if use_rife:
+                rendered = ffrife.render_rife_frames(
+                    source, section_root, ffrife_config, start=seg_start, end=seg_end,
+                    fps=target_fps, speed=speed, source_fps=source_fps,
+                )
+                if not rendered:
+                    raise RuntimeError("RIFE stopped before producing frames")
+                frames, _, _ = rendered
+                prepared_inputs.append(("frames", frames, None, None))
+            else:
+                # Leave untouched sections as source inputs. The final ffmpeg
+                # process decodes them once; a PNG relay here would add disk
+                # I/O and a redundant decode with no quality benefit.
+                prepared_inputs.append(("source", source, seg_start, seg_end))
+
+        inputs, filters, labels = [], "", []
+        for i, (kind, value, seg_start, seg_end) in enumerate(prepared_inputs):
+            if kind == "frames":
+                inputs += ["-framerate", f"{target_fps:g}", "-i", str(value / "%08d.png")]
+                normalize = "settb=AVTB,setpts=PTS-STARTPTS"
+            else:
+                inputs += ["-ss", str(seg_start), "-to", str(seg_end), "-i", str(value)]
+                normalize = f"fps={target_fps:g},settb=AVTB,setpts=PTS-STARTPTS"
+            filters += f"[{i}:v]{normalize}[p{i}];"
+            labels.append(f"[p{i}]")
+        filters += "".join(labels) + f"concat=n={len(sections)}:v=1:a=0[out]"
+        map_label = "[out]"
+        if overlay:
+            filters += f";[out]{overlay}[final]"
+            map_label = "[final]"
+        cmd = inputs + ["-filter_complex", filters, "-map", map_label] + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
+        output_duration = sum((end - start) / (speed or 1.0) for start, end, speed, _ in sections)
+        run_ffmpeg(cmd, duration=output_duration)
+
 def extract_verse_sections(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, mode, boundaries, speed, source_labels=None, metadata_args=None):
     """--slow/--fast: split the verse window at `boundaries` (seconds,
     relative to the verse's own start) into alternating normal/retimed
@@ -1863,45 +1922,14 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
         source_fps = float(ffrife.probe_source_fps(source))
         target_fps = (float(config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"]))
                       if whole_clip_interpolation else source_fps)
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            frame_dirs = []
-            for i in range(n):
-                seg_start, seg_end = starts[i], ends[i]
-                section_root = Path(tmp_dir) / f"section_{i}"
-                retimed = (i + 1) % 2 == 0
-                if retimed or whole_clip_interpolation:
-                    rendered = ffrife.render_rife_frames(
-                        source, section_root, ffrife_config, start=seg_start, end=seg_end,
-                        fps=target_fps, speed=speed if retimed else None, source_fps=source_fps,
-                    )
-                    if not rendered:
-                        raise RuntimeError("RIFE stopped before producing frames")
-                    frames, _, _ = rendered
-                else:
-                    # Decode the untouched section to lossless frames. It and
-                    # the RIFE output feed the same single final encode below.
-                    frames = section_root / "out"
-                    frames.mkdir(parents=True)
-                    run_ffmpeg(["-ss", str(seg_start), "-to", str(seg_end), "-i", str(source), f"{frames}/%08d.png"], duration=seg_end - seg_start)
-                frame_dirs.append(frames)
-
-            # Each input is a lossless frame sequence. The only video encode
-            # in this entire path is the final concat+overlay output.
-            concat_inputs = []
-            concat_filter = ""
-            normalized_labels = []
-            for i, frames in enumerate(frame_dirs):
-                concat_inputs += ["-framerate", f"{target_fps:g}", "-i", str(frames / "%08d.png")]
-                concat_filter += f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[p{i}];"
-                normalized_labels.append(f"[p{i}]")
-            concat_filter += "".join(normalized_labels) + f"concat=n={n}:v=1:a=0[out]"
-            map_label = "[out]"
-            if overlay:
-                concat_filter += f";[out]{overlay}[final]"
-                map_label = "[final]"
-            cmd = concat_inputs + ["-filter_complex", concat_filter, "-map", map_label] + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
-            run_ffmpeg(cmd, duration=duration)
+        sections = []
+        for i, (seg_start, seg_end) in enumerate(zip(starts, ends)):
+            retimed = (i + 1) % 2 == 0
+            sections.append((seg_start, seg_end, speed if retimed else None, retimed or whole_clip_interpolation))
+        encode_rife_frame_sections(
+            source, output_file, sections, target_fps, config, overlay=overlay,
+            metadata_args=metadata_args, ffrife=ffrife, ffrife_config=ffrife_config, source_fps=source_fps,
+        )
         return
 
     base_label = "[0:v]"
@@ -2752,10 +2780,6 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         for i, (seg_start, seg_end) in enumerate(zip(points, points[1:])):
             retimed = (i % 2 == 1) if mode == "slow" else (i % 2 == 0)
             chapter_timeline.append((seg_start, seg_end, 1 / speed if retimed else 1.0))
-    elif config.get("interpolation_engine") == "rife":
-        # RIFE currently retains mid transitions even when trimming was asked
-        # for, matching its extraction implementation.
-        chapter_timeline = [(0.0, duration, 1.0)]
     else:
         chapter_timeline = [(seg_start, seg_end, 1.0) for seg_start, seg_end in kept_segments]
 
