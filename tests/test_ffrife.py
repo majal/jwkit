@@ -497,6 +497,30 @@ class FfrifeLongRunTest(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertIn("rgb24", command)
 
+    def test_transition_detector_cut_floor_and_revert_fraction_are_tunable(self) -> None:
+        # Same isolated-spike sequence as the hard-cut test above, but a
+        # deliberately tiny jump (50 -> 60) that a default cut_floor=0.05
+        # rejects outright. Raising cut_floor keeps it rejected everywhere;
+        # lowering it below the spike's own magnitude reveals the cut - and
+        # a revert_fraction of 0 (nothing ever "reverts enough") suppresses
+        # it again regardless of floor, proving both knobs are load-bearing.
+        frames = [bytes([50] * (32 * 18 * 3)) for _ in range(6)]
+        frames += [bytes([60] * (32 * 18 * 3)) for _ in range(4)]
+        raw = b"".join(frames)
+
+        def run(**kwargs):
+            process = MagicMock(stdout=io.BytesIO(raw), returncode=0)
+            process.wait.return_value = 0
+            with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
+                return self.ffrife.detect_transitions("frames", source_fps=24, **kwargs)
+
+        cuts_default, _ = run()
+        self.assertEqual(cuts_default, [])
+        cuts_low_floor, _ = run(cut_floor=0.01)
+        self.assertEqual(cuts_low_floor, [6])
+        cuts_no_revert, _ = run(cut_floor=0.01, revert_fraction=0)
+        self.assertEqual(cuts_no_revert, [])
+
     def test_transition_detector_does_not_flag_a_sustained_burst_as_a_cut(self) -> None:
         # Regression: a sustained run of large, poorly-aligned steps (e.g. a
         # whip pan or any other extreme-but-real motion) must not be
