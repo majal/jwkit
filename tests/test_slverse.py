@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -580,6 +583,202 @@ class SlverseCacheBudgetTest(unittest.TestCase):
 
             self.assertFalse(fake_state_file.exists(), "enforce_cache_budget must not call save_state() itself")
 
+    def test_second_call_trusts_the_running_total_instead_of_rescanning(self) -> None:
+        # The whole point of tracking state["_cache_bytes"]: once a total is
+        # known and we're under budget, a repeat call (e.g. after every
+        # single segment download in a session) must be O(1), not another
+        # full directory walk.
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "cache" / "ASL"
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "a.mp4").write_bytes(b"0" * (1024 * 1024))
+            state: dict = {}
+            config = {"cache_dir": str(cache_dir.parent), "cache_policy": "lru", "cache_max_size": "10Mi"}
+
+            self.slverse.enforce_cache_budget(config, state)  # first call: unknown total, must scan
+            root = str(cache_dir.parent)
+            self.assertEqual(state["_cache_bytes"][root], 1024 * 1024)
+
+            def scan_should_not_run(*a, **k):
+                raise AssertionError("enforce_cache_budget rescanned despite already knowing the total")
+            self.slverse._scan_cache_dir = scan_should_not_run
+
+            self.slverse.enforce_cache_budget(config, state, added_bytes=2 * 1024 * 1024)
+
+            self.assertEqual(state["_cache_bytes"][root], 3 * 1024 * 1024)
+
+    def test_eviction_falls_back_to_a_real_scan_once_the_running_total_goes_over_budget(self) -> None:
+        # A known running total avoids a scan only while it says we're
+        # under budget (see the previous test) - the moment added_bytes
+        # pushes it over, eviction needs real file sizes/ages to pick
+        # candidates, which the total alone can't provide, so this must
+        # fall back to an actual directory walk rather than e.g. evicting
+        # nothing or picking an arbitrary file.
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "cache" / "ASL"
+            cache_dir.mkdir(parents=True)
+            state: dict = {}
+            for name in ("oldest.mp4", "newest.mp4"):
+                p = cache_dir / name
+                p.write_bytes(b"0" * (1024 * 1024))
+                self.slverse.note_cache_use(state, p)
+                time.sleep(0.01)
+            config = {"cache_dir": str(cache_dir.parent), "cache_policy": "lru", "cache_max_size": "1Mi"}
+            state["_cache_bytes"] = {str(cache_dir.parent): 0}  # known, currently under budget
+
+            self.slverse.enforce_cache_budget(config, state, added_bytes=2 * 1024 * 1024)
+
+            remaining = sorted(p.name for p in cache_dir.iterdir())
+            self.assertEqual(remaining, ["newest.mp4"])
+
+    def test_invalidate_cache_totals_clears_tracked_value(self) -> None:
+        state = {"_cache_bytes": {"/a": 100, "/b": 200}}
+        self.slverse.invalidate_cache_totals(state, "/a")
+        self.assertEqual(state["_cache_bytes"], {"/b": 200})
+
+    def test_invalidate_cache_totals_with_no_arg_clears_everything(self) -> None:
+        state = {"_cache_bytes": {"/a": 100, "/b": 200}}
+        self.slverse.invalidate_cache_totals(state)
+        self.assertEqual(state["_cache_bytes"], {})
+
+    def test_invalidate_cache_totals_is_a_noop_without_a_prior_total(self) -> None:
+        state: dict = {}
+        self.slverse.invalidate_cache_totals(state, "/a")  # must not raise
+        self.assertEqual(state, {})
+
+    def test_cmd_cache_clean_invalidates_and_persists_the_running_total(self) -> None:
+        # A 'cache clean' changes cache_dir out from under enforce_cache_
+        # budget without going through it - the tracked total has to be
+        # invalidated (and that invalidation actually saved to state.json,
+        # not just held in a throwaway in-memory dict) or the next lru
+        # check would trust a number that no longer means anything.
+        with tempfile.TemporaryDirectory() as td:
+            cache_dir = Path(td) / "cache"
+            (cache_dir / "ASL").mkdir(parents=True)
+            (cache_dir / "ASL" / "a.mp4").write_bytes(b"0" * 1024)
+            state_file = Path(td) / "state.json"
+            state_file.write_text(json.dumps({"_cache_bytes": {str(cache_dir): 999999}}))
+            original_state_file = self.slverse.STATE_FILE
+            self.slverse.STATE_FILE = state_file
+            try:
+                args = argparse.Namespace(action="clean", lang=None)
+                config = {"cache_dir": str(cache_dir)}
+                self.slverse.cmd_cache(args, config)
+            finally:
+                self.slverse.STATE_FILE = original_state_file
+
+            persisted = json.loads(state_file.read_text())
+            self.assertEqual(persisted.get("_cache_bytes", {}), {})
+
+
+class SlverseSegmentCacheTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_segment_cache_path_is_stable_and_scoped_by_lang_book_chapter_window(self) -> None:
+        config = {"cache_dir": "/cache"}
+        a = self.slverse.segment_cache_path(config, "ASL", 54, 1, 221.788, 236.336)
+        b = self.slverse.segment_cache_path(config, "ASL", 54, 1, 221.788, 236.336)
+        different_window = self.slverse.segment_cache_path(config, "ASL", 54, 1, 221.788, 240.0)
+        different_lang = self.slverse.segment_cache_path(config, "FSL", 54, 1, 221.788, 236.336)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, different_window)
+        self.assertNotEqual(a, different_lang)
+        self.assertEqual(a.parent, Path("/cache/ASL/segments"))
+
+    def test_download_segment_uses_copy_and_copyts_and_retries_on_failure(self) -> None:
+        calls = []
+
+        def fake_run_ffmpeg(args, duration=None):
+            calls.append(args)
+            if len(calls) == 1:
+                raise self.slverse.subprocess.CalledProcessError(1, args)
+            Path(args[-1]).write_bytes(b"fake ffmpeg output")  # real ffmpeg writes to its last arg on success
+
+        self.slverse.run_ffmpeg = fake_run_ffmpeg
+        self.slverse.MAX_ATTEMPTS = 3
+        self.slverse.RETRY_BACKOFF = 2
+        # self.slverse.time IS the real, process-wide stdlib time module (see
+        # SlverseLaunchMpvTest's own note on subprocess.Popen) - patch just
+        # .sleep via mock.patch.object so it's guaranteed restored even if
+        # this test fails partway through, instead of leaking a stubbed
+        # sleep to every test that runs after this one.
+        sleep_patcher = mock.patch.object(self.slverse.time, "sleep", lambda seconds: None)
+        sleep_patcher.start()
+        self.addCleanup(sleep_patcher.stop)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "seg.mp4"
+            ok = self.slverse.download_segment("http://example/vid.mp4", out, 10.0, 20.0)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)  # first attempt failed, second succeeded
+        for args in calls:
+            self.assertIn("-copyts", args)
+            self.assertEqual(args[args.index("-c") + 1], "copy")
+            self.assertEqual(args[0:2], ["-ss", "10.0"])
+            self.assertIn("-to", args)
+
+    def test_resolve_segment_source_reuses_cached_file_without_fetching(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = {"cache_dir": td}
+            cached = self.slverse.segment_cache_path(config, "ASL", 54, 1, 10.0, 20.0)
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"already here")
+            self.slverse.download_segment = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fetch"))
+
+            source, cached_path = self.slverse.resolve_segment_source("http://example/vid.mp4", "ASL", 54, 1, 10.0, 20.0, config, {})
+
+            self.assertEqual(source, str(cached))
+            self.assertEqual(cached_path, cached)
+
+    def test_resolve_segment_source_falls_back_to_url_when_fetch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = {"cache_dir": td}
+            self.slverse.download_segment = lambda *a, **k: False
+
+            source, cached_path = self.slverse.resolve_segment_source("http://example/vid.mp4", "ASL", 54, 1, 10.0, 20.0, config, {})
+
+            self.assertEqual(source, "http://example/vid.mp4")
+            self.assertIsNone(cached_path)
+
+    def test_download_segment_against_a_real_local_file_produces_a_playable_trim(self) -> None:
+        # Runs real ffmpeg (no network - a synthetic local source stands in
+        # for the remote URL) instead of mocking run_ffmpeg, specifically to
+        # catch muxer/container-format issues a mocked call can't: ffmpeg
+        # guesses the output container from the FILENAME's extension, and
+        # the .part suffix download_segment writes to (for the same atomic
+        # write-then-rename download_file already uses) isn't a recognized
+        # one on its own - this caught a real "Unable to choose an output
+        # format for ...mp4.part" failure during development, fixed by
+        # passing -f mp4 explicitly rather than relying on the extension.
+        ffmpeg_bin = self.slverse.resolve_ffmpeg_binary(self.slverse.DEFAULT_CONFIG)
+        if not self.slverse.command_exists(ffmpeg_bin):
+            self.skipTest(f"{ffmpeg_bin} not available on this machine")
+        self.slverse.FFMPEG_BIN = ffmpeg_bin
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "source.mp4"
+            subprocess.run(
+                [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                 "-i", "testsrc2=size=320x240:rate=30:duration=6",
+                 "-c:v", "libx264", "-preset", "ultrafast", str(source)],
+                check=True, timeout=60,
+            )
+            out = Path(td) / "seg.mp4"
+            ok = self.slverse.download_segment(str(source), out, 2.0, 4.0)
+
+            self.assertTrue(ok)
+            self.assertTrue(out.exists())
+            self.assertLess(out.stat().st_size, source.stat().st_size)
+            probe = subprocess.run(
+                [self.slverse.resolve_ffprobe_binary(self.slverse.DEFAULT_CONFIG), "-v", "error",
+                 "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(out)],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
+            self.assertGreater(float(probe.stdout.strip()), 0)
+
 
 class SlverseInternetAvailableTest(unittest.TestCase):
     @classmethod
@@ -934,9 +1133,26 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.cache_dir = Path(self._tmp.name)
         self.download_calls: list = []
-        self.slverse.download_file = lambda url, path, expected_checksum=None: (
-            self.download_calls.append((url, path)), True
-        )[1]
+
+        def fake_download_file(url, path, expected_checksum=None):
+            self.download_calls.append((url, path))
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(b"fake video")  # real download_file leaves a real file behind too
+            return True
+
+        self.slverse.download_file = fake_download_file
+        # Same idea for segment-level caching (preview_source/extract_mode=
+        # segment) - stub download_segment so these tests never shell out to
+        # a real ffmpeg against a fake URL.
+        self.segment_download_calls: list = []
+
+        def fake_download_segment(url, path, start_time, end_time):
+            self.segment_download_calls.append((url, path, start_time, end_time))
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(b"fake segment")
+            return True
+
+        self.slverse.download_segment = fake_download_segment
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -951,7 +1167,7 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         extract_calls = []
         self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
         self.slverse.extract_verse = lambda *a, **k: extract_calls.append((a, k))
-        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False, segment=False)
 
         lang, filename, error = self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(), {})
 
@@ -960,13 +1176,44 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         self.assertEqual(len(preview_calls), 1)
         self.assertEqual(len(extract_calls), 0)
 
-    def test_preview_source_cache_default_downloads_once_and_plays_local_path(self) -> None:
+    def test_preview_source_segment_is_default_and_downloads_only_the_window(self) -> None:
         preview_calls = []
         self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
-        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False, segment=False)
 
         self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(), {})
 
+        self.assertEqual(self.download_calls, [])  # never the whole chapter
+        self.assertEqual(len(self.segment_download_calls), 1)
+        url, path, start, end = self.segment_download_calls[0]
+        self.assertEqual(url, "http://example/vid.mp4")
+        self.assertEqual((start, end), (10.0, 20.0))
+        played_source = preview_calls[0][0][0]
+        self.assertEqual(played_source, str(path))
+        self.assertEqual(preview_calls[0][1].get("source_url"), "http://example/vid.mp4")
+
+    def test_preview_source_segment_reuses_already_cached_segment(self) -> None:
+        seg_path = self.slverse.segment_cache_path(self.base_config(), "FSL", 19, 16, 10.0, 20.0)
+        seg_path.parent.mkdir(parents=True)
+        seg_path.write_bytes(b"fake segment")
+        preview_calls = []
+        self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False, segment=False)
+
+        self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(), {})
+
+        self.assertEqual(self.segment_download_calls, [])  # already cached - no fetch needed
+        played_source = preview_calls[0][0][0]
+        self.assertEqual(played_source, str(seg_path))
+
+    def test_preview_source_cache_downloads_whole_chapter_once_and_plays_local_path(self) -> None:
+        preview_calls = []
+        self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False, segment=False)
+
+        self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(preview_source="cache"), {})
+
+        self.assertEqual(self.segment_download_calls, [])
         self.assertEqual(len(self.download_calls), 1)
         self.assertEqual(self.download_calls[0][0], "http://example/vid.mp4")
         played_source = preview_calls[0][0][0]
@@ -976,23 +1223,24 @@ class SlverseExtractPreviewTest(unittest.TestCase):
     def test_preview_source_remote_streams_url_and_never_downloads(self) -> None:
         preview_calls = []
         self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
-        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False, segment=False)
 
         self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(preview_source="remote"), {})
 
         self.assertEqual(self.download_calls, [])
+        self.assertEqual(self.segment_download_calls, [])
         played_source = preview_calls[0][0][0]
         self.assertEqual(played_source, "http://example/vid.mp4")
 
-    def test_preview_source_cache_reuses_already_downloaded_file(self) -> None:
+    def test_preview_source_cache_reuses_already_downloaded_whole_chapter(self) -> None:
         lang_dir = self.cache_dir / "FSL"
         lang_dir.mkdir(parents=True)
         (lang_dir / "vid.mp4").write_bytes(b"fake video")
         preview_calls = []
         self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
-        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False, segment=False)
 
-        self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(), {})
+        self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11], args, self.base_config(preview_source="cache"), {})
 
         self.assertEqual(self.download_calls, [])  # already cached - no download needed
         played_source = preview_calls[0][0][0]
@@ -1001,13 +1249,29 @@ class SlverseExtractPreviewTest(unittest.TestCase):
     def test_write_flag_encodes_and_returns_a_filename(self) -> None:
         extract_calls = []
         self.slverse.extract_verse = lambda *a, **k: extract_calls.append((a, k))
-        args = argparse.Namespace(write=True, play=False, onthefly=True, cache=False)
+        args = argparse.Namespace(write=True, play=False, onthefly=True, cache=False, segment=False)
 
         lang, filename, error = self.slverse.extract_one_lang("ASL", "Psalm", 19, 16, [11], args, self.base_config(), {})
 
         self.assertIsNone(error)
         self.assertIsNotNone(filename)
         self.assertEqual(len(extract_calls), 1)
+
+    def test_write_flag_with_segment_mode_caches_only_the_window(self) -> None:
+        extract_calls = []
+        self.slverse.extract_verse = lambda *a, **k: extract_calls.append((a, k))
+        args = argparse.Namespace(write=True, play=False, onthefly=False, cache=False, segment=True)
+
+        lang, filename, error = self.slverse.extract_one_lang("ASL", "Psalm", 19, 16, [11], args, self.base_config(), {})
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(filename)
+        self.assertEqual(self.download_calls, [])  # never the whole chapter
+        self.assertEqual(len(self.segment_download_calls), 1)
+        url, path, start, end = self.segment_download_calls[0]
+        self.assertEqual((url, start, end), ("http://example/vid.mp4", 10.0, 20.0))
+        self.assertEqual(extract_calls[0][0][0], str(path))  # extract_verse's source is the cached segment
+        self.assertEqual(extract_calls[0][1].get("remote"), False)
 
     def test_partial_range_is_accepted_by_default(self) -> None:
         # Requesting verses 11-12 but the language only actually has 11
@@ -1018,7 +1282,7 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         )
         preview_calls = []
         self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
-        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False, segment=False)
 
         lang, filename, error = self.slverse.extract_one_lang("FSL", "Psalm", 19, 16, [11, 12], args, self.base_config(), {})
 
@@ -1035,7 +1299,7 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         )
         preview_calls = []
         self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
-        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False)
+        args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False, segment=False)
 
         lang, filename, error = self.slverse.extract_one_lang(
             "FSL", "Psalm", 19, 16, [11, 12], args, self.base_config(), {}, require_full_range=True,
@@ -1923,6 +2187,48 @@ class SlverseGenericConfigOverrideTest(unittest.TestCase):
         config = dict(self.slverse.DEFAULT_CONFIG)
         self.slverse.apply_generic_config_overrides(argparse.Namespace(), config)
         self.assertEqual(config, self.slverse.DEFAULT_CONFIG)
+
+
+class SlverseExtractCliParsingTest(unittest.TestCase):
+    """-I/--interpolation-engine takes a value; -i/--interpolate is an
+    unrelated boolean ("force interpolation on"). They used to share the
+    same mnemonic with no short flag for the former, so typing -i where
+    -I was meant (e.g. `-i none` intending to select the 'none' engine)
+    left an unconsumed 'none' positional and a confusing argparse error.
+    -I is the dedicated fix - these lock in that it actually reaches
+    config as 'interpolation_engine', separately from -i/--interpolate."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def parse_extract_args(self, argv):
+        captured = {}
+        self.slverse.cmd_extract = lambda args, config: captured.update(vars(args))
+        self.slverse.maybe_auto_sync = lambda args, config: None  # no real sync/network for a CLI-parsing test
+        original_argv = sys.argv
+        self.addCleanup(setattr, sys, "argv", original_argv)
+        sys.argv = ["slverse", "extract"] + argv
+        self.slverse.main()
+        return captured
+
+    def test_short_I_flag_sets_interpolation_engine(self) -> None:
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-I", "none"])
+        self.assertEqual(args["interpolation_engine"], "none")
+        self.assertFalse(args["interpolate"])  # -i/--interpolate untouched
+
+    def test_long_interpolation_engine_flag_still_works(self) -> None:
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--interpolation-engine", "rife"])
+        self.assertEqual(args["interpolation_engine"], "rife")
+
+    def test_lowercase_i_flag_is_the_unrelated_boolean(self) -> None:
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-i"])
+        self.assertTrue(args["interpolate"])
+        self.assertIsNone(args["interpolation_engine"])
+
+    def test_segment_flag_is_parsed(self) -> None:
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--segment"])
+        self.assertTrue(args["segment"])
 
 
 if __name__ == "__main__":
