@@ -480,6 +480,43 @@ class FfrifeLongRunTest(unittest.TestCase):
         self.assertEqual(command[command.index("-j") + 1], "1:1:1")
         self.assertEqual(command[command.index("-g") + 1], "-1")
 
+    def test_scene_cut_detection_reads_source_pts(self) -> None:
+        result = argparse.Namespace(
+            stderr="[Parsed_showinfo_2] n: 0 pts:      7 pts_time:0.2917\n"
+                   "[Parsed_showinfo_2] n: 1 pts:     19 pts_time:0.7917\n"
+        )
+        with patch.object(self.ffrife.subprocess, "run", return_value=result) as run:
+            cuts = self.ffrife.detect_scene_cuts("frames", 24, 0.35)
+        self.assertEqual(cuts, [7, 19])
+        command = run.call_args.args[0]
+        self.assertIn("scale=160:-2,select='gt(scene,0.35)',showinfo", command)
+
+    def test_scene_cut_replacement_maps_arbitrary_target_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            incoming, outgoing = root / "in", root / "out"
+            incoming.mkdir(); outgoing.mkdir()
+            for index in range(1, 4):
+                (incoming / f"{index:08d}.png").write_text(f"source-{index}")
+            for index in range(1, 6):
+                (outgoing / f"{index:08d}.png").write_text(f"rife-{index}")
+            replaced = self.ffrife.suppress_scene_cut_interpolation(
+                incoming, outgoing, input_count=3, target_count=5, cuts=[1]
+            )
+            self.assertEqual(replaced, 1)
+            self.assertEqual((outgoing / "00000002.png").read_text(), "source-1")
+            self.assertEqual((outgoing / "00000003.png").read_text(), "rife-3")
+
+    def test_scene_detection_cli_defaults_and_overrides(self) -> None:
+        parser = self.ffrife.build_parser()
+        default = parser.parse_args(["run", "in", "-o", "out"])
+        disabled = parser.parse_args(["run", "in", "-o", "out", "--no-scene-detection"])
+        self.assertIsNone(default.scene_detection)
+        self.assertEqual(disabled.scene_detection, "false")
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        self.ffrife.apply_run_overrides(disabled, config)
+        self.assertEqual(config["scene_detection"], "false")
+
     def test_batch_collects_folder_glob_and_list_without_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

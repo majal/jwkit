@@ -1937,6 +1937,18 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         # rife-specific keys still come from ffrife's own config file, not slverse's
         self.assertIn("rife_binary_path", bridged)
         self.assertIn("rife_fallback_engine", bridged)
+        self.assertEqual(bridged["scene_detection"], "false")
+
+    def test_slverse_can_enable_rife_scene_detection_for_one_run(self) -> None:
+        self.assertIn("rife_scene_detection", self.slverse.BOOLEAN_CONFIG_KEYS)
+        parser = argparse.ArgumentParser()
+        self.slverse.add_generic_config_overrides(parser)
+        args = parser.parse_args(["--rife-scene-detection"])
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        self.slverse.apply_generic_config_overrides(args, config)
+        self.assertEqual(config["rife_scene_detection"], "true")
+        bridged = self.slverse.ffrife_config_for({"rife_scene_detection": "true"})
+        self.assertEqual(bridged["scene_detection"], "true")
 
     def test_extract_verse_rife_engine_delegates_to_ffrife(self) -> None:
         calls = []
