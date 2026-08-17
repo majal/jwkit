@@ -138,13 +138,19 @@ Play or encode from the first configured language that has the verse:
 ./slverse extract any "phuc truyen luat le 6:4" --play
 ```
 
-Pull a single verse without ever storing the full chapter on disk (this is the default, `--onthefly` is shown for clarity):
+Pull a single verse without ever storing anything on disk:
 
 ```bash
 ./slverse extract FSL "Rev 13:1" --onthefly
 ```
 
-Download and keep the full chapter instead, so more verses from it are free to extract afterward:
+Cache and keep just this verse window instead - cheaper than a whole chapter for a one-off or a few verses spread across languages:
+
+```bash
+./slverse extract FSL "Rev 13:1" --segment
+```
+
+Download and keep the WHOLE chapter instead, so more *different* verses from it are free to extract afterward:
 
 ```bash
 ./slverse extract FSL "Rev 13:1" --cache
@@ -199,7 +205,7 @@ The winner is the smallest file among everything at SSIM ≥ 0.98 - but ties wit
 
 - Global configuration is saved in `~/.config/jwkit/slverse/config.toml`. Sync state is split into a small `state.json` (sync timestamps, cached book-name lookups) plus one index file per synced language under `~/.config/jwkit/slverse/index/`, so it stays fast to load as you sync more languages.
 - jwkit itself checks for updates automatically at most once a day, only when you run a real command (never `--help`, never in the background) — see [Quick Install](../README.md#quick-install). Controlled by the shared `auto_update` setting in `~/.config/jwkit/config.toml`, not this tool's own config.
-- Extraction downloads a verified chapter once and reuses it by default (`extract_mode = cache`). Cached chapters live in `~/.cache/slverse/`, capped at `cache_max_size` (default `1G`) with least-recently-used chapters removed first once the cap is hit. Accepts a unix-style size: `K`/`M`/`G`/`T`/`P`/`E` for decimal SI (`1G` = 1,000,000,000 bytes) or `Ki`/`Mi`/`Gi`/`Ti`/`Pi`/`Ei` for binary IEC (`1Gi` = 1,073,741,824 bytes) - a bare number is bytes. An existing `cache_max_gb` setting from before this was unit-aware migrates automatically the first time `slverse` runs (its old semantics were binary GiB, so e.g. `cache_max_gb = 5` becomes `cache_max_size = 5Gi`, not `5G`, to keep the actual cap unchanged). Pass `--onthefly` only when you explicitly want to stream without caching.
+- Extraction downloads a verified WHOLE chapter once and reuses it by default (`extract_mode = cache`) - worth it once you're pulling several different verses from that chapter. Pass `--segment` (or `./slverse config set extract_mode segment`) to instead cache just the requested verse window - cheaper for a one-off extract or a few verses spread across languages, since it never pulls the rest of the chapter. Cached files live under `cache_dir` (default `~/.cache/slverse/`, whole chapters at `<lang>/<file>.mp4`, segments at `<lang>/segments/<book>_<chapter>_<start>-<end>.mp4`), capped at `cache_max_size` (default `1G`) with least-recently-used files removed first once the cap is hit - segments and whole chapters share the same cap and eviction. Accepts a unix-style size: `K`/`M`/`G`/`T`/`P`/`E` for decimal SI (`1G` = 1,000,000,000 bytes) or `Ki`/`Mi`/`Gi`/`Ti`/`Pi`/`Ei` for binary IEC (`1Gi` = 1,073,741,824 bytes) - a bare number is bytes. An existing `cache_max_gb` setting from before this was unit-aware migrates automatically the first time `slverse` runs (its old semantics were binary GiB, so e.g. `cache_max_gb = 5` becomes `cache_max_size = 5Gi`, not `5G`, to keep the actual cap unchanged). Pass `--onthefly` only when you explicitly want to stream without caching at all.
 - The tool uses lazy loading: it only downloads or streams a chapter when a specific verse extraction is requested, and only syncs metadata for the languages you've configured (default `ASL,FSL,BVL,INI,SPE`) unless you name others.
 - Verse start/end times come from JW.org's own API metadata (backfilled into the local index on first use), not from probing a downloaded video file. Book-name lookups are cached per `api_language` too, instead of hitting jw.org on every extract.
 - Book references accept JW.org's standard, official, singular, plural, display-title, and numeric variants. The rendered overlay, output metadata, chapter titles, and default filename always use the matched book's `standardName`, regardless of which accepted variant you typed.
@@ -209,7 +215,7 @@ The winner is the smallest file among everything at SSIM ≥ 0.98 - but ties wit
 - Book-name matching uses the configured `api_language` priority list and ignores case and diacritics. The default `E` accepts English abbreviations/full names or a plain book number; `VT,E` adds Vietnamese-first lookup with English fallback.
 - `extract`/`find`/`bulk` trigger a metadata refresh at most once every `auto_sync_interval_hours` (default 24), so verse availability stays current without ever running `slverse sync` by hand. By default (`auto_sync_background = true`) this refresh runs as a detached background process and never blocks the command that triggered it; set `./slverse config set auto_sync_background false` to sync inline and block instead. Disable the refresh entirely per-run with `--no-auto-sync`, or permanently with `./slverse config set auto_sync false`. A failed or offline attempt still resets the timer, so a bad connection doesn't retry (and pause) on every command for the rest of the day.
 - `--slow`/`--fast` need `--write`/`-f` (no live preview for sectioned retiming); boundary times are seconds or `HH:MM:SS`, relative to the verse's own start, and must be strictly increasing and inside the verse's duration. `--speed` defaults to `0.5` for `--slow` and `3` for `--fast` if not given explicitly. Like the standalone `ffslow`/`fffast` tools, sectioned output is video-only (no audio) - the single-window path (without `--slow`/`--fast`) still keeps audio.
-- Preview mode (`extract` without `--write`) defaults to `preview_source = cache`: it downloads the chapter once (if not already cached under `cache_dir`, from a prior `--cache` extract, a `bulk` run, or an earlier preview) and plays that local copy from then on, so previewing more verses from the same chapter costs no further bandwidth. The "Previewing:" line shows the local path being played; a `Source:` line under it has the remote URL too, in case you want to swap it in yourself. Set `./slverse config set preview_source remote` to always stream straight from the URL instead and never touch disk.
+- Preview mode (`extract` without `--write`) and `find --play` both default to `preview_source = segment`: they fetch and cache just the verse window being previewed (if not already cached), so a repeat preview of the same window - or a later `--write` extract with `extract_mode = segment` - costs no further bandwidth, without ever pulling a whole chapter just to look at a few seconds of it. Set `preview_source = cache` to instead download and reuse the WHOLE chapter (worth it if you'll preview several different verses from the same chapter), or `preview_source = remote` to always stream straight from the URL and never touch disk. The "Previewing:" line shows the local path being played; a `Source:` line under it has the remote URL too, in case you want to swap it in yourself.
 - Both preview players (`ffplay` by default, `mpv` with `--play`/`-m`) stay open on the last frame once playback ends instead of closing themselves, so you can seek back and review the clip; close the window yourself when you're done.
 - `find --play`'s multi-language preview windows are sized via `preview_window_size` (default `65%` of screen size, aspect preserved, via mpv's `--autofit`) when previewing more than one language at once; a single match still autoplays fullscreen.
 - A multi-verse extraction can show more than one distinct source caption in sequence (each verse advances its own marker's label, e.g. "Psalm 16:10" then "Psalm 16:11") - the delogo box is sized to whichever is widest/tallest across the whole window, so it stays correctly sized throughout rather than only for the first verse.
@@ -217,7 +223,7 @@ The winner is the smallest file among everything at SSIM ≥ 0.98 - but ties wit
 ## Notes / Caveats
 
 - `minterpolate` through `ffmpeg` is CPU-bound and very slow. Using `rife-ncnn-vulkan` is highly recommended for users with a dedicated GPU; `slverse setup` tells you exactly what to download for your OS.
-- The default `--onthefly` mode seeks directly against the CDN URL, which is a byte-approximate seek over the network rather than a local frame-accurate one — fine for casual viewing, but use `--cache` if you need frame-exact boundaries or plan to pull several verses from the same chapter.
+- `--onthefly` and `--segment` both seek directly against the CDN URL, which is a byte-approximate seek over the network rather than a local frame-accurate one — fine for casual viewing, and `--segment` at least avoids repeating that seek on a later request for the same window. Use `--cache` (whole chapter) if you need frame-exact boundaries, or plan to pull several *different* verses from the same chapter.
 - `slverse` replaces the legacy `SL/ffv`, `SL/ffvdl`, `SL/sldl`, `SL/sldl_nwt`, `SL/sldl_nwt_info`, and `SL/sl_findlang` scripts, kept for reference only in git history and a local archive, not part of this public repo's working tree.
 
 [↑ Back to README TOC](../README.md#table-of-contents)
