@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tests.support import load_script_module
@@ -413,6 +414,43 @@ class JwkitCommonOverwritePolicyTest(unittest.TestCase):
                 result = self.common.resolve_output_conflict(p, {"on_output_exists": "trash"})
         trash_mock.assert_called_once_with(p)
         self.assertEqual(result, p)
+
+    def test_macos_trash_passes_absolute_path_as_argv(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as home:
+            p = self._existing_file(td)
+            relative = p.relative_to(Path(td))
+            completed = mock.Mock(returncode=0, stdout="", stderr="")
+            with mock.patch.object(self.common.Path, "home", return_value=Path(home)), \
+                 mock.patch.object(self.common.subprocess, "run", return_value=completed) as run_mock, \
+                 mock.patch.object(self.common.Path, "resolve", return_value=p):
+                self.common._move_to_trash_macos(relative)
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[-1], str(p))
+        self.assertIn("item 1 of argv", command[2])
+
+    def test_macos_trash_falls_back_when_finder_is_unavailable(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as home:
+            p = self._existing_file(td)
+            failed = mock.Mock(returncode=1, stdout="", stderr="Not authorized")
+            with mock.patch.object(self.common.subprocess, "run", return_value=failed), \
+                 mock.patch.object(self.common.Path, "home", return_value=Path(home)):
+                self.common._move_to_trash_macos(p)
+            self.assertFalse(p.exists())
+            self.assertTrue((Path(home) / ".Trash" / p.name).exists())
+
+    def test_linux_trash_falls_back_when_gio_is_unusable(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as home:
+            p = self._existing_file(td)
+            failed = mock.Mock(returncode=1, stdout="", stderr="No D-Bus session")
+            with mock.patch.object(self.common.shutil, "which", return_value="/usr/bin/gio"), \
+                 mock.patch.object(self.common.subprocess, "run", return_value=failed), \
+                 mock.patch.object(self.common.Path, "home", return_value=Path(home)):
+                self.common._move_to_trash_linux(p)
+            self.assertFalse(p.exists())
+            self.assertTrue((Path(home) / ".local/share/Trash/files" / p.name).exists())
 
     def test_unrecognized_policy_raises(self) -> None:
         import tempfile
