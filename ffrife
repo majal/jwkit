@@ -112,9 +112,9 @@ DEFAULT_CONFIG = {
     "resume": "true",  # keep and reuse durable per-output work state
     "keep_work": "false",  # retain completed work state for inspection
     "scene_detection": "true",  # do not synthesize hybrid frames across hard cuts
-    "scene_threshold": "0.35",  # ffmpeg scene score in [0, 1]; lower is more sensitive
+    "scene_threshold": "3.0",  # spike multiplier over recent motion; lower is more sensitive
     "gradual_transition_detection": "true",
-    "transition_min_duration": "0.25",  # seconds
+    "transition_min_duration": "0.25",  # seconds of baseline lookback, not a minimum run length
     "transition_sensitivity": "1.35",  # change magnitude relative to recent motion
     "transition_alignment": "0.80",  # successive pixel-change vector cosine similarity
     "transition_ranges": "",  # explicit START:END seconds, comma-separated
@@ -527,28 +527,6 @@ def _write_json_atomic(path, payload):
     temp.write_text(json.dumps(payload, indent=2, sort_keys=True))
     temp.replace(path)
 
-def detect_scene_cuts(in_frames, source_fps, threshold=0.35):
-    """Return zero-based indices of frames that begin a new shot."""
-    threshold = float(threshold)
-    if not 0 <= threshold <= 1:
-        raise ValueError("scene_threshold must be between 0 and 1")
-    cmd = [
-        FFMPEG_BIN, "-hide_banner", "-loglevel", "info",
-        "-framerate", f"{float(source_fps):.12g}",
-        "-i", str(Path(in_frames) / "%08d.png"),
-        "-vf", f"scale=160:-2,select='gt(scene,{threshold:.12g})',showinfo",
-        "-an", "-f", "null", "-",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    cuts = []
-    for line in result.stderr.splitlines():
-        if "Parsed_showinfo" not in line:
-            continue
-        match = re.search(r"\bpts:\s*(\d+)\b", line)
-        if match and int(match.group(1)) > 0:
-            cuts.append(int(match.group(1)))
-    return sorted(set(cuts))
-
 def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_count, cuts):
     """Replace output samples strictly between each cut's real endpoints."""
     if input_count < 2 or target_count < 2:
@@ -560,7 +538,9 @@ def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_
             continue
         first = math.floor((cut - 1) * scale) + 1
         last = math.ceil(cut * scale) - 1
-        source = Path(in_frames) / f"{cut:08d}.png"
+        # `cut` is the zero-based index of the shot's first frame; frame
+        # files are one-based, so the post-cut source is at `cut + 1`.
+        source = Path(in_frames) / f"{cut + 1:08d}.png"
         for output_zero_index in range(first, last + 1):
             destination = Path(out_frames) / f"{output_zero_index + 1:08d}.png"
             if destination.exists():
@@ -568,25 +548,63 @@ def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_
                 replaced += 1
     return replaced
 
-def detect_gradual_transitions(in_frames, source_fps, min_duration=0.25,
-                               sensitivity=1.35, alignment=0.80):
-    """Find conservative fade/dissolve frame intervals as ``(start, end)``.
+CUT_MAGNITUDE_FLOOR = 0.05  # absolute pixel-change floor below which nothing can be a hard cut
+CUT_REVERT_FRACTION = 0.5  # neighbor magnitude must drop to this fraction of the spike to count as isolated
 
-    Tiny grayscale frames make this cheap. A transition is a sustained run
-    whose pixel-change vectors point in a consistent direction and are
-    stronger than the clip's immediately preceding motion baseline.
+def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, min_duration=0.25,
+                        sensitivity=1.35, alignment=0.80, detect_gradual=True):
+    """Single-pass detection of hard cuts and gradual transitions.
+
+    Tiny RGB frames (32x18, cheap enough to hold in memory for the whole
+    clip) make this cheap, and colour - not just luma - matters: a cut
+    between two shots that happen to share the same average brightness but
+    differ in hue is invisible to a grayscale-only metric.
+
+    Every frame-to-frame step gets a magnitude (how much changed) and an
+    alignment (cosine similarity with the previous step's change vector).
+    The two transition types share the same signal but differ in shape:
+
+    - A hard cut is an isolated impulse: magnitude spikes sharply above the
+      clip's recent baseline, is unaligned with the motion before it (the
+      incoming shot's content has no relationship to the outgoing shot's
+      direction of change), and both neighbors are far smaller than the
+      spike itself. That last, *relative* part matters - comparing the
+      neighbors only to the pre-spike baseline would also flag whip pans
+      (which sustain elevated, poorly-aligned magnitude across several
+      frames) and would miss a cut into a shot that itself opens with brisk
+      motion (whose first real frame reads as "elevated" against the
+      calmer outgoing shot). Comparing each neighbor to the spike's own
+      size instead - not the baseline - tells "steep both ways" (a cut)
+      apart from "ramps up, ramps down" (real camera motion) or "elevated
+      throughout" (a busy new shot), even when every individual frame of a
+      whip pan clears the baseline-relative bar on its own.
+    - A gradual transition is the same signature sustained: elevated
+      magnitude that stays aligned with itself frame after frame, which is
+      what a monotonic fade/dissolve looks like (linear alpha blending
+      produces a near-constant per-pixel change direction for its whole
+      duration). ``min_duration`` only sizes the baseline lookback window
+      (how far back to search for the clip's normal motion level before
+      judging a run elevated) - it is not a minimum run length. Quick
+      dissolves (a handful of frames) are common and are protected the
+      same as long ones; the magnitude/alignment gates already reject
+      one-off motion spikes.
+
+    Returns ``(cuts, transitions)``: ``cuts`` is a sorted list of
+    zero-based indices of frames that begin a new shot; ``transitions`` is
+    a list of zero-based ``(start, end)`` frame ranges for sustained
+    fades/dissolves.
     """
     width, height = 32, 18
     cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-framerate",
            f"{float(source_fps):.12g}", "-i", str(Path(in_frames) / "%08d.png"),
-           "-vf", f"scale={width}:{height},format=gray", "-f", "rawvideo", "-"]
-    size = width * height
+           "-vf", f"scale={width}:{height}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+    size = width * height * 3
     minimum = max(3, round(float(min_duration) * float(source_fps)))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     previous_frame = previous_delta = None
     frame_count = 0
     magnitudes = []
-    candidates = []
+    cosines = {}
     while True:
         frame = proc.stdout.read(size)
         if len(frame) != size:
@@ -600,40 +618,72 @@ def detect_gradual_transitions(in_frames, source_fps, min_duration=0.25,
                 index = len(magnitudes) - 1
                 left_energy = sum(value * value for value in previous_delta)
                 right_energy = sum(value * value for value in delta)
-                cosine = (sum(a * b for a, b in zip(previous_delta, delta)) /
-                          math.sqrt(left_energy * right_energy) if left_energy and right_energy else 0.0)
-                history_end = max(1, index - minimum)
-                history = magnitudes[max(0, history_end - max(24, minimum * 3)):history_end]
-                baseline = statistics.median(history) if history else magnitudes[index - 1]
-                active = magnitude >= max(0.003, baseline * float(sensitivity))
-                candidates.append((index + 1, active and cosine >= float(alignment),
-                                   magnitude >= 0.003 and cosine >= float(alignment)))
+                cosines[index] = (sum(a * b for a, b in zip(previous_delta, delta)) /
+                                  math.sqrt(left_energy * right_energy) if left_energy and right_energy else 0.0)
             previous_delta = delta
         previous_frame = frame
     proc.stdout.close()
     if proc.wait() != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
     if frame_count < 3:
-        return []
-    runs = []
-    start = previous = None
-    gaps = 0
-    for frame_index, begins, continues in candidates + [(frame_count, False, False), (frame_count + 1, False, False)]:
-        accepted = begins if start is None else continues
-        if accepted:
-            start = frame_index if start is None else start
-            previous = frame_index
-            gaps = 0
-            continue
-        if start is not None:
-            gaps += 1
-            if gaps <= 1:
+        return [], []
+
+    def baseline_at(index):
+        history_end = max(1, index - minimum)
+        history = magnitudes[max(0, history_end - max(24, minimum * 3)):history_end]
+        return statistics.median(history) if history else magnitudes[index - 1]
+
+    transitions = []
+    if detect_gradual:
+        candidates = []
+        for index in range(1, len(magnitudes)):
+            if index not in cosines:
                 continue
-            if previous - start + 1 >= minimum:
-                runs.append((max(0, start - 1), min(frame_count - 1, previous + 1)))
-            start = previous = None
-            gaps = 0
-    return runs
+            cosine = cosines[index]
+            magnitude = magnitudes[index]
+            baseline = baseline_at(index)
+            active = magnitude >= max(0.003, baseline * float(sensitivity))
+            candidates.append((index + 1, active and cosine >= float(alignment),
+                               magnitude >= 0.003 and cosine >= float(alignment)))
+        start = previous = None
+        gaps = 0
+        for frame_index, begins, continues in candidates + [(frame_count, False, False), (frame_count + 1, False, False)]:
+            accepted = begins if start is None else continues
+            if accepted:
+                start = frame_index if start is None else start
+                previous = frame_index
+                gaps = 0
+                continue
+            if start is not None:
+                gaps += 1
+                if gaps <= 1:
+                    continue
+                transitions.append((max(0, start - 1), min(frame_count - 1, previous + 1)))
+                start = previous = None
+                gaps = 0
+
+    protected = set()
+    for start_frame, end_frame in transitions:
+        protected.update(range(start_frame, end_frame + 1))
+
+    cuts = []
+    for index in range(len(magnitudes)):
+        frame_index = index + 1  # zero-based index of the frame that just arrived
+        if frame_index in protected:
+            continue
+        magnitude = magnitudes[index]
+        baseline = baseline_at(index) if index >= 1 else magnitude
+        if magnitude < max(CUT_MAGNITUDE_FLOOR, baseline * float(cut_sensitivity)):
+            continue
+        if cosines.get(index, 0.0) >= float(alignment):
+            continue  # coherent with recent motion direction - not a discontinuity
+        previous_magnitude = magnitudes[index - 1] if index >= 1 else 0.0
+        next_magnitude = magnitudes[index + 1] if index + 1 < len(magnitudes) else 0.0
+        if (previous_magnitude >= magnitude * CUT_REVERT_FRACTION or
+                next_magnitude >= magnitude * CUT_REVERT_FRACTION):
+            continue  # part of a sustained burst (e.g. a whip pan), not a one-off cut
+        cuts.append(frame_index)
+    return sorted(set(cuts)), transitions
 
 def parse_transition_ranges(value, source_fps, input_count):
     ranges = []
@@ -791,9 +841,9 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     scene_threshold = None
     explicit_transitions = []
     if config_bool(config, "scene_detection", True) and input_frame_count > 1:
-        scene_threshold = config_float(config, "scene_threshold", 0.35)
-        if not 0 <= scene_threshold <= 1:
-            raise ValueError("scene_threshold must be between 0 and 1")
+        scene_threshold = config_float(config, "scene_threshold", 3.0)
+        if scene_threshold <= 0:
+            raise ValueError("scene_threshold must be greater than 0")
         explicit_transitions = parse_transition_ranges(
             config.get("transition_ranges", ""), source_fps, input_frame_count
         )
@@ -810,16 +860,17 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, effective,
                             frames_root / "rife-state.json")
     if scene_threshold is not None:
-        print(f"Detecting hard scene cuts (threshold={scene_threshold:g})...")
-        cuts = detect_scene_cuts(in_frames, source_fps, scene_threshold)
-        transitions = list(explicit_transitions)
-        if config_bool(config, "gradual_transition_detection", True):
-            transitions += detect_gradual_transitions(
-                in_frames, source_fps,
-                config_float(config, "transition_min_duration", 0.25),
-                config_float(config, "transition_sensitivity", 1.35),
-                config_float(config, "transition_alignment", 0.80),
-            )
+        detect_gradual = config_bool(config, "gradual_transition_detection", True)
+        print(f"Detecting scene cuts and transitions (sensitivity={scene_threshold:g})...")
+        cuts, transitions = detect_transitions(
+            in_frames, source_fps,
+            cut_sensitivity=scene_threshold,
+            min_duration=config_float(config, "transition_min_duration", 0.25),
+            sensitivity=config_float(config, "transition_sensitivity", 1.35),
+            alignment=config_float(config, "transition_alignment", 0.80),
+            detect_gradual=detect_gradual,
+        )
+        transitions = list(explicit_transitions) + transitions
         for start_frame, end_frame in transitions:
             cuts.extend(range(start_frame + 1, end_frame + 1))
         cuts = sorted(set(cuts))
