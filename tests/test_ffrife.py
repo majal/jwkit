@@ -237,6 +237,28 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-c:a") + 1], "copy")
         self.assertNotIn("-vf", cmd)
 
+    def test_output_filter_is_applied_only_in_the_final_encode(self) -> None:
+        config = {"rife_binary_path": "/fake/rife"}
+        calls = []
+
+        def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+            calls.append(cmd)
+            if cmd and str(cmd[-1]).endswith("%08d.png"):
+                (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
+
+        def fake_run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
+            (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
+
+        with patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+             patch.object(self.ffrife, "run_rife", fake_run_rife), \
+             patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
+             patch.object(self.ffrife.subprocess, "run"):
+            self.ffrife.interpolate("in.mp4", "out.mp4", config, output_vf="drawtext=text='label'", fps=60)
+
+        self.assertNotIn("-vf", calls[0])
+        self.assertEqual(calls[-1][calls[-1].index("-vf") + 1], "drawtext=text='label'")
+
     def test_rife_path_generates_retimed_frames_before_the_merge(self) -> None:
         # RIFE installed/configured -> the PNG-extract-then-RIFE-then-merge
         # path. RIFE should generate the retimed count directly, without a
