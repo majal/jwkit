@@ -1850,16 +1850,40 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
             "slow", [5.0], 0.5,
         )
 
-        # 2 sections: section 1 (normal, plain ffmpeg trim) then section 2
-        # (slow, delegated to ffrife.interpolate) - plus the final concat
-        # pass, all via run_ffmpeg.
-        self.assertEqual(len(ffrife_calls), 1)
-        args, kwargs = ffrife_calls[0]
+        # With whole-clip RIFE enabled, both pieces are interpolated so the
+        # final concat has one real 60fps cadence; only piece 2 is retimed.
+        self.assertEqual(len(ffrife_calls), 2)
+        args, kwargs = ffrife_calls[1]
         self.assertEqual(kwargs["start"], 15.0)  # 10.0 + boundary 5.0
         self.assertEqual(kwargs["end"], 20.0)
         self.assertEqual(kwargs["speed"], 0.5)
         self.assertEqual(kwargs["fps"], 60.0)  # the flat configured interpolation_target_fps, not a source-fps multiple
-        self.assertEqual(len(piece_ffmpeg_calls), 2)  # normal-section piece + final concat
+        self.assertEqual(len(piece_ffmpeg_calls), 1)  # final concat only
+        fc = piece_ffmpeg_calls[0][piece_ffmpeg_calls[0].index("-filter_complex") + 1]
+        self.assertIn("fps=60,settb=AVTB,setpts=PTS-STARTPTS", fc)
+
+    def test_slow_smoothing_uses_rife_without_whole_clip_interpolation(self) -> None:
+        ffrife_calls = []
+        ffmpeg_calls = []
+        fake_ffrife = argparse.Namespace(
+            interpolate=lambda *a, **k: ffrife_calls.append((a, k)),
+            load_config=lambda: {},
+            probe_source_fps=lambda source: 30000 / 1001,
+        )
+        self.slverse.load_ffrife = lambda: fake_ffrife
+        self.slverse.run_ffmpeg = lambda cmd, duration=None: ffmpeg_calls.append(cmd)
+        config = {"interpolation_engine": "none", "_interpolation_engine_preference": "rife", "smooth_slow_motion": "true"}
+
+        self.slverse.extract_verse_sections(
+            "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
+            "slow", [5.0], 0.5,
+        )
+
+        self.assertEqual(len(ffrife_calls), 1)
+        self.assertAlmostEqual(ffrife_calls[0][1]["fps"], 30000 / 1001)
+        self.assertEqual(ffrife_calls[0][1]["speed"], 0.5)
+        final_fc = ffmpeg_calls[-1][ffmpeg_calls[-1].index("-filter_complex") + 1]
+        self.assertIn("settb=AVTB", final_fc)
 
 
 class SlverseFfrifeIntegrationTest(unittest.TestCase):
@@ -2291,6 +2315,19 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
     def test_no_interpolate_forces_boolean_off(self) -> None:
         args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--no-interpolate"])
         self.assertFalse(args["interpolate"])
+
+    def test_short_trim_flags_take_unsigned_amounts(self) -> None:
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-s", "2.5", "-e", "8.909"])
+        self.assertEqual(args["trim_start"], 2.5)
+        self.assertEqual(args["trim_end"], 8.909)
+
+    def test_old_negative_short_end_trim_still_parses(self) -> None:
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-e", "-8.909"])
+        self.assertEqual(args["trim_end"], -8.909)
+
+    def test_smooth_slow_motion_has_per_run_boolean_override(self) -> None:
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--no-smooth-slow-motion"])
+        self.assertFalse(args["smooth_slow_motion"])
 
     def test_output_implies_write(self) -> None:
         args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-o", "clip.mp4"])
