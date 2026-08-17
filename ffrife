@@ -26,6 +26,8 @@ Options:
                           isn't installed/configured (default: none)
 """
 import argparse
+import glob
+import hashlib
 import json
 import os
 import platform
@@ -99,7 +101,30 @@ DEFAULT_CONFIG = {
     "video_preset": "slow",
     "ffmpeg_binary": "",
     "ffprobe_binary": "",
+    "rife_gpu": "auto",  # auto, cpu, or a numeric GPU id
+    "rife_threads": "1:1:1",  # load:process:save; cooler than upstream 1:2:2
+    "chunk_frames": "1200",  # 0 disables chunking
+    "cooldown_seconds": "15",  # between completed RIFE chunks
+    "resume": "true",  # keep and reuse durable per-output work state
+    "keep_work": "false",  # retain completed work state for inspection
 }
+
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".mts", ".m2ts"}
+
+def config_bool(config, key, default=False):
+    return str(config.get(key, str(default))).strip().lower() in {"1", "true", "yes", "on"}
+
+def config_int(config, key, default=0, minimum=0):
+    try:
+        return max(minimum, int(float(config.get(key, default))))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+def config_float(config, key, default=0.0, minimum=0.0):
+    try:
+        return max(minimum, float(config.get(key, default)))
+    except (TypeError, ValueError):
+        return max(minimum, default)
 
 # --- Config ---
 def load_config():
@@ -338,7 +363,8 @@ def install_rife(config):
     print(f"RIFE installed: {match}")
     return match
 
-def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
+def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0,
+             threads=None, gpu=None):
     """rife-ncnn-vulkan has no built-in progress output, so this polls the
     output directory's file count against `target_count`. By far the
     slowest step in the whole pipeline - measured ~125-130s for a
@@ -352,6 +378,17 @@ def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, sl
     cmd = [rife_path, "-i", str(in_frames), "-o", str(out_frames), "-n", str(target_count)]
     if model_path:
         cmd += ["-m", str(model_path)]
+    if threads:
+        if not re.fullmatch(r"\d+:\d+:\d+", str(threads)):
+            raise ValueError("rife_threads must be load:process:save, for example 1:1:1")
+        if any(int(value) < 1 for value in str(threads).split(":")):
+            raise ValueError("every rife_threads value must be at least 1")
+        cmd += ["-j", str(threads)]
+    if gpu is not None and str(gpu).lower() != "auto":
+        gpu_id = "-1" if str(gpu).lower() == "cpu" else str(gpu)
+        if not re.fullmatch(r"(?:-1|\d+)", gpu_id):
+            raise ValueError("rife_gpu must be auto, cpu, or a numeric GPU id")
+        cmd += ["-g", gpu_id]
     proc = subprocess.Popen(cmd)
     start = time.time()
     shown = False
@@ -448,6 +485,104 @@ def resolve_target_fps(fps_spec, source_fps):
     return float(s)
 
 # --- Core: single-pass interpolation ---
+def _link_or_copy(source, destination):
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+def _write_json_atomic(path, payload):
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    temp.replace(path)
+
+def _job_signature(source, output_file, options):
+    source_path = Path(str(source)).expanduser()
+    source_identity = str(source_path.resolve()) if source_path.exists() else str(source)
+    if source_path.exists():
+        stat_result = source_path.stat()
+        source_identity += f":{stat_result.st_size}:{stat_result.st_mtime_ns}"
+    raw = json.dumps([source_identity, str(Path(output_file).resolve()), options], sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+def _work_dir_for(output_file, signature):
+    output = Path(output_file)
+    return output.parent / f".{output.name}.ffrife-{signature}"
+
+def _chunk_ranges(frame_count, chunk_frames):
+    if chunk_frames == 1:
+        raise ValueError("chunk_frames must be 0 (disabled) or at least 2")
+    if frame_count < 2 or chunk_frames <= 0 or frame_count <= chunk_frames:
+        return [(0, frame_count)]
+    ranges = []
+    start = 0
+    while start < frame_count - 1:
+        end = min(frame_count, start + chunk_frames)
+        ranges.append((start, end))
+        if end == frame_count:
+            break
+        start = end - 1  # overlap one endpoint so RIFE sees the seam
+    return ranges
+
+def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, config, state_path):
+    inputs = sorted(Path(in_frames).glob("*.png"))
+    ranges = _chunk_ranges(len(inputs), config_int(config, "chunk_frames", 1200))
+    completed = set()
+    if state_path.exists():
+        try:
+            completed = set(json.loads(state_path.read_text()).get("completed_chunks", []))
+        except (OSError, ValueError):
+            completed = set()
+    chunks_root = state_path.parent / "chunks"
+    chunks_root.mkdir(parents=True, exist_ok=True)
+    total_intervals = max(1, len(inputs) - 1)
+    target_intervals = max(0, target_count - 1)
+    for index, (start, end) in enumerate(ranges):
+        chunk_key = str(index)
+        chunk_out = chunks_root / f"{index:06d}" / "out"
+        marker = chunk_out.parent / "complete.json"
+        if chunk_key in completed and marker.exists():
+            try:
+                expected = int(json.loads(marker.read_text())["target_count"])
+            except (OSError, ValueError, KeyError, TypeError):
+                expected = -1
+            if len(list(chunk_out.glob("*.png"))) == expected:
+                print(f"Resuming: chunk {index + 1}/{len(ranges)} already complete.")
+                continue
+            print(f"Resume data for chunk {index + 1} is incomplete; rebuilding it.")
+        chunk_in = chunks_root / f"{index:06d}" / "in"
+        shutil.rmtree(chunk_in, ignore_errors=True)
+        shutil.rmtree(chunk_out, ignore_errors=True)
+        chunk_in.mkdir(parents=True); chunk_out.mkdir(parents=True)
+        for local_index, source_frame in enumerate(inputs[start:end], 1):
+            _link_or_copy(source_frame, chunk_in / f"{local_index:08d}.png")
+        first_interval = round(start * target_intervals / total_intervals)
+        last_interval = round((end - 1) * target_intervals / total_intervals)
+        chunk_target = max(2, last_interval - first_interval + 1)
+        print(f"RIFE chunk {index + 1}/{len(ranges)} ({end - start} source frames)...")
+        run_rife(rife_path, chunk_in, chunk_out, chunk_target, model_path=model_path,
+                 threads=config.get("rife_threads"), gpu=config.get("rife_gpu"))
+        _write_json_atomic(marker, {"target_count": chunk_target})
+        completed.add(chunk_key)
+        _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int)})
+        shutil.rmtree(chunk_in, ignore_errors=True)
+        cooldown = config_float(config, "cooldown_seconds", 15)
+        if cooldown and index + 1 < len(ranges):
+            print(f"Cooling down for {cooldown}s before the next chunk (Ctrl-C is safe; resume later)...")
+            time.sleep(cooldown)
+    shutil.rmtree(out_frames, ignore_errors=True)
+    Path(out_frames).mkdir(parents=True)
+    output_index = 1
+    for index in range(len(ranges)):
+        frames = sorted((chunks_root / f"{index:06d}" / "out").glob("*.png"))
+        if index:
+            frames = frames[1:]  # overlapped endpoint was emitted by prior chunk
+        for frame in frames:
+            _link_or_copy(frame, Path(out_frames) / f"{output_index:08d}.png")
+            output_index += 1
+    if output_index - 1 != target_count:
+        raise RuntimeError(f"chunk assembly produced {output_index - 1} frames; expected {target_count}")
+
 def render_rife_frames(source, frames_root, config, start=None, end=None, vf=None, fps=60, speed=None, source_fps=None):
     """Decode a source window, synthesize its final retimed RIFE frame
     sequence, and return ``(out_frames, resolved_fps, duration)``.
@@ -482,7 +617,14 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     if vf:
         extract_cmd += ["-vf", vf]
     extract_cmd += [f"{in_frames}/%08d.png"]
-    run_ffmpeg(extract_cmd, duration=duration, label="Extracting")
+    extract_marker = frames_root / "extract-complete.json"
+    if extract_marker.exists() and any(in_frames.glob("*.png")):
+        print("Resuming: extracted source frames already complete.")
+    else:
+        shutil.rmtree(in_frames, ignore_errors=True)
+        in_frames.mkdir(parents=True)
+        run_ffmpeg(extract_cmd, duration=duration, label="Extracting")
+        _write_json_atomic(extract_marker, {"frame_count": len(list(in_frames.glob("*.png")))})
 
     input_frame_count = len(list(in_frames.glob("*.png")))
     if input_frame_count == 0:
@@ -494,7 +636,13 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     speed_factor = speed if speed and speed != 1 else 1.0
     target_count = round(input_frame_count * fps / source_fps / speed_factor)
     model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
-    run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
+    # Library callers historically pass only the settings they own. Keep that
+    # API compatible; the full ffrife config enables resumable chunking.
+    if "chunk_frames" not in config:
+        run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
+    else:
+        _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, config,
+                            frames_root / "rife-state.json")
     return out_frames, fps, retimed_duration(duration, speed)
 
 
@@ -558,10 +706,19 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         run_ffmpeg(cmd, duration=retimed_duration(duration, speed))
         return True
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_dir_path = Path(temp_dir)
+    options = {"start": start, "end": end, "vf": vf, "fps": fps, "speed": speed,
+               "model": config.get("rife_model"), "threads": config.get("rife_threads"),
+               "gpu": config.get("rife_gpu"), "chunk_frames": config.get("chunk_frames")}
+    signature = _job_signature(source, output_file, options)
+    durable = config_bool(config, "resume", False)
+    work_path = _work_dir_for(output_file, signature) if durable else Path(tempfile.mkdtemp(prefix="ffrife-"))
+    work_path.mkdir(parents=True, exist_ok=True)
+    try:
+        temp_dir_path = work_path
         rendered = render_rife_frames(source, temp_dir_path, config, start=start, end=end, vf=vf, fps=fps, speed=speed)
         if not rendered:
+            if not durable:
+                shutil.rmtree(work_path, ignore_errors=True)
             return False
         out_frames, fps, _ = rendered
 
@@ -580,6 +737,14 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
             merge_cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"])
         merge_cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]
         run_ffmpeg(merge_cmd, duration=retimed_duration(duration, speed))
+    except BaseException:
+        if durable:
+            print(f"Work saved for resume: {work_path}")
+        else:
+            shutil.rmtree(work_path, ignore_errors=True)
+        raise
+    if not config_bool(config, "keep_work", False):
+        shutil.rmtree(work_path, ignore_errors=True)
     return True
 
 # --- CLI ---
@@ -734,7 +899,8 @@ def cmd_config(args, config):
 # DEFAULT_CONFIG keys with their own dedicated per-run flag already -
 # excluded from the generic --<key> override loop (see slverse's own
 # GENERIC_OVERRIDE_EXCLUDED_KEYS for the same pattern).
-GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset"}
+GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset",
+                                  "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds", "resume", "keep_work"}
 
 def add_generic_config_overrides(parser):
     for key in DEFAULT_CONFIG:
@@ -749,6 +915,80 @@ def apply_generic_config_overrides(args, config):
         value = getattr(args, key, None)
         if value is not None:
             config[key] = value
+
+def collect_batch_inputs(inputs, patterns=None, list_files=None, recursive=False):
+    candidates = []
+    for value in inputs or []:
+        path = Path(value).expanduser()
+        if path.is_dir():
+            iterator = path.rglob("*") if recursive else path.glob("*")
+            candidates.extend(p for p in iterator if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS)
+        elif any(char in value for char in "*?["):
+            candidates.extend(Path(p) for p in glob.glob(str(path), recursive=recursive))
+        else:
+            candidates.append(path)
+    for pattern in patterns or []:
+        candidates.extend(Path(p) for p in glob.glob(os.path.expanduser(pattern), recursive=recursive))
+    for list_file in list_files or []:
+        base = Path(list_file).expanduser().resolve().parent
+        for line in Path(list_file).expanduser().read_text().splitlines():
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            path = Path(value).expanduser()
+            candidates.append(path if path.is_absolute() else base / path)
+    result = []
+    seen = set()
+    for path in candidates:
+        if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        resolved = path.resolve()
+        if resolved not in seen:
+            result.append(resolved); seen.add(resolved)
+    return result
+
+def batch_output_path(source, output_dir, suffix):
+    rendered = suffix.format(stem=source.stem, suffix=source.suffix, name=source.name)
+    if not Path(rendered).suffix:
+        rendered += source.suffix
+    return Path(output_dir) / rendered
+
+def apply_run_overrides(args, config):
+    if getattr(args, "fallback", None):
+        config["rife_fallback_engine"] = args.fallback
+    for arg_name, config_key in (("encoder", "hardware_encoder"), ("codec", "video_codec"),
+                                 ("crf", "video_crf"), ("preset", "video_preset")):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            config[config_key] = value
+
+def add_processing_arguments(parser, include_trim=True):
+    if include_trim:
+        parser.add_argument("--start", type=float, help="Trim start (seconds)")
+        parser.add_argument("--end", type=float, help="Trim end (seconds)")
+    parser.add_argument("--fps", default="60", help="Target frame rate: a plain number (60) or source-relative (2x, 2.5x, 150%%) (default: 60)")
+    parser.add_argument("--speed", type=parse_speed, help="Retime output: decimal, fraction, or percentage")
+    parser.add_argument("--vf", help="Extra ffmpeg -vf filter chain during frame extraction")
+    parser.add_argument("--fallback", choices=["none", "framerate", "minterpolate"])
+    parser.add_argument("--encoder", choices=["cpu", "videotoolbox", "nvenc", "qsv"])
+    parser.add_argument("--codec", choices=["h264", "hevc", "av1"])
+    parser.add_argument("--crf", help="Video quality for this run; use 'auto' for codec default")
+    parser.add_argument("--preset", help="FFmpeg encoder preset")
+    parser.add_argument("--rife-gpu", help="RIFE GPU: auto, cpu, or numeric device id")
+    parser.add_argument("-j", "--rife-threads", help="RIFE load:process:save threads (default: 1:1:1)")
+    parser.add_argument("-c", "--chunk-frames", help="Source frames per resumable chunk; 0 disables")
+    parser.add_argument("--cooldown", "--cooldown-seconds", dest="cooldown_seconds", help="Seconds to rest between chunks")
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", dest="resume", action="store_const", const="true", default=None)
+    resume_group.add_argument("--no-resume", dest="resume", action="store_const", const="false")
+    keep_group = parser.add_mutually_exclusive_group()
+    keep_group.add_argument("--keep-work", dest="keep_work", action="store_const", const="true", default=None,
+                            help="Keep completed intermediate frames for inspection")
+    keep_group.add_argument("--no-keep-work", dest="keep_work", action="store_const", const="false")
+    parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"])
+    parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"])
+    parser.add_argument("--overwrite-timeout", type=float)
+    add_generic_config_overrides(parser)
 
 def build_parser():
     parser = argparse.ArgumentParser(description="ffrife - AI frame interpolation (rife-ncnn-vulkan) for any video")
@@ -769,26 +1009,23 @@ def build_parser():
     p_run = subparsers.add_parser("run", help="Interpolate a file (also the default when no subcommand is given)")
     p_run.add_argument("input", help="Local path or remote URL")
     p_run.add_argument("-o", "--output", required=True)
-    p_run.add_argument("--start", type=float, help="Trim start (seconds)")
-    p_run.add_argument("--end", type=float, help="Trim end (seconds)")
-    p_run.add_argument("--fps", default="60", help="Target frame rate: a plain number (60) or source-relative (2x, 2.5x, 150%%) (default: 60)")
-    p_run.add_argument("--speed", type=parse_speed, help="Retime the output - decimal (0.5), fraction (1/3), or percent (150%%) - folded into the merge/fallback encode, no extra pass")
-    p_run.add_argument("--vf", help="Extra ffmpeg -vf filter chain, applied in the same pass as frame extraction")
-    p_run.add_argument("--fallback", choices=["none", "framerate", "minterpolate"], help="Override rife_fallback_engine for this run")
-    p_run.add_argument("--encoder", choices=["cpu", "videotoolbox", "nvenc", "qsv"], help="Video encoder for this run (default: configured hardware_encoder)")
-    p_run.add_argument("--codec", choices=["h264", "hevc", "av1"], help="Video codec for this run (default: configured video_codec)")
-    p_run.add_argument("--crf", help="Video quality for this run; use 'auto' for the codec default")
-    p_run.add_argument("--preset", help="FFmpeg encoder preset for this run (e.g. slow, medium, fast)")
-    p_run.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run (default: shared jwkit config, 'ask')")
-    p_run.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run - what 'ask' falls back to with no TTY, a declined prompt, or a timeout")
-    p_run.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back (default: shared jwkit config, 20)")
-    add_generic_config_overrides(p_run)
+    add_processing_arguments(p_run)
+
+    p_batch = subparsers.add_parser("batch", aliases=["bulk"], help="Interpolate folders, globs, or file lists sequentially")
+    p_batch.add_argument("inputs", nargs="*", help="Files, folders, or quoted wildcard patterns")
+    p_batch.add_argument("--glob", dest="patterns", action="append", default=[], help="Additional glob pattern; repeatable")
+    p_batch.add_argument("--list", dest="list_files", action="append", default=[], help="Text file with one input path per line; repeatable")
+    p_batch.add_argument("-O", "--output-dir", required=True)
+    p_batch.add_argument("--output-name", default="{stem}_rife{suffix}", help="Output template using {stem}, {suffix}, {name}")
+    p_batch.add_argument("-r", "--recursive", action="store_true", help="Recurse through input folders and ** globs")
+    p_batch.add_argument("--fail-fast", action="store_true", help="Stop the batch after the first failed file")
+    add_processing_arguments(p_batch, include_trim=False)
 
     # On every subparser, not the top-level parser: normalize_argv rewrites
     # a bare `ffrife --no-color in.mp4 ...` to `run --no-color in.mp4 ...`,
     # putting the flag AFTER the subcommand token, where only a subparser's
     # own registered args (not the top-level parser's) are recognized.
-    for p in (subparsers.choices["setup"], p_config, p_benchmark, p_run):
+    for p in (subparsers.choices["setup"], p_config, p_benchmark, p_run, p_batch):
         color_group = p.add_mutually_exclusive_group()
         color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colored output for this run (overrides the shared color_output config and auto-detection)")
         color_group.add_argument("--no-color", dest="color", action="store_false", help="Disable colored output for this run")
@@ -798,7 +1035,7 @@ def normalize_argv(argv):
     """`ffrife <input> -o <output> ...` works without typing the 'run'
     subcommand explicitly - only dispatch to it when the first arg isn't
     already a known subcommand name."""
-    if argv and argv[0] not in ("setup", "config", "run", "benchmark", "-h", "--help"):
+    if argv and argv[0] not in ("setup", "config", "run", "batch", "bulk", "benchmark", "-h", "--help"):
         return ["run"] + argv
     return argv
 
@@ -826,13 +1063,7 @@ def main():
     elif args.command == "benchmark":
         cmd_benchmark(args, config)
     elif args.command == "run":
-        if args.fallback:
-            config["rife_fallback_engine"] = args.fallback
-        for arg_name, config_key in (("encoder", "hardware_encoder"), ("codec", "video_codec"), ("crf", "video_crf"), ("preset", "video_preset")):
-            value = getattr(args, arg_name)
-            if value is not None:
-                config[config_key] = value
-
+        apply_run_overrides(args, config)
         jwkit_config = _jwkit_common.load_jwkit_config()
         for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
             value = getattr(args, arg_name, None)
@@ -844,6 +1075,46 @@ def main():
 
         ok = interpolate(args.input, output, config, start=args.start, end=args.end, vf=args.vf, fps=args.fps, speed=args.speed)
         sys.exit(0 if ok else 1)
+    elif args.command in ("batch", "bulk"):
+        apply_run_overrides(args, config)
+        sources = collect_batch_inputs(args.inputs, args.patterns, args.list_files, args.recursive)
+        if not sources:
+            print("No supported video files found.", file=sys.stderr)
+            sys.exit(2)
+        output_dir = Path(args.output_dir).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        jwkit_config = _jwkit_common.load_jwkit_config()
+        for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
+            value = getattr(args, arg_name, None)
+            if value is not None:
+                jwkit_config[config_key] = value
+        failures = []
+        completed = skipped = 0
+        print(f"Batch: {len(sources)} file(s), processed sequentially to limit sustained load.")
+        for index, source in enumerate(sources, 1):
+            print(f"\n[{index}/{len(sources)}] {source}")
+            requested = batch_output_path(source, output_dir, args.output_name)
+            output = _jwkit_common.resolve_output_conflict(requested, jwkit_config)
+            if output is None:
+                skipped += 1
+                continue
+            try:
+                if interpolate(source, output, config, vf=args.vf, fps=args.fps, speed=args.speed):
+                    completed += 1
+                else:
+                    failures.append((source, "interpolation unavailable"))
+            except KeyboardInterrupt:
+                print("\nBatch interrupted; completed chunks are saved for resume.")
+                raise
+            except Exception as exc:
+                failures.append((source, str(exc)))
+                print(f"Failed: {exc}", file=sys.stderr)
+                if args.fail_fast:
+                    break
+        print(f"\nBatch summary: {completed} completed, {skipped} skipped, {len(failures)} failed.")
+        for source, error in failures:
+            print(f"  FAILED {source}: {error}")
+        sys.exit(1 if failures else 0)
     else:
         build_parser().print_help()
 

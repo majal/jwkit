@@ -397,6 +397,72 @@ class FfrifeCliDispatchTest(unittest.TestCase):
         self.assertEqual(args.output, "out.mp4")
         self.assertEqual(args.fps, "60")
 
+    def test_batch_and_bulk_are_known_subcommands(self) -> None:
+        for name in ("batch", "bulk"):
+            argv = [name, "clips", "-O", "done"]
+            self.assertEqual(self.ffrife.normalize_argv(argv), argv)
+            self.assertIn(self.ffrife.build_parser().parse_args(argv).command, ("batch", "bulk"))
+
+
+class FfrifeLongRunTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_chunk_ranges_overlap_one_frame(self) -> None:
+        self.assertEqual(self.ffrife._chunk_ranges(10, 4), [(0, 4), (3, 7), (6, 10)])
+        self.assertEqual(self.ffrife._chunk_ranges(10, 0), [(0, 10)])
+        with self.assertRaises(ValueError):
+            self.ffrife._chunk_ranges(10, 1)
+
+    def test_chunks_assemble_exact_target_and_resume(self) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            incoming, outgoing = root / "in", root / "out"
+            incoming.mkdir()
+            for index in range(10):
+                (incoming / f"{index:08d}.png").write_bytes(b"png")
+
+            def fake_run(_binary, _input, output, target_count, **_kwargs):
+                calls.append(target_count)
+                for index in range(target_count):
+                    (Path(output) / f"{index:08d}.png").write_bytes(b"png")
+
+            config = {"chunk_frames": "4", "cooldown_seconds": "3", "rife_threads": "1:1:1", "rife_gpu": "auto"}
+            with patch.object(self.ffrife, "run_rife", fake_run), patch.object(self.ffrife.time, "sleep") as sleep:
+                self.ffrife._render_rife_chunks("rife", incoming, outgoing, 25, "model", config, root / "state.json")
+                self.assertEqual(len(list(outgoing.glob("*.png"))), 25)
+                self.assertEqual(sleep.call_count, 2)
+                first_calls = list(calls)
+                self.ffrife._render_rife_chunks("rife", incoming, outgoing, 25, "model", config, root / "state.json")
+            self.assertEqual(calls, first_calls)
+
+    def test_run_rife_passes_resource_controls(self) -> None:
+        process = MagicMock()
+        process.poll.side_effect = [0, 0]
+        process.returncode = 0
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=process) as popen:
+            self.ffrife.run_rife("rife", "in", "out", 12, threads="1:1:1", gpu="cpu")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("-j") + 1], "1:1:1")
+        self.assertEqual(command[command.index("-g") + 1], "-1")
+
+    def test_batch_collects_folder_glob_and_list_without_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.mp4").write_bytes(b"")
+            (root / "b.mkv").write_bytes(b"")
+            (root / "ignore.txt").write_text("no")
+            listing = root / "inputs.txt"
+            listing.write_text("a.mp4\n# comment\nb.mkv\n")
+            found = self.ffrife.collect_batch_inputs([str(root)], [str(root / "*.mp4")], [str(listing)])
+            self.assertEqual([p.name for p in found], ["a.mp4", "b.mkv"])
+
+    def test_batch_output_template_preserves_extension(self) -> None:
+        result = self.ffrife.batch_output_path(Path("clip.mov"), "done", "{stem}_smooth{suffix}")
+        self.assertEqual(result, Path("done/clip_smooth.mov"))
+
 
 class FfrifeCmdBenchmarkSampleTrimTest(unittest.TestCase):
     """Regression coverage for a real bug hit while actually using this:
