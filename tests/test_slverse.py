@@ -1048,7 +1048,16 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         )
         self.assertIn("Mazmur 16:11", seen)
         self.assertNotIn("Psalm 16:11", seen)
-        self.assertIn("w=220", result)  # 200 + 10 + delogo_width_pad(10)
+        self.assertIn("w=212", result)  # measured 200 + built-in 10 + configured 2px margin
+
+    def test_exact_source_caption_automatically_skips_reference_replacement(self) -> None:
+        result = self.slverse.build_overlay_filter(
+            "XSL", "Psalm", 16, "11",
+            self.config(default_target_lang="FSL", sign_lang_ref_language="", show_source_lang_label="true"),
+            show_box=False, source_labels=["  PSALM 16:11  "],
+        )
+        self.assertNotIn("delogo=", result)
+        self.assertIn("drawtext=text='XSL'", result)
 
     def test_mid_transition_fade_dips_and_recovers(self) -> None:
         # A mid-range transition (source plays on into the next verse) isn't
@@ -2231,6 +2240,35 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
     def test_source_modes_are_mutually_exclusive(self) -> None:
         with self.assertRaises(SystemExit):
             self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--cache", "--segment"])
+
+    def test_saved_false_disables_rife_without_persisting(self) -> None:
+        config = {"interpolate": "false", "interpolation_engine": "rife"}
+        enabled = self.slverse.apply_interpolation_overrides(
+            argparse.Namespace(interpolate=None, interpolation_engine=None), config,
+        )
+        self.assertFalse(enabled)
+        self.assertEqual(config["interpolation_engine"], "none")
+
+    def test_cli_interpolate_enables_saved_rife(self) -> None:
+        config = {"interpolate": "false", "interpolation_engine": "rife"}
+        enabled = self.slverse.apply_interpolation_overrides(
+            argparse.Namespace(interpolate=True, interpolation_engine=None), config,
+        )
+        self.assertTrue(enabled)
+        self.assertEqual(config["interpolation_engine"], "rife")
+
+    def test_main_passes_none_engine_to_extract_when_saved_toggle_is_false(self) -> None:
+        effective = {}
+        config = dict(self.slverse.DEFAULT_CONFIG, interpolate="false", interpolation_engine="rife")
+        original_argv = sys.argv
+        self.addCleanup(setattr, sys, "argv", original_argv)
+        sys.argv = ["slverse", "extract", "ASL", "1", "Timothy", "1:11", "-f"]
+        with mock.patch.object(self.slverse, "load_config", return_value=config), \
+             mock.patch.object(self.slverse, "maybe_auto_sync"), \
+             mock.patch.object(self.slverse, "cmd_extract", side_effect=lambda args, cfg: effective.update(cfg)):
+            self.slverse.main()
+        self.assertEqual(effective["interpolate"], "false")
+        self.assertEqual(effective["interpolation_engine"], "none")
 
     def test_segment_flag_is_parsed(self) -> None:
         args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--segment"])
