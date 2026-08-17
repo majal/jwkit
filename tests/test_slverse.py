@@ -690,7 +690,7 @@ class SlverseSegmentCacheTest(unittest.TestCase):
     def test_download_segment_uses_zero_based_output_seek_and_retries_on_failure(self) -> None:
         calls = []
 
-        def fake_run_ffmpeg(args, duration=None):
+        def fake_run_ffmpeg(args, duration=None, label="Encoding"):
             calls.append(args)
             if len(calls) == 1:
                 raise self.slverse.subprocess.CalledProcessError(1, args)
@@ -1913,6 +1913,17 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         ffrife = self.slverse.load_ffrife()
         self.assertTrue(hasattr(ffrife, "interpolate"))
         self.assertTrue(hasattr(ffrife, "install_rife"))
+
+    def test_load_ffrife_syncs_color_so_its_headers_are_not_silently_plain(self) -> None:
+        # ffrife.COLOR is only ever set by ffrife's own main(), which this
+        # library usage never calls - without this sync it stays permanently
+        # disabled and every header/progress bar ffrife prints (even the
+        # ones already existing before this test, like the "Done" checkmark)
+        # would come out uncolored regardless of slverse's own setting.
+        sentinel = self.slverse._jwkit_common.Colorizer(True)
+        self.slverse.COLOR = sentinel
+        ffrife = self.slverse.load_ffrife()
+        self.assertIs(ffrife.COLOR, sentinel)
 
     def test_delogo_box_and_drawtext_split(self) -> None:
         overlay = "delogo=x=88:y=49:w=240:h=60:show=0,drawtext=text='Psalm'"

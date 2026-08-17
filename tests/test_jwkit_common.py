@@ -61,6 +61,11 @@ class JwkitCommonColorTest(unittest.TestCase):
         self.assertEqual(c.green("hi"), "hi")
         self.assertEqual(c.bold(42), "42")  # non-string input still returns a plain string
 
+    def test_colorizer_header_is_bold_cyan(self) -> None:
+        c = self.common.Colorizer(True)
+        self.assertEqual(c.header("Encoding..."), "\033[1m\033[36mEncoding...\033[0m\033[0m")
+        self.assertEqual(self.common.Colorizer(False).header("Encoding..."), "Encoding...")
+
     def test_cli_override_wins_over_everything(self) -> None:
         with mock.patch.object(self.common.os, "environ", {"NO_COLOR": "1"}):
             self.assertTrue(self.common.resolve_color_enabled({"color_output": "never"}, cli_override=True))
