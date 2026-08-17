@@ -113,6 +113,8 @@ DEFAULT_CONFIG = {
     "keep_work": "false",  # retain completed work state for inspection
     "scene_detection": "true",  # do not synthesize hybrid frames across hard cuts
     "scene_threshold": "3.0",  # spike multiplier over recent motion; lower is more sensitive
+    "scene_floor": "0.05",  # absolute pixel-change floor below which nothing can be a hard cut
+    "scene_revert_fraction": "0.5",  # neighbor magnitude vs. spike's own size to count as isolated
     "gradual_transition_detection": "true",
     "transition_min_duration": "0.25",  # seconds of baseline lookback, not a minimum run length
     "transition_sensitivity": "1.35",  # change magnitude relative to recent motion
@@ -548,10 +550,8 @@ def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_
                 replaced += 1
     return replaced
 
-CUT_MAGNITUDE_FLOOR = 0.05  # absolute pixel-change floor below which nothing can be a hard cut
-CUT_REVERT_FRACTION = 0.5  # neighbor magnitude must drop to this fraction of the spike to count as isolated
-
-def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, min_duration=0.25,
+def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.05,
+                        revert_fraction=0.5, min_duration=0.25,
                         sensitivity=1.35, alignment=0.80, detect_gradual=True):
     """Single-pass detection of hard cuts and gradual transitions.
 
@@ -564,20 +564,23 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, min_duration=
     alignment (cosine similarity with the previous step's change vector).
     The two transition types share the same signal but differ in shape:
 
-    - A hard cut is an isolated impulse: magnitude spikes sharply above the
+    - A hard cut is an isolated impulse: magnitude clears both ``cut_floor``
+      (an absolute pixel-change amount - keeps near-silent clips from
+      treating tiny noise as a cut) and ``cut_sensitivity`` times the
       clip's recent baseline, is unaligned with the motion before it (the
       incoming shot's content has no relationship to the outgoing shot's
-      direction of change), and both neighbors are far smaller than the
-      spike itself. That last, *relative* part matters - comparing the
-      neighbors only to the pre-spike baseline would also flag whip pans
-      (which sustain elevated, poorly-aligned magnitude across several
-      frames) and would miss a cut into a shot that itself opens with brisk
-      motion (whose first real frame reads as "elevated" against the
-      calmer outgoing shot). Comparing each neighbor to the spike's own
-      size instead - not the baseline - tells "steep both ways" (a cut)
-      apart from "ramps up, ramps down" (real camera motion) or "elevated
-      throughout" (a busy new shot), even when every individual frame of a
-      whip pan clears the baseline-relative bar on its own.
+      direction of change), and both neighbors are below ``revert_fraction``
+      of the spike itself - far smaller, not just smaller. That last,
+      *relative* part matters - comparing the neighbors only to the
+      pre-spike baseline would also flag whip pans (which sustain elevated,
+      poorly-aligned magnitude across several frames) and would miss a cut
+      into a shot that itself opens with brisk motion (whose first real
+      frame reads as "elevated" against the calmer outgoing shot).
+      Comparing each neighbor to the spike's own size instead - not the
+      baseline - tells "steep both ways" (a cut) apart from "ramps up,
+      ramps down" (real camera motion) or "elevated throughout" (a busy new
+      shot), even when every individual frame of a whip pan clears the
+      baseline-relative bar on its own.
     - A gradual transition is the same signature sustained: elevated
       magnitude that stays aligned with itself frame after frame, which is
       what a monotonic fade/dissolve looks like (linear alpha blending
@@ -673,14 +676,14 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, min_duration=
             continue
         magnitude = magnitudes[index]
         baseline = baseline_at(index) if index >= 1 else magnitude
-        if magnitude < max(CUT_MAGNITUDE_FLOOR, baseline * float(cut_sensitivity)):
+        if magnitude < max(float(cut_floor), baseline * float(cut_sensitivity)):
             continue
         if cosines.get(index, 0.0) >= float(alignment):
             continue  # coherent with recent motion direction - not a discontinuity
         previous_magnitude = magnitudes[index - 1] if index >= 1 else 0.0
         next_magnitude = magnitudes[index + 1] if index + 1 < len(magnitudes) else 0.0
-        if (previous_magnitude >= magnitude * CUT_REVERT_FRACTION or
-                next_magnitude >= magnitude * CUT_REVERT_FRACTION):
+        if (previous_magnitude >= magnitude * float(revert_fraction) or
+                next_magnitude >= magnitude * float(revert_fraction)):
             continue  # part of a sustained burst (e.g. a whip pan), not a one-off cut
         cuts.append(frame_index)
     return sorted(set(cuts)), transitions
@@ -865,6 +868,8 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         cuts, transitions = detect_transitions(
             in_frames, source_fps,
             cut_sensitivity=scene_threshold,
+            cut_floor=config_float(config, "scene_floor", 0.05),
+            revert_fraction=config_float(config, "scene_revert_fraction", 0.5),
             min_duration=config_float(config, "transition_min_duration", 0.25),
             sensitivity=config_float(config, "transition_sensitivity", 1.35),
             alignment=config_float(config, "transition_alignment", 0.80),
@@ -949,6 +954,8 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
                "batch": bool(config.get("_batch_mode")),
                "scene_detection": config.get("scene_detection"),
                "scene_threshold": config.get("scene_threshold"),
+               "scene_floor": config.get("scene_floor"),
+               "scene_revert_fraction": config.get("scene_revert_fraction"),
                "gradual_transition_detection": config.get("gradual_transition_detection"),
                "transition_min_duration": config.get("transition_min_duration"),
                "transition_sensitivity": config.get("transition_sensitivity"),
