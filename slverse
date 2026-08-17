@@ -127,6 +127,7 @@ DEFAULT_CONFIG = {
     "interpolate": "false",  # independent on/off preference; --interpolate/--no-interpolate override it for one run
     "interpolation_engine": "rife",  # minterpolate, rife, framerate; legacy "none" remains accepted as an off alias
     "interpolation_target_fps": "60",  # flat target frame rate for all three interpolation engines - with rife, ffrife's interpolate() computes the exact frame count to hit this at the source's original duration (no speed change, any ratio), not just a source-fps multiple
+    "rife_scene_detection": "false",  # verse clips are continuous; standalone ffrife defaults this on for arbitrary videos
     "smooth_slow_motion": "true",  # synthesize extra frames in --slow sections even when whole-clip interpolation is off
     "delogo_engine": "blur",  # blur, auto, inpaint; optional inpainting is delegated to ffinpaint
     "delogo_inpaint_fallback": "blur",  # blur or error when auto/inpaint has no configured backend
@@ -189,7 +190,7 @@ CONFIG_CHOICES = {
 BOOLEAN_CONFIG_KEYS = {
     "interpolate", "smooth_slow_motion", "auto_sync", "auto_sync_background", "trim_end_transition",
     "trim_mid_transitions", "show_source_lang_label", "mpv_show_osc",
-    "caption_detection",
+    "caption_detection", "rife_scene_detection",
 }
 
 def validate_config_value(key, value):
@@ -231,6 +232,7 @@ CONFIG_HELP = {
     "interpolate": "Whether saved output is interpolated by default (true/false)",
     "interpolation_engine": "rife, minterpolate, or framerate; legacy none disables interpolation",
     "interpolation_target_fps": "Flat target frame rate for interpolation (default 60)",
+    "rife_scene_detection": "Detect hard cuts before RIFE (off by default for continuous verse clips)",
     "smooth_slow_motion": "Synthesize extra frames in --slow sections even when whole-clip interpolation is off",
     "delogo_engine": "blur (default), auto (detect occlusion), or inpaint (requires the optional ffinpaint backend)",
     "delogo_inpaint_fallback": "blur (default) or error if the optional inpainting backend is unavailable",
@@ -604,6 +606,9 @@ def ffrife_config_for(config):
     for key in ("hardware_encoder", "video_codec", "video_crf", "video_preset"):
         if key in config:
             ffrife_config[key] = config[key]
+    ffrife_config["scene_detection"] = config.get(
+        "rife_scene_detection", DEFAULT_CONFIG["rife_scene_detection"]
+    )
     return ffrife_config
 
 def setup_dependencies(config):

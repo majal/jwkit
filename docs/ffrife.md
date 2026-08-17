@@ -14,6 +14,7 @@
 - Shows a minimal live progress bar for anything that's actually slow (RIFE itself has no built-in progress output, so this counts output frames against the expected total) - fast operations stay silent.
 - Adapts long-run behavior without second-guessing upstream defaults: all automatic modes leave RIFE's own `1:2:2` worker default untouched; long files and batches add bounded resumable chunks and cooldowns. Reduced workers are explicit via `--cool`.
 - Processes folders, quoted wildcards, and newline-delimited file lists sequentially with `ffrife batch` (`bulk` is an alias), isolating per-file failures and printing a final summary.
+- Detects hard scene cuts by default and replaces would-be RIFE hybrid frames with a hold of the last real frame from the outgoing shot. Disable it for known-continuous footage with `--no-scene-detection`.
 
 ## Supported Platforms
 
@@ -104,6 +105,13 @@ Interrupted runs resume automatically when the same input, output, and interpola
 ./ffrife input.mp4 -o output.mp4 --no-resume
 ```
 
+Skip scene detection for a known-continuous clip, or tune its sensitivity:
+
+```bash
+./ffrife input.mp4 -o output.mp4 --no-scene-detection
+./ffrife input.mp4 -o output.mp4 --scene-threshold 0.30
+```
+
 Time every video encoder this machine's ffmpeg build actually has against a real clip, and apply the recommendation:
 
 ```bash
@@ -120,6 +128,7 @@ Time every video encoder this machine's ffmpeg build actually has against a real
 - Chunks overlap by one source frame, and the duplicate endpoint is removed during assembly. This preserves continuity across the boundary while still producing the exact requested total frame count.
 - Resume state is stored in a hidden directory beside the output, named after the output plus a signature of the source and interpolation settings. Extraction and each completed RIFE chunk are recorded atomically. Successful jobs remove the state automatically unless `--keep-work` is used; interrupted or failed jobs retain it and print its location.
 - `rife_gpu=cpu` maps to RIFE device `-1`. This avoids GPU use but is not necessarily cooler overall; it can shift sustained load to the CPU. `auto` normally gives the best efficiency on Apple Silicon.
+- `scene_detection=true` is the standalone default. After RIFE finishes, `ffrife` scans 160-pixel-wide copies of the already-extracted source frames with FFmpeg's scene score (`scene_threshold=0.35`) and replaces only generated samples that cross a detected hard cut. The scan is CPU-only and normally small beside RIFE's GPU work; disable it with `--no-scene-detection` when the source is known to be one continuous shot. Lower thresholds detect more cuts; higher thresholds reduce false positives.
 - Batch mode accepts files, directories, quoted shell patterns, repeatable `--glob` patterns, and repeatable `--list` files. Blank/comment lines in list files are ignored, relative entries resolve beside the list, duplicates are removed, unsupported extensions are ignored, and processing is deliberately sequential. The default output template is `{stem}_rife{suffix}`; customize it with `--output-name` using `{stem}`, `{suffix}`, and `{name}`.
 - Batch failures do not discard other queued work. Use `--fail-fast` when the first failure should stop the queue. Existing outputs use the same shared `--on-exists` policy as single-file runs. A cool/balanced profile also applies its cooldown between files, so a folder of individually short clips does not become one uninterrupted heat soak; `--cooldown 0` disables both between-chunk and between-file rests.
 - `hardware_encoder` defaults to `cpu` (`libx264`). Measured directly on Apple Silicon: `videotoolbox` at a quality setting matching `crf 20` produced a file ~2.6x larger than `libx264 crf 20 preset slow` for immeasurably different quality (SSIM within 0.0003), with no meaningful speed advantage at short clip lengths.
