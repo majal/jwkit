@@ -613,24 +613,45 @@ def _prompt_yes_no_with_timeout(prompt, timeout):
 
 
 def _move_to_trash_macos(path):
-    path = Path(path)
+    # Finder resolves POSIX files relative to its own process, not the
+    # caller's cwd. Always hand it an absolute path. Pass that path as an
+    # AppleScript argv item rather than interpolating it into source code so
+    # quotes and backslashes in filenames remain literal.
+    path = Path(path).resolve()
     trash_dir = Path.home() / ".Trash"
     if trash_dir.exists() and (trash_dir / path.name).exists():
         path = path.rename(_datetime_tagged(path))
-    subprocess.run(
-        ["osascript", "-e", f'tell application "Finder" to delete (POSIX file "{path}")'],
-        capture_output=True, text=True, check=True,
-    )
+    script = 'on run argv\n tell application "Finder" to delete (POSIX file (item 1 of argv))\nend run'
+    result = subprocess.run(["osascript", "-e", script, str(path)], capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    # Finder automation may be unavailable in SSH/headless sessions or
+    # denied by macOS Automation privacy. ~/.Trash is the same per-user
+    # destination, so fall back to a direct move instead of crashing the
+    # real media command. Preserve Finder's error if even that fails.
+    try:
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        dest = trash_dir / path.name
+        if dest.exists():
+            dest = _datetime_tagged(dest)
+        shutil.move(str(path), str(dest))
+    except Exception as fallback_error:
+        detail = (result.stderr or result.stdout or "unknown osascript error").strip()
+        raise OSError(f"could not move {path} to Trash: Finder: {detail}; fallback: {fallback_error}") from fallback_error
 
 
 def _move_to_trash_linux(path):
-    path = Path(path)
+    path = Path(path).resolve()
     trash_files_dir = Path.home() / ".local" / "share" / "Trash" / "files"
     if trash_files_dir.exists() and (trash_files_dir / path.name).exists():
         path = path.rename(_datetime_tagged(path))
     if shutil.which("gio"):
-        subprocess.run(["gio", "trash", str(path)], capture_output=True, text=True, check=True)
-        return
+        result = subprocess.run(["gio", "trash", str(path)], capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        # gio can be installed but unusable in a headless/SSH session.
+        # Continue into the freedesktop.org implementation below.
     # Minimal freedesktop.org trash-spec fallback for boxes without gio
     # (plausible on a headless server - see AGENTS.md's unattended jobs).
     trash_info_dir = Path.home() / ".local" / "share" / "Trash" / "info"
@@ -656,7 +677,8 @@ def _move_to_trash_windows(path):
     caveat as install.ps1 (see AGENTS.md)."""
     import ctypes
 
-    path = Path(path).rename(_datetime_tagged(Path(path)))
+    path = Path(path).resolve()
+    path = path.rename(_datetime_tagged(path))
     SHFileOperationW = ctypes.windll.shell32.SHFileOperationW
 
     class SHFILEOPSTRUCTW(ctypes.Structure):
@@ -679,8 +701,8 @@ def _move_to_trash_windows(path):
         pTo=None, fFlags=FOF_ALLOWUNDO | FOF_NOCONFIRMATION,
     )
     result = SHFileOperationW(ctypes.byref(op))
-    if result != 0:
-        raise OSError(f"SHFileOperationW failed (code {result}) trashing {path}")
+    if result != 0 or op.fAnyOperationsAborted:
+        raise OSError(f"SHFileOperationW failed (code {result}, aborted={bool(op.fAnyOperationsAborted)}) trashing {path}")
 
 
 def _move_to_trash(path):
