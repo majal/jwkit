@@ -1839,43 +1839,61 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
     slow_engine = config.get("_interpolation_engine_preference", engine) if smooth_slow else engine
     duration = end_time - start_time
 
+    ffrife = None
+    ffrife_config = None
     if mode == "slow" and slow_engine == "rife":
         ffrife = load_ffrife()
         ffrife_config = ffrife_config_for(config)
+        rife_path = ffrife_config.get("rife_binary_path")
+        if not rife_path or not ffrife.command_exists(rife_path):
+            slow_engine = ffrife_config.get("rife_fallback_engine", "none")
+            print()
+            print("RIFE binary not found. (Run 'ffrife setup' to download and configure it.)")
+            if slow_engine == "none":
+                print("rife_fallback_engine=none: using ordinary retiming without synthesized frames.")
+            else:
+                print(f"Using the configured ffmpeg {slow_engine} fallback.")
+
+    if mode == "slow" and slow_engine == "rife":
         n = len(boundaries) + 1
         abs_bounds = [start_time + b for b in boundaries]
         starts = [start_time] + abs_bounds
         ends = abs_bounds + [end_time]
         whole_clip_interpolation = engine == "rife"
+        source_fps = float(ffrife.probe_source_fps(source))
         target_fps = (float(config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"]))
-                      if whole_clip_interpolation else float(ffrife.probe_source_fps(source)))
+                      if whole_clip_interpolation else source_fps)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            pieces = []
+            frame_dirs = []
             for i in range(n):
                 seg_start, seg_end = starts[i], ends[i]
-                piece = Path(tmp_dir) / f"piece_{i}.mp4"
-                pieces.append(piece)
+                section_root = Path(tmp_dir) / f"section_{i}"
                 retimed = (i + 1) % 2 == 0
                 if retimed or whole_clip_interpolation:
-                    # Slow section: RIFE + retime, one merge encode (see
-                    # ffrife.interpolate's `speed` param).
-                    ffrife.interpolate(source, piece, ffrife_config, start=seg_start, end=seg_end, vf=None, fps=target_fps, speed=speed if retimed else None)
+                    rendered = ffrife.render_rife_frames(
+                        source, section_root, ffrife_config, start=seg_start, end=seg_end,
+                        fps=target_fps, speed=speed if retimed else None, source_fps=source_fps,
+                    )
+                    if not rendered:
+                        raise RuntimeError("RIFE stopped before producing frames")
+                    frames, _, _ = rendered
                 else:
-                    # Normal-speed section: plain cut, no interpolation needed.
-                    cmd = ["-ss", str(seg_start), "-to", str(seg_end), "-i", str(source), "-c:a", "copy"] + build_encode_args(config) + [str(piece)]
-                    run_ffmpeg(cmd, duration=seg_end - seg_start)
+                    # Decode the untouched section to lossless frames. It and
+                    # the RIFE output feed the same single final encode below.
+                    frames = section_root / "out"
+                    frames.mkdir(parents=True)
+                    run_ffmpeg(["-ss", str(seg_start), "-to", str(seg_end), "-i", str(source), f"{frames}/%08d.png"], duration=seg_end - seg_start)
+                frame_dirs.append(frames)
 
-            # concat *filter*, not the concat demuxer/-c copy: pieces have
-            # different internal frame rates (normal pieces at source fps,
-            # RIFE'd pieces at target_fps), and stream-copy concat doesn't
-            # reconcile that - see ffslow's own version of this comment.
+            # Each input is a lossless frame sequence. The only video encode
+            # in this entire path is the final concat+overlay output.
             concat_inputs = []
             concat_filter = ""
             normalized_labels = []
-            for i, piece in enumerate(pieces):
-                concat_inputs += ["-i", str(piece)]
-                concat_filter += f"[{i}:v]fps={target_fps:g},settb=AVTB,setpts=PTS-STARTPTS[p{i}];"
+            for i, frames in enumerate(frame_dirs):
+                concat_inputs += ["-framerate", f"{target_fps:g}", "-i", str(frames / "%08d.png")]
+                concat_filter += f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[p{i}];"
                 normalized_labels.append(f"[p{i}]")
             concat_filter += "".join(normalized_labels) + f"concat=n={n}:v=1:a=0[out]"
             map_label = "[out]"
