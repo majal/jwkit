@@ -46,6 +46,16 @@ def save_config(config):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text("".join(f'{key} = "{value}"\n' for key, value in config.items()))
 
+def add_config_flags(parser):
+    for key in DEFAULT_CONFIG:
+        parser.add_argument(f"--{key.replace('_', '-')}", dest=key, help=f"Override {key} for this run")
+
+def apply_config_flags(args, config):
+    for key in DEFAULT_CONFIG:
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+
 def configured(config):
     root = Path(config.get("e2fgvi_root", ""))
     checkpoint = Path(config.get("e2fgvi_checkpoint", ""))
@@ -112,11 +122,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Run an opt-in, locally installed E2FGVI-HQ backend.")
     sub = parser.add_subparsers(dest="command", required=True)
     setup = sub.add_parser("setup"); setup.add_argument("--root"); setup.add_argument("--checkpoint")
+    config_parser = sub.add_parser("config", help="show or edit saved defaults")
+    config_parser.add_argument("action", choices=("list", "get", "set"), nargs="?", default="list")
+    config_parser.add_argument("key", nargs="?"); config_parser.add_argument("value", nargs="?")
     run = sub.add_parser("run"); run.add_argument("input"); run.add_argument("-o", "--output", required=True); run.add_argument("--box", required=True); run.add_argument("--start", type=float); run.add_argument("--end", type=float)
     run.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     run.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
     run.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
-    for p in (setup, run):
+    add_config_flags(run)
+    for p in (setup, config_parser, run):
         color_group = p.add_mutually_exclusive_group()
         color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colored output for this run")
         color_group.add_argument("--no-color", dest="color", action="store_false", help="Disable colored output for this run")
@@ -125,6 +139,17 @@ def main(argv=None):
     COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color))
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     config = load_config()
+    apply_config_flags(args, config)
+    if args.command == "config":
+        if args.action == "list":
+            for key, value in config.items(): print(f"{key} = {value}")
+        elif args.action == "get" and args.key in DEFAULT_CONFIG:
+            print(f"{args.key} = {config[args.key]}")
+        elif args.action == "set" and args.key in DEFAULT_CONFIG and args.value is not None:
+            config[args.key] = args.value; save_config(config); print(f"Set {args.key} = {args.value}")
+        else:
+            raise SystemExit(f"Use: ffinpaint config {args.action} <{'key value' if args.action == 'set' else 'key'}>")
+        return
     global FFMPEG_BIN, FFPROBE_BIN
     FFMPEG_BIN = _jwkit_common.resolve_ffmpeg_binary(config)
     FFPROBE_BIN = _jwkit_common.resolve_ffprobe_binary(config)

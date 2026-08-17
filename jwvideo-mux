@@ -51,6 +51,60 @@ LAUNCHER_EXTENSION = ".jwplay"
 # Resolved once at startup by main() -> _jwkit_common.resolve_color_enabled.
 COLOR = _jwkit_common.Colorizer(False)
 
+CONFIG_DIR = Path.home() / ".config" / "jwkit" / "jwvideo-mux"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+DEFAULT_CONFIG = {
+    "video": "E", "audio": "E,TG,CV,HV,SA", "subs": "", "res": "720p",
+    "container": "mkv", "single_streams": False, "cleanup": False,
+    "output_dir": ".", "no_default_subs": False, "default_video": "",
+    "default_audio": "", "default_sub": "", "variant_min_seconds": 1.5,
+    "scan_small_regions": False, "region_count": 8, "dedupe_identical_video": False,
+    "dedupe_visually_same": False, "adaptive_mpv_library": False,
+    "launchers_in_video_folder": False, "normalize_mismatched_aspect": False,
+}
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            if "=" not in line or line.lstrip().startswith("#"): continue
+            key, raw = line.split("=", 1); key, raw = key.strip(), raw.strip().strip('"\'')
+            if key not in config: continue
+            default = config[key]
+            if isinstance(default, bool): config[key] = raw.lower() == "true"
+            elif isinstance(default, int): config[key] = int(raw)
+            elif isinstance(default, float): config[key] = float(raw)
+            else: config[key] = raw
+    return config
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for key, value in config.items():
+        rendered = str(value).lower() if isinstance(value, bool) else str(value) if isinstance(value, (int, float)) else f'"{value}"'
+        lines.append(f"{key} = {rendered}\n")
+    CONFIG_FILE.write_text("".join(lines))
+
+def run_config(argv):
+    parser = argparse.ArgumentParser(prog="jwvideo-mux config")
+    parser.add_argument("action", choices=("list", "get", "set"), nargs="?", default="list")
+    parser.add_argument("key", nargs="?"); parser.add_argument("value", nargs="?")
+    args = parser.parse_args(argv); config = load_config()
+    if args.action == "list":
+        for key, value in config.items(): print(f"{key} = {value}")
+        return 0
+    if not args.key or args.key not in config: raise SystemExit(f"Unknown config key: {args.key}")
+    if args.action == "get": print(f"{args.key} = {config[args.key]}"); return 0
+    if args.value is None: raise SystemExit("config set requires KEY VALUE")
+    default = DEFAULT_CONFIG[args.key]
+    if isinstance(default, bool):
+        if args.value.lower() not in ("true", "false"): raise SystemExit("Boolean values must be true or false")
+        value = args.value.lower() == "true"
+    elif isinstance(default, int): value = int(args.value)
+    elif isinstance(default, float): value = float(args.value)
+    else: value = args.value
+    config[args.key] = value; save_config(config); print(f"Set {args.key} = {value}"); return 0
+
 
 def update_and_load_langs() -> dict:
     langs_dict = dict(KNOWN_LANGUAGES)
@@ -1486,39 +1540,47 @@ def build_adaptive_library(
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "config":
+        return run_config(sys.argv[2:])
     parser = argparse.ArgumentParser(description="jwvideo-mux: Merge videos, audio, and subtitles from jw.org")
     parser.add_argument("input", help="URL, docid, or local file pattern to process")
-    parser.add_argument("-v", "--video", default="E", help="Comma-separated language codes for video tracks (default: E)")
-    parser.add_argument("-a", "--audio", default="E,TG,CV,HV,SA", help="Comma-separated language codes for audio tracks")
-    parser.add_argument("-s", "--subs", default="", help="Comma-separated language codes for subtitles. If omitted, uses all video/audio languages.")
-    parser.add_argument("-r", "--res", default="720p", help="Target resolution (default: 720p)")
-    parser.add_argument("-c", "--container", default="mkv", choices=["mkv", "mp4"], help="Export container format (default: mkv)")
-    parser.add_argument("-S", "--single-streams", action="store_true", help="Also produce multiple separate videos with modified audio streams")
-    parser.add_argument("-C", "--cleanup", action="store_true", help="Trash downloaded source files after muxing")
-    parser.add_argument("-o", "--output-dir", default=".", help="Directory to save output files")
+    parser.add_argument("-v", "--video", help="Comma-separated language codes for video tracks")
+    parser.add_argument("-a", "--audio", help="Comma-separated language codes for audio tracks")
+    parser.add_argument("-s", "--subs", help="Comma-separated subtitle languages; empty uses video/audio languages")
+    parser.add_argument("-r", "--res", "--resolution", dest="res", help="Target resolution")
+    parser.add_argument("-c", "--container", choices=["mkv", "mp4"], help="Export container format")
+    parser.add_argument("-S", "--single-streams", action=argparse.BooleanOptionalAction, default=None, help="Produce separate single-stream videos")
+    parser.add_argument("-C", "--cleanup", action=argparse.BooleanOptionalAction, default=None, help="Trash downloaded source files after muxing")
+    parser.add_argument("-o", "--output-dir", help="Directory to save output files")
     parser.add_argument("-f", "--force", action="store_true", help="Force overwrite if output file exists without asking (equivalent to --on-exists overwrite for this run)")
     parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
     parser.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
-    parser.add_argument("--no-default-subs", action="store_true", help="Do not set any subtitle track as default")
+    default_subs = parser.add_mutually_exclusive_group()
+    default_subs.add_argument("--no-default-subs", dest="no_default_subs", action="store_true", default=None, help="Do not set a subtitle track as default")
+    default_subs.add_argument("--default-subs", dest="no_default_subs", action="store_false", help="Set the selected subtitle track as default")
     parser.add_argument("--default-video", help="Language code to set as default video track")
     parser.add_argument("--default-audio", help="Language code to set as default audio track")
     parser.add_argument("--default-sub", help="Language code to set as default subtitle track")
     parser.add_argument("--analyze-video-variants", action="store_true", help="Report exact video reuse and reviewed localized-difference candidates; does not mux or delete media")
-    parser.add_argument("--variant-min-seconds", type=float, default=1.5, help="Minimum sustained duration (seconds) a similarity drop must hold before it counts as a localized-difference candidate (default: 1.5)")
-    parser.add_argument("--scan-small-regions", action="store_true", help="Also compare horizontal frame bands (name plates, lower-third captions) that whole-frame SSIM/PSNR dilutes; slower, and never auto-confirms by itself -- surfaces review_recommended candidates and supplementary windows on already-localized videos")
-    parser.add_argument("--region-count", type=int, default=8, help="Number of horizontal bands to split the frame into for --scan-small-regions (default: 8)")
+    parser.add_argument("--variant-min-seconds", type=float, help="Minimum sustained localized-difference duration")
+    parser.add_argument("--scan-small-regions", action=argparse.BooleanOptionalAction, default=None, help="Compare horizontal frame bands too")
+    parser.add_argument("--region-count", type=int, help="Horizontal bands used by --scan-small-regions")
     parser.add_argument("--manual-overrides", type=Path, help="TOML file (ground-truth.toml schema: talks -> videos -> differences, with an optional fallback_ok flag per difference) of human-confirmed evidence for local-file-mode SCE-layout input; always wins over automatic detection for the languages/windows it covers. Matched by exact talk-folder-name + anchor-filename, so reuse one file across a whole library.")
-    parser.add_argument("--dedupe-identical-video", action="store_true", help="When muxing, retain one video stream from each byte-identical video group")
-    parser.add_argument("--dedupe-visually-same", action="store_true", help="When muxing, retain one reference video where SSIM+PSNR both verified comparisons are visually_same or exactly_same (asks for confirmation unless --force)")
-    parser.add_argument("--adaptive-mpv-library", action="store_true", help="Export a space-saving mpv library (shared common video segments + per-language localized segments/audio/subs/EDL/manifest) instead of muxing; does not alter or delete source media. If analysis finds no real localized differences for any language, falls back to an ordinary single-file mux (one shared video track) written directly to the output directory instead of building an unnecessary EDL library.")
-    parser.add_argument("--launchers-in-video-folder", action="store_true", help=f"With --adaptive-mpv-library, write the {LAUNCHER_EXTENSION} launchers inside the per-video library folder (the old default) instead of the output directory (the unit root). Default is the unit root, one level up, so every video's launchers for a unit are visible without opening each video's own subfolder; launcher names there already carry the video's own docid/title (see build_docid_output_name), so multiple videos in one unit never collide.")
-    parser.add_argument("--normalize-mismatched-aspect", action="store_true", help="With --adaptive-mpv-library, when a language's localized clips are a different resolution/aspect ratio than the reference (e.g. a 16:9 insert against a 4:3 reference), center-crop and re-encode just those short localized clips to the reference's exact aspect ratio and resolution so mpv never visibly resizes mid-presentation. The shared common/reference segments are never re-encoded -- only the mismatched language's own short localized clips are.")
+    parser.add_argument("--dedupe-identical-video", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--dedupe-visually-same", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--adaptive-mpv-library", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--launchers-in-video-folder", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--normalize-mismatched-aspect", action=argparse.BooleanOptionalAction, default=None)
     color_group = parser.add_mutually_exclusive_group()
     color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colored output for this run (overrides the shared color_output config and auto-detection)")
     color_group.add_argument("--no-color", dest="color", action="store_false", help="Disable colored output for this run")
 
     args = parser.parse_args()
+    config = load_config()
+    for key in DEFAULT_CONFIG:
+        if getattr(args, key, None) is None:
+            setattr(args, key, config[key])
     global COLOR
     COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color))
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)

@@ -39,6 +39,8 @@ Enable selective use in `slverse`:
 
 ## Important Behavior / Defaults
 
+Backend defaults live in `~/.config/jwkit/ffinpaint/config.toml`. Use `ffinpaint config list|get|set`; every backend setting has a matching `ffinpaint run --<setting>` override. Setup's `--root` and `--checkpoint` remain friendly aliases for the corresponding saved E2FGVI paths.
+
 `slverse` defaults to `delogo_engine = blur`. With `auto`, it samples the caption box against its surrounding backdrop and only invokes the configured backend when it sees significant foreground-like variation. If no backend is configured, it safely keeps using blur unless `delogo_inpaint_fallback = error` is set.
 
 Only the detected occlusion window actually goes to the AI backend, not the whole verse - the rest of the clip still gets the cheap blur, with the inpainted result composited on top only while it's active (`slverse`'s `extract_verse`, via `detect_delogo_occlusion`'s returned time range). `delogo_engine = inpaint` (forced, not `auto`) still runs the detector first to try to localize a window; it only falls back to inpainting the *entire* verse if nothing localizes. The mask handed to the backend is also smaller than the blur box itself (`shrink_box_for_inpaint` drops `delogo_width_pad`/`delogo_height_pad`'s extra safety margin, which inpainting doesn't need the way a static blur does) - less area and less time for the model to process, which matters a lot against a GPU-minutes-per-clip backend.

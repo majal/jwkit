@@ -124,7 +124,8 @@ DEFAULT_CONFIG = {
     "video_codec": "av1",  # h264, hevc, av1 - royalty-free and meaningfully smaller than hevc at matched quality; falls back to hevc then h264 automatically if this machine/ffmpeg build can't actually encode it (see build_encode_args)
     "video_crf": "auto",  # codec-specific balanced quality: h264=20, hevc=23, av1=30
     "video_preset": "slow",
-    "interpolation_engine": "none",  # none, minterpolate, rife, framerate - "rife" delegates to the sibling ffrife tool; see its own config for rife_binary_path/rife_fallback_engine
+    "interpolate": "false",  # independent on/off preference; --interpolate/--no-interpolate override it for one run
+    "interpolation_engine": "rife",  # minterpolate, rife, framerate; legacy "none" remains accepted as an off alias
     "interpolation_target_fps": "60",  # flat target frame rate for all three interpolation engines - with rife, ffrife's interpolate() computes the exact frame count to hit this at the source's original duration (no speed change, any ratio), not just a source-fps multiple
     "delogo_engine": "blur",  # blur, auto, inpaint; optional inpainting is delegated to ffinpaint
     "delogo_inpaint_fallback": "blur",  # blur or error when auto/inpaint has no configured backend
@@ -182,14 +183,30 @@ CONFIG_CHOICES = {
     "extract_mode": ("cache", "onthefly", "segment"),
     "preview_source": ("cache", "remote", "segment"),
 }
+BOOLEAN_CONFIG_KEYS = {
+    "interpolate", "auto_sync", "auto_sync_background", "trim_end_transition",
+    "trim_mid_transitions", "show_source_lang_label", "mpv_show_osc",
+}
 
 def validate_config_value(key, value):
     """None if `value` is acceptable for `key`, else a ready-to-print error
     string. Case-insensitive against CONFIG_CHOICES; keys not in
     CONFIG_CHOICES always pass (see its own docstring)."""
+    normalized = str(value).strip().lower()
+    if key in BOOLEAN_CONFIG_KEYS and normalized not in ("true", "false"):
+        return f"{key} must be true or false (got {value!r})"
     choices = CONFIG_CHOICES.get(key)
     if choices and str(value).strip().lower() not in choices:
         return f"{key} must be one of {', '.join(choices)} (got {value!r})"
+    try:
+        if key in ("overlay_alpha", "overlay_source_label_alpha") and not 0 <= float(value) <= 1:
+            return f"{key} must be between 0 and 1"
+        if key in ("sync_workers", "extract_workers", "download_max_attempts") and int(value) < 1:
+            return f"{key} must be at least 1"
+        if key in ("interpolation_target_fps", "auto_sync_interval_hours", "download_retry_backoff") and float(value) < 0:
+            return f"{key} must be non-negative"
+    except ValueError:
+        return f"{key} has an invalid numeric value {value!r}"
     return None
 
 # One-line description per DEFAULT_CONFIG key, shown by 'slverse config
@@ -205,7 +222,8 @@ CONFIG_HELP = {
     "video_codec": "h264, hevc, or av1",
     "video_crf": "Encode quality (lower = higher quality/larger file)",
     "video_preset": "ffmpeg encoder preset (e.g. slow, medium, fast)",
-    "interpolation_engine": "none, minterpolate, framerate, or rife (delegates to the sibling ffrife tool)",
+    "interpolate": "Whether saved output is interpolated by default (true/false)",
+    "interpolation_engine": "rife, minterpolate, or framerate; legacy none disables interpolation",
     "interpolation_target_fps": "Flat target frame rate for interpolation (default 60)",
     "delogo_engine": "blur (default), auto (detect occlusion), or inpaint (requires the optional ffinpaint backend)",
     "delogo_inpaint_fallback": "blur (default) or error if the optional inpainting backend is unavailable",
@@ -264,6 +282,12 @@ def load_config():
                     file_keys.add(k)
     except Exception as e:
         print(f"Warning: could not parse config: {e}")
+    if CONFIG_FILE.exists() and "interpolate" not in file_keys:
+        # The old engine key also acted as the on/off switch. Preserve that
+        # behavior for existing installations; new users get false+rife.
+        config["interpolate"] = "false" if config.get("interpolation_engine") == "none" else "true"
+        save_config(config)
+        print(f"Migrated interpolation preference to interpolate = {config['interpolate']} ({CONFIG_FILE})")
     if "cache_max_gb" in file_keys:
         # One-time migration: cache_max_gb's old semantics were binary GiB
         # (see enforce_cache_budget's old `max_gb * 1024**3`), not decimal -
@@ -1969,15 +1993,16 @@ def cmd_setup(args, config):
         config["cache_max_size"] = ans
         config["cache_policy"] = "lru"
 
-    print("\n60fps playback options:")
-    print("  rife         - fastest and best quality, but needs a one-time download (uses your graphics card)")
-    print("  minterpolate - works right now with no extra download, but is slow (uses your processor)")
-    print("  none         - skip 60fps conversion")
-    ans = (input("Which one do you want? [rife]: ").strip().lower() or "rife")
-    if ans not in ("rife", "minterpolate", "framerate", "none"):
-        ans = "none"
-    config["interpolation_engine"] = ans
-    if ans == "rife":
+    enable_interpolation = input("\nInterpolate saved clips to a smoother frame rate by default? [y/N]: ").strip().lower() in ("y", "yes")
+    config["interpolate"] = "true" if enable_interpolation else "false"
+    engine = config.get("interpolation_engine", "rife")
+    if enable_interpolation:
+        print("60fps interpolation engine: rife (GPU, recommended), minterpolate (CPU), or framerate")
+        engine = (input(f"Which engine? [{engine}]: ").strip().lower() or engine)
+        if engine not in ("rife", "minterpolate", "framerate"):
+            engine = "rife"
+    config["interpolation_engine"] = engine
+    if enable_interpolation and engine == "rife":
         # RIFE install/config lives entirely in the sibling ffrife tool
         # (not JW-specific - see load_ffrife's docstring), so delegate to
         # its own setup instead of duplicating the download logic here.
@@ -2020,6 +2045,9 @@ def cmd_setup(args, config):
     print("If you use slverse on more than one computer, run 'slverse setup' on each one — settings are per-machine.")
 
 def cmd_config(args, config):
+    if args.key and args.key not in DEFAULT_CONFIG:
+        print(COLOR.red(f"Error: unknown config key {args.key!r}"))
+        return
     if args.key and args.value:
         error = validate_config_value(args.key, args.value)
         if error:
@@ -2203,7 +2231,7 @@ def maybe_auto_sync(args, config):
     to false to restore the old behavior of syncing inline before proceeding."""
     if getattr(args, "no_auto_sync", False):
         return
-    if config.get("auto_sync", "true").strip().lower() not in ("true", "1", "yes"):
+    if not getattr(args, "auto_sync_override", False) and config.get("auto_sync", "true").strip().lower() not in ("true", "1", "yes"):
         return
 
     try:
@@ -2420,6 +2448,9 @@ GENERIC_OVERRIDE_EXCLUDED_KEYS = {
     "trim_end_transition",   # --keep-end-transition
     "trim_mid_transitions",  # --trim-mid-transitions
     "extract_mode",          # --onthefly/--cache/--segment
+    "interpolate", "interpolation_engine",  # dedicated paired toggle and engine selector
+    "auto_sync",             # dedicated --auto-sync/--no-auto-sync pair
+    "trim_end_transition", "trim_mid_transitions",  # dedicated semantic pairs
 }
 
 def add_generic_config_overrides(parser):
@@ -2433,7 +2464,11 @@ def add_generic_config_overrides(parser):
     for key in DEFAULT_CONFIG:
         if key in GENERIC_OVERRIDE_EXCLUDED_KEYS:
             continue
-        parser.add_argument(f"--{key.replace('_', '-')}", dest=key, help=CONFIG_HELP.get(key, ""))
+        flag = f"--{key.replace('_', '-')}"
+        if key in BOOLEAN_CONFIG_KEYS:
+            parser.add_argument(flag, dest=key, action=argparse.BooleanOptionalAction, default=None, help=CONFIG_HELP.get(key, ""))
+        else:
+            parser.add_argument(flag, dest=key, help=CONFIG_HELP.get(key, ""))
 
 def apply_generic_config_overrides(args, config):
     for key in DEFAULT_CONFIG:
@@ -2441,6 +2476,8 @@ def apply_generic_config_overrides(args, config):
             continue
         value = getattr(args, key, None)
         if value is not None:
+            if key in BOOLEAN_CONFIG_KEYS and isinstance(value, bool):
+                value = "true" if value else "false"
             error = validate_config_value(key, value)
             if error:
                 raise SystemExit(f"--{key.replace('_', '-')}: {error}")
@@ -2992,17 +3029,24 @@ def main():
     p_extract.add_argument("lang", help="Sign language code, comma list, 'all', or 'any' (first available in configured order)")
     p_extract.add_argument("reference", nargs="+", help="Bible reference (e.g., Rev 13:1, 2; quoting is optional)")
     p_extract.add_argument("-f", "--write", action="store_true", help="Encode and save the output file. Default is preview-only: play the verse with its overlay (delogo box shown, not applied) and write nothing.")
-    p_extract.add_argument("-o", "--output", help="Output media filename (requires --write and one language)")
+    p_extract.add_argument("-o", "--output", help="Output media filename; implies --write (one language only)")
     p_extract.add_argument("-q", "--quiet", action="store_true", help="Suppress source/cache status lines (progress and errors still show)")
     p_extract.add_argument("-m", "--play", action="store_true", help="With --write, also play the finished file via mpv. Without --write, preview via mpv instead of ffplay.")
-    p_extract.add_argument("-i", "--interpolate", action="store_true", help="Force interpolation on output (a boolean toggle - to pick WHICH engine, use -I/--interpolation-engine below instead)")
-    p_extract.add_argument("--onthefly", action="store_true", help="Stream-extract from the source URL; never store anything on disk")
-    p_extract.add_argument("-c", "--cache", action="store_true", help="Download and keep the WHOLE chapter in the local cache (default extract_mode) - worth it once you're pulling several different verses from it; see --segment for a cheaper one-off")
-    p_extract.add_argument("--segment", action="store_true", help="Download and cache just this verse window instead of the whole chapter - cheaper than --cache for a one-off or a few verses spread across languages")
-    p_extract.add_argument("-I", dest="interpolation_engine", metavar="ENGINE", help="Short for --interpolation-engine below")
-    p_extract.add_argument("-n", "--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
-    p_extract.add_argument("--keep-end-transition", action="store_true", help="Keep the trailing fade-out/copyright-endscreen this once, overriding trim_end_transition for this run only")
-    p_extract.add_argument("--trim-mid-transitions", action="store_true", help="Also cut mid-range paragraph transitions inside a multi-verse range this once, overriding trim_mid_transitions for this run only")
+    p_extract.add_argument("-i", "--interpolate", action=argparse.BooleanOptionalAction, default=None, help="Force interpolation on or off for this run")
+    source_mode = p_extract.add_mutually_exclusive_group()
+    source_mode.add_argument("--onthefly", action="store_true", help="Stream-extract from the source URL; never store anything on disk")
+    source_mode.add_argument("-c", "--cache", action="store_true", help="Download and keep the whole chapter in the local cache")
+    source_mode.add_argument("--segment", action="store_true", help="Download and cache just this verse window")
+    p_extract.add_argument("-I", "--interpolation-engine", choices=CONFIG_CHOICES["interpolation_engine"], help="Interpolation engine for this run; legacy 'none' disables interpolation")
+    sync_toggle = p_extract.add_mutually_exclusive_group()
+    sync_toggle.add_argument("--auto-sync", dest="auto_sync_override", action="store_true", help="Enable automatic metadata refresh for this run")
+    sync_toggle.add_argument("-n", "--no-auto-sync", dest="no_auto_sync", action="store_true", help="Skip automatic metadata refresh for this run")
+    end_transition = p_extract.add_mutually_exclusive_group()
+    end_transition.add_argument("--trim-end-transition", dest="keep_end_transition", action="store_false", default=None)
+    end_transition.add_argument("--keep-end-transition", dest="keep_end_transition", action="store_true")
+    mid_transition = p_extract.add_mutually_exclusive_group()
+    mid_transition.add_argument("--trim-mid-transitions", dest="trim_mid_transitions", action="store_true", default=None)
+    mid_transition.add_argument("--keep-mid-transitions", dest="trim_mid_transitions", action="store_false")
     p_extract.add_argument("-s", "--offset-start", type=float, metavar="SECONDS", help="Nudge the verse range's own start by this many seconds (either sign) - e.g. 5.302 to skip the first 5.302s and play to the natural end")
     p_extract.add_argument("-e", "--offset-end", type=float, metavar="SECONDS", help="Nudge the verse range's own end by this many seconds (either sign) - e.g. -3 to end 3s early")
     p_extract.add_argument("--window", dest="clip_window", type=parse_clip_window, metavar="START:END", help="Keep one relative slice of the natural verse window, e.g. --window 3.567:10.003")
@@ -3027,7 +3071,9 @@ def main():
     p_find.add_argument("-p", "--play", action="store_true", help="Also stream-preview each match with mpv")
     p_find.add_argument("-v", "--verbose", action="store_true", help="Show full match details (URL, mpv command) instead of the compact checkmark list")
     p_find.add_argument("--json", action="store_true", help="Machine-readable JSON instead of the checkmark list (always includes every synced language, found or not)")
-    p_find.add_argument("--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
+    find_sync = p_find.add_mutually_exclusive_group()
+    find_sync.add_argument("--auto-sync", dest="auto_sync_override", action="store_true")
+    find_sync.add_argument("--no-auto-sync", dest="no_auto_sync", action="store_true")
     add_generic_config_overrides(p_find)
 
     p_cache = subparsers.add_parser("cache", help="Manage cache")
@@ -3044,10 +3090,13 @@ def main():
     p_bulk = subparsers.add_parser("bulk", help="Precompute whole chapters (optionally interpolated) ahead of time, instead of extracting on demand")
     p_bulk.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
     p_bulk.add_argument("--books", default="all", help="Book number range, e.g. '40-66' or '66' (default: all 66)")
-    p_bulk.add_argument("--interpolate", action="store_true", help="Interpolate each chapter to 60fps using the configured engine")
-    p_bulk.add_argument("--out", help="Output directory (default: <cache_dir>/bulk/<lang>)")
+    p_bulk.add_argument("-i", "--interpolate", action=argparse.BooleanOptionalAction, default=None, help="Force interpolation on or off for this run")
+    p_bulk.add_argument("-I", "--interpolation-engine", choices=CONFIG_CHOICES["interpolation_engine"], help="Interpolation engine for this run; legacy 'none' disables interpolation")
+    p_bulk.add_argument("--out", "--output-dir", dest="out", help="Output directory (default: <cache_dir>/bulk/<lang>)")
     p_bulk.add_argument("--overwrite", action="store_true", help="Reprocess chapters even if the output file already exists")
-    p_bulk.add_argument("--no-auto-sync", action="store_true", help="Skip the once-a-day automatic background metadata refresh for this run")
+    bulk_sync = p_bulk.add_mutually_exclusive_group()
+    bulk_sync.add_argument("--auto-sync", dest="auto_sync_override", action="store_true")
+    bulk_sync.add_argument("--no-auto-sync", dest="no_auto_sync", action="store_true")
     p_bulk.add_argument("--encoder", choices=["cpu", "videotoolbox", "nvenc", "qsv"], help="Video encoder for this run (default: configured hardware_encoder)")
     p_bulk.add_argument("--codec", choices=["h264", "hevc", "av1"], help="Video codec for this run (default: configured video_codec)")
     p_bulk.add_argument("--crf", help="Video quality for this run; use 'auto' for the codec default")
@@ -3095,9 +3144,17 @@ def main():
             value = getattr(args, arg_name)
             if value is not None:
                 config[config_key] = value
+        if args.output:
+            args.write = True
+        if args.interpolation_engine is not None:
+            config["interpolation_engine"] = args.interpolation_engine
+        enabled = str(config.get("interpolate", "false")).lower() in ("true", "1", "yes", "on") if args.interpolate is None else args.interpolate
+        if config.get("interpolation_engine") == "none":
+            enabled = False
+        config["interpolate"] = "true" if enabled else "false"
+        if not enabled:
+            config["interpolation_engine"] = "none"
         maybe_auto_sync(args, config)
-        if args.interpolate and config.get("interpolation_engine") == "none":
-            config["interpolation_engine"] = "minterpolate"
         cmd_extract(args, config)
     elif args.command == "find":
         maybe_auto_sync(args, config)
@@ -3113,9 +3170,15 @@ def main():
             value = getattr(args, arg_name)
             if value is not None:
                 config[config_key] = value
+        if args.interpolation_engine is not None:
+            config["interpolation_engine"] = args.interpolation_engine
+        enabled = str(config.get("interpolate", "false")).lower() in ("true", "1", "yes", "on") if args.interpolate is None else args.interpolate
+        if config.get("interpolation_engine") == "none":
+            enabled = False
+        config["interpolate"] = "true" if enabled else "false"
+        if not enabled:
+            config["interpolation_engine"] = "none"
         maybe_auto_sync(args, config)
-        if args.interpolate and config.get("interpolation_engine") == "none":
-            config["interpolation_engine"] = "minterpolate"
         cmd_bulk(args, config)
     else:
         parser.print_help()

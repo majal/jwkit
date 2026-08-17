@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from tests.support import REPO_ROOT
+from tests.support import REPO_ROOT, load_script_module
 
 
 class SmokeTest(unittest.TestCase):
@@ -56,6 +56,12 @@ class SmokeTest(unittest.TestCase):
         result = self.run_script("ffv", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ffv any", result.stdout)
+
+    def test_ffv_all_preserves_future_option_values(self) -> None:
+        ffv = load_script_module("ffv")
+        reference, flags = ffv.split_all_reference(["1", "Timothy", "1:11", "--future-option", "value", "--json"])
+        self.assertEqual(reference, ["1 Timothy", "1", "11"])
+        self.assertEqual(flags, ["--future-option", "value", "--json"])
 
     def test_jwpl_help(self) -> None:
         result = self.run_script("jwpl", "--help")
