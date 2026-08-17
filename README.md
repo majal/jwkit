@@ -89,7 +89,7 @@ Full docs: [docs/ffinpaint.md](docs/ffinpaint.md)
 
 ### [`ffrife`](./ffrife)
 
-`ffrife` interpolates any video to a higher frame rate using `rife-ncnn-vulkan`, a GPU-accelerated AI model that generates real in-between frames instead of just blending adjacent ones. It works on any local file or URL, JW-related or not — trim a section, add an `ffmpeg` filter, or retime the speed, all in a single pass. `slverse` uses it as a library for its own interpolation instead of duplicating the logic.
+`ffrife` interpolates any video to a higher frame rate using `rife-ncnn-vulkan`, a GPU-accelerated AI model that generates real in-between frames instead of just blending adjacent ones. Long jobs use cooler worker defaults, resumable chunks, and cooldowns; batch mode handles folders, globs, or file lists sequentially. It works on any local file or URL, JW-related or not, and `slverse` uses it as a library instead of duplicating the interpolation engine.
 
 Full docs: [docs/ffrife.md](docs/ffrife.md)
 

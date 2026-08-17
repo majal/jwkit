@@ -12,6 +12,8 @@
 - Falls back gracefully when RIFE isn't installed/configured (`rife_fallback_engine`: `none` keeps native fps with no artifact, or `framerate`/`minterpolate` for the blended look anyway), so callers don't have to special-case a missing binary.
 - `ffrife setup` downloads and configures the right `rife-ncnn-vulkan` release for your platform automatically.
 - Shows a minimal live progress bar for anything that's actually slow (RIFE itself has no built-in progress output, so this counts output frames against the expected total) - fast operations stay silent.
+- Runs long jobs as bounded, resumable chunks with a cooldown between them. The default `1:1:1` RIFE worker layout also avoids the upstream binary's more aggressive `1:2:2` processing default.
+- Processes folders, quoted wildcards, and newline-delimited file lists sequentially with `ffrife batch` (`bulk` is an alias), isolating per-file failures and printing a final summary.
 
 ## Supported Platforms
 
@@ -71,6 +73,31 @@ Use Apple VideoToolbox for this output only:
 ./ffrife input.mp4 -o output.mp4 --encoder videotoolbox --codec hevc
 ```
 
+Process every video in a folder (recursively) without running multiple GPU jobs at once:
+
+```bash
+./ffrife batch ./incoming -r -O ./interpolated
+```
+
+Quoted wildcards and explicit lists work too:
+
+```bash
+./ffrife batch "clips/*.mp4" --glob "more/**/*.mkv" --list jobs.txt -r -O ./done
+```
+
+Use a cooler one-run profile, or disable chunking for a short job:
+
+```bash
+./ffrife input.mp4 -o output.mp4 -j 1:1:1 -c 600 --cooldown 30
+./ffrife input.mp4 -o output.mp4 -c 0
+```
+
+Interrupted runs resume automatically when the same input, output, and interpolation options are used. To opt out for one run:
+
+```bash
+./ffrife input.mp4 -o output.mp4 --no-resume
+```
+
 Time every video encoder this machine's ffmpeg build actually has against a real clip, and apply the recommendation:
 
 ```bash
@@ -80,6 +107,12 @@ Time every video encoder this machine's ffmpeg build actually has against a real
 ## Important Behavior / Defaults
 
 - Global configuration is saved in `~/.config/jwkit/ffrife/config.toml` (separate from `slverse`'s own config - `slverse` bridges its own `hardware_encoder`/`video_crf`/etc. into a call to `ffrife` rather than needing them kept in sync across two files by hand).
+- Long-run defaults are `rife_threads=1:1:1`, `rife_gpu=auto`, `chunk_frames=1200`, `cooldown_seconds=15`, and `resume=true`. Set any persistently with `ffrife config set KEY VALUE`; override them with `-j`/`--rife-threads`, `--rife-gpu`, `-c`/`--chunk-frames`, `--cooldown`, and `--resume`/`--no-resume`.
+- Chunks overlap by one source frame, and the duplicate endpoint is removed during assembly. This preserves continuity across the boundary while still producing the exact requested total frame count.
+- Resume state is stored in a hidden directory beside the output, named after the output plus a signature of the source and interpolation settings. Extraction and each completed RIFE chunk are recorded atomically. Successful jobs remove the state automatically unless `--keep-work` is used; interrupted or failed jobs retain it and print its location.
+- `rife_gpu=cpu` maps to RIFE device `-1`. This avoids GPU use but is not necessarily cooler overall; it can shift sustained load to the CPU. `auto` normally gives the best efficiency on Apple Silicon.
+- Batch mode accepts files, directories, quoted shell patterns, repeatable `--glob` patterns, and repeatable `--list` files. Blank/comment lines in list files are ignored, relative entries resolve beside the list, duplicates are removed, unsupported extensions are ignored, and processing is deliberately sequential. The default output template is `{stem}_rife{suffix}`; customize it with `--output-name` using `{stem}`, `{suffix}`, and `{name}`.
+- Batch failures do not discard other queued work. Use `--fail-fast` when the first failure should stop the queue. Existing outputs use the same shared `--on-exists` policy as single-file runs.
 - `hardware_encoder` defaults to `cpu` (`libx264`). Measured directly on Apple Silicon: `videotoolbox` at a quality setting matching `crf 20` produced a file ~2.6x larger than `libx264 crf 20 preset slow` for immeasurably different quality (SSIM within 0.0003), with no meaningful speed advantage at short clip lengths.
 - `video_codec` defaults to `av1` (`libsvtav1` in software - no consumer Apple Silicon has AV1 *hardware encode* yet, that's landing with 2026's M5 Pro/Max; VideoToolbox's AV1 support through M4 is decode-only). Confirmed with a full `benchmark` crf sweep (3 crf values per codec, real ASL footage, Apple M3):
 
@@ -105,5 +138,7 @@ Time every video encoder this machine's ffmpeg build actually has against a real
 
 - Downloading the actual RIFE release binary is a multi-MB transfer - if it stalls or times out in a constrained/sandboxed network environment, run `ffrife setup` from a normal terminal instead.
 - The final merge (PNG frames back to video) is the only lossy re-encode; PNG extraction and RIFE itself are lossless intermediate steps.
+- Intermediate PNGs can consume substantial disk space. They are required for lossless resume and are cleaned after success; check the printed hidden work-directory path after an interrupted job if space is tight.
+- Cooling is time-based rather than temperature-based because portable, permission-free temperature telemetry is not consistently available across macOS, Linux, and Windows. The operating system remains responsible for hardware thermal throttling.
 
 [↑ Back to README TOC](../README.md#table-of-contents)
