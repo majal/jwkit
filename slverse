@@ -151,6 +151,8 @@ DEFAULT_CONFIG = {
     "overlay_fontsize": "34",
     "overlay_alpha": "0.66",
     "overlay_source_label_alpha": "0.5",  # small "which SL is this" label under the reference
+    "caption_detection": "true",  # measure the burned-in caption from small sampled frame crops; proxy font remains the confidence fallback
+    "caption_detection_samples": "3",  # majority-voted interior frames; local segment analysis is normally well under one second
     "delogo_width_pad": "2",   # small antialiasing margin beyond the dynamically measured source-label proxy
     "delogo_height_pad": "2",
     "default_target_lang": "FSL",  # requesting this SL skips delogo/drawtext entirely - its own burned-in caption is already correct
@@ -186,6 +188,7 @@ CONFIG_CHOICES = {
 BOOLEAN_CONFIG_KEYS = {
     "interpolate", "auto_sync", "auto_sync_background", "trim_end_transition",
     "trim_mid_transitions", "show_source_lang_label", "mpv_show_osc",
+    "caption_detection",
 }
 
 def validate_config_value(key, value):
@@ -201,8 +204,10 @@ def validate_config_value(key, value):
     try:
         if key in ("overlay_alpha", "overlay_source_label_alpha") and not 0 <= float(value) <= 1:
             return f"{key} must be between 0 and 1"
-        if key in ("sync_workers", "extract_workers", "download_max_attempts") and int(value) < 1:
+        if key in ("sync_workers", "extract_workers", "download_max_attempts", "caption_detection_samples") and int(value) < 1:
             return f"{key} must be at least 1"
+        if key == "caption_detection_samples" and int(value) > 9:
+            return f"{key} must be at most 9"
         if key in ("interpolation_target_fps", "auto_sync_interval_hours", "download_retry_backoff") and float(value) < 0:
             return f"{key} must be non-negative"
     except ValueError:
@@ -249,6 +254,8 @@ CONFIG_HELP = {
     "overlay_fontsize": "Verse-reference overlay font size",
     "overlay_alpha": "Verse-reference overlay opacity (0-1)",
     "overlay_source_label_alpha": "Source-SL label opacity (0-1), when show_source_lang_label is true",
+    "caption_detection": "Measure the source caption from sampled video pixels before falling back to proxy-font sizing",
+    "caption_detection_samples": "Interior frames sampled for caption measurement (1-9; default 3)",
     "delogo_width_pad": "Extra px of delogo box width beyond the auto-measured source caption",
     "delogo_height_pad": "Extra px of delogo box height beyond the auto-measured source caption",
     "default_target_lang": "Requesting this SL skips the overlay entirely - its own caption is already correct",
@@ -978,20 +985,19 @@ def cache_dir_size(cache_dir):
 
 def segment_cache_path(config, lang, book_num, chapter, start_time, end_time):
     cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang / "segments"
-    name = f"{book_num}_{chapter}_{round(start_time * 1000)}-{round(end_time * 1000)}.mp4"
+    # v2 segments are zero-based.  The old stream-copy files retained a
+    # non-zero MP4 start_time, but ffmpeg's input -ss still interpreted the
+    # requested chapter timestamp relative to the short file and sought past
+    # EOF.  Keep the cache-key version explicit so those files are not reused.
+    name = f"{book_num}_{chapter}_{round(start_time * 1000)}-{round(end_time * 1000)}-v2.mp4"
     return cache_dir / name
 
 def download_segment(url, output_path, start_time, end_time):
     """Grabs just [start_time, end_time] from a remote chapter via ffmpeg
-    stream copy - no re-encode, so this is fast and cheap, but only as
-    accurate as onthefly's own remote seek (nearest keyframe, not frame-
-    exact - see extract_verse). -copyts keeps the source's original
-    (whole-chapter-relative) timestamps in the saved clip instead of
-    resetting them to zero, so every downstream function that assumes
-    absolute chapter time (overlay fade timing, verse markers, chapter
-    metadata) keeps working completely unchanged whether the eventual -ss/
-    -to in extract_verse lands on this small segment or a full cached
-    chapter."""
+    stream copy - no re-encode.  The muxer resets the saved MP4 timestamps;
+    callers translate the already-known verse window to 0..duration when a
+    cached segment was returned.  This avoids seeking a short local file by
+    its original whole-chapter timestamp."""
     tmp_path = Path(str(output_path) + ".part")
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -1000,7 +1006,7 @@ def download_segment(url, output_path, start_time, end_time):
             # the container from the output filename's extension, and
             # ".part" (appended for the same atomic-write-then-rename safety
             # download_file uses) isn't one it recognizes.
-            run_ffmpeg(["-ss", str(start_time), "-to", str(end_time), "-i", url, "-c", "copy", "-copyts", "-f", "mp4", str(tmp_path)], duration=end_time - start_time)
+            run_ffmpeg(["-ss", str(start_time), "-to", str(end_time), "-i", url, "-c", "copy", "-reset_timestamps", "1", "-f", "mp4", str(tmp_path)], duration=end_time - start_time)
             os.replace(tmp_path, output_path)
             return True
         except subprocess.CalledProcessError as e:
@@ -1223,7 +1229,7 @@ def measure_text_size(text, font_path, fontsize):
             pass
     return round(len(text) * fontsize * 0.55), round(fontsize * 1.3)
 
-def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box, source_labels=None, fade_outs=None):
+def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box, source_labels=None, fade_outs=None, detected_caption_box=None):
     """delogo (blur out the source video's own burned-in reference caption)
     + drawtext (the correct reference, in the caption position old ffv
     used) + a small label of which sign language this clip came from -
@@ -1337,17 +1343,118 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
         cw, ch = measure_text_size(candidate, estimator_font, fontsize)
         w, h = max(w, cw), max(h, ch)
 
+    # Pixel detection is deliberately confidence-gated.  Its exact glyph
+    # bounds beat a proxy font when the source frame is clear; otherwise the
+    # long-standing text measurement above remains the safe fallback.
+    source_x, source_y = x, y
+    if detected_caption_box:
+        source_x, source_y, w, h = detected_caption_box
+
     if not skip_reference:
         show = 1 if show_box else 0
-        delogo = f"delogo=x={x - 5}:y={y - 5}:w={w + 10 + width_pad}:h={h + 5 + height_pad}:show={show}"
+        if detected_caption_box:
+            delogo = f"delogo=x={source_x - width_pad}:y={source_y - height_pad}:w={w + width_pad * 2}:h={h + height_pad * 2}:show={show}"
+        else:
+            delogo = f"delogo=x={x - 5}:y={y - 5}:w={w + 10 + width_pad}:h={h + 5 + height_pad}:show={show}"
         drawtext = f"drawtext=text='{esc(label_text)}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y}:alpha='{fading_alpha(alpha)}'"
         filters += [delogo, drawtext]
 
     if show_label:
-        drawtext_ll = f"drawtext=text='{lang_u}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y + h - 5}:alpha='{fading_alpha(label_alpha)}'"
+        label_y = source_y + h + 4 if detected_caption_box else y + h - 5
+        drawtext_ll = f"drawtext=text='{lang_u}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={label_y}:alpha='{fading_alpha(label_alpha)}'"
         filters.append(drawtext_ll)
 
     return ",".join(filters) if filters else None
+
+def _caption_box_from_rgb(raw, crop, expected_x, expected_y):
+    """Find near-white caption glyphs in one small RGB24 crop.
+
+    JW's Bible sign-language reference is static, near-white, and anchored
+    at a known corner.  We therefore need neither OCR nor a full-frame image
+    dependency: select low-chroma bright pixels, then follow the text line
+    from its expected origin while allowing normal inter-word gaps.
+    """
+    left, top, width, height = crop
+    if len(raw) != width * height * 3:
+        return None
+    mask = bytearray(width * height)
+    for pixel in range(width * height):
+        r, g, b = raw[pixel * 3:pixel * 3 + 3]
+        mask[pixel] = max(r, g, b) >= 150 and max(r, g, b) - min(r, g, b) <= 35
+
+    row_counts = [sum(mask[row * width:(row + 1) * width]) for row in range(height)]
+    rows = [row for row, count in enumerate(row_counts) if count >= 4]
+    runs = []
+    for row in rows:
+        if not runs or row > runs[-1][-1] + 2:
+            runs.append([row])
+        else:
+            runs[-1].append(row)
+    expected_row = expected_y - top
+    plausible = [run for run in runs if 8 <= run[-1] - run[0] + 1 <= 50 and abs((run[0] + run[-1]) / 2 - expected_row) <= 35]
+    if not plausible:
+        return None
+    line = min(plausible, key=lambda run: abs((run[0] + run[-1]) / 2 - expected_row))
+    y0, y1 = line[0], line[-1]
+
+    occupied = []
+    for col in range(width):
+        if any(mask[row * width + col] for row in range(y0, y1 + 1)):
+            occupied.append(col)
+    expected_col = expected_x - left
+    starts = [col for col in occupied if expected_col - 20 <= col <= expected_col + 35]
+    if not starts:
+        return None
+    x0 = min(starts)
+    x1 = x0
+    for col in (col for col in occupied if col >= x0):
+        if col - x1 > 32:
+            break
+        x1 = col
+    if x1 - x0 < 30:
+        return None
+    return left + x0, top + y0, x1 - x0 + 1, y1 - y0 + 1
+
+def detect_caption_box(source, start_time, end_time, config, samples=None):
+    """Measure the static source caption from several cheap cropped frames.
+
+    Returns a glyph bounding box only when a majority of samples agree
+    closely.  Decode/network errors, fades, hands, or unusual backgrounds
+    simply return None so proxy-font sizing remains available.
+    """
+    if str(config.get("caption_detection", DEFAULT_CONFIG["caption_detection"])).strip().lower() == "false":
+        return None
+    # Three random-access HTTP seeks cost seconds each even though analyzing
+    # the returned crop costs milliseconds.  Segment/cache modes are local
+    # (and the defaults), so keep --onthefly/preview_source=remote cheap and
+    # use its proxy fallback instead.
+    if str(source).lower().startswith(("http://", "https://")):
+        return None
+    samples = int(config.get("caption_detection_samples", DEFAULT_CONFIG["caption_detection_samples"])) if samples is None else samples
+    if end_time <= start_time or samples < 1:
+        return None
+    expected_x = int(config.get("overlay_x", DEFAULT_CONFIG["overlay_x"]))
+    expected_y = int(config.get("overlay_y", DEFAULT_CONFIG["overlay_y"]))
+    crop = (max(0, expected_x - 45), max(0, expected_y - 35), 500, 105)
+    left, top, width, height = crop
+    boxes = []
+    for index in range(samples):
+        fraction = (index + 1) / (samples + 1)
+        timestamp = start_time + (end_time - start_time) * fraction
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-ss", f"{timestamp:.3f}", "-i", str(source), "-frames:v", "1", "-vf", f"crop={width}:{height}:{left}:{top},format=rgb24", "-f", "rawvideo", "pipe:1"]
+        try:
+            raw = subprocess.run(cmd, check=True, capture_output=True, timeout=15).stdout
+        except Exception:
+            continue
+        box = _caption_box_from_rgb(raw, crop, expected_x, expected_y)
+        if box:
+            boxes.append(box)
+    required = samples // 2 + 1
+    if len(boxes) < required:
+        return None
+    medians = tuple(sorted(box[axis] for box in boxes)[len(boxes) // 2] for axis in range(4))
+    agreeing = [box for box in boxes if all(abs(box[axis] - medians[axis]) <= (6 if axis < 2 else 10) for axis in range(4))]
+    return medians if len(agreeing) >= required else None
 
 def preview_verse(source, start_time, end_time, book_name, chapter, verse_label, lang, config, use_mpv=False, source_url=None, source_labels=None, fade_outs=None):
     """Default 'slverse extract' behavior (no --write): play the verse with
@@ -1357,7 +1464,8 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
     (fastest - no encode at all), while mpv can't take -vf on a remote/
     local source directly, so --play/-m instead makes a quick ultrafast
     temp clip first, the same tradeoff the old script made."""
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True, source_labels=source_labels, fade_outs=fade_outs)
+    detected_box = detect_caption_box(source, start_time, end_time, config)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
     duration = end_time - start_time
 
     from_cache = source_url is not None and str(source) != str(source_url)
@@ -1488,7 +1596,8 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     has_audio_stream - so this is usually moot in practice). Not combined
     with the rife engine here - ffrife owns its own PNG extraction and
     doesn't know about kept_segments."""
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, fade_outs=fade_outs)
+    detected_box = detect_caption_box(source, start_time, end_time, config)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
     engine = config.get("interpolation_engine", "none")
     duration = end_time - start_time
     segments = kept_segments or [(0.0, duration)]
@@ -1719,7 +1828,8 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
     setpts to only half the timeline, leaves no single consistent audio
     track to carry through) - the single-window extract_verse path above
     still keeps audio."""
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels)
+    detected_box = detect_caption_box(source, start_time, end_time, config)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, detected_caption_box=detected_box)
     engine = config.get("interpolation_engine", "none")
     duration = end_time - start_time
 
@@ -2554,6 +2664,8 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         preview_source = config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower()
         if preview_source == "segment":
             source, cached_path = resolve_segment_source(url, lang, book_num, chapter, start_time, end_time, config, state)
+            if cached_path:
+                start_time, end_time = 0.0, end_time - start_time
         elif preview_source != "remote":
             cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang
             cached = cache_dir / url.split("/")[-1]
@@ -2640,10 +2752,11 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             print(f"[{lang}] Source cache: {local_path}")
             print(f"[{lang}] Source: {url}")
         with cache_in_use(cached_seg) if cached_seg else contextlib.nullcontext():
+            local_start, local_end = (0.0, duration) if cached_seg else (start_time, end_time)
             if mode:
-                extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
+                extract_verse_sections(local_path, out_filename, local_start, local_end, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
             else:
-                extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=cached_seg is None, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
+                extract_verse(local_path, out_filename, local_start, local_end, book_name, chapter, verses_str, lang, config, remote=cached_seg is None, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
     else:
         cache_dir = Path(config["cache_dir"]) / lang
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2865,7 +2978,9 @@ def cmd_find(args, config):
                 dur = r["end"] - r["start"]
                 play_source = r["url"]
                 if use_cache:
-                    play_source, _ = resolve_segment_source(r["url"], r["lang"], book_num, r["chapter"], r["start"], r["end"], config, state)
+                    play_source, cached_segment = resolve_segment_source(r["url"], r["lang"], book_num, r["chapter"], r["start"], r["end"], config, state)
+                    if cached_segment:
+                        start_str = "00:00:00.000"
                 # Multiple matches: windowed (not fullscreen, so several can
                 # be visible at once), sized to preview_window_size (percent
                 # of screen, aspect preserved - mpv works this out itself,
