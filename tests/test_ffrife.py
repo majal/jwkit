@@ -481,16 +481,37 @@ class FfrifeLongRunTest(unittest.TestCase):
         self.assertEqual(command[command.index("-j") + 1], "1:1:1")
         self.assertEqual(command[command.index("-g") + 1], "-1")
 
-    def test_scene_cut_detection_reads_source_pts(self) -> None:
-        result = argparse.Namespace(
-            stderr="[Parsed_showinfo_2] n: 0 pts:      7 pts_time:0.2917\n"
-                   "[Parsed_showinfo_2] n: 1 pts:     19 pts_time:0.7917\n"
-        )
-        with patch.object(self.ffrife.subprocess, "run", return_value=result) as run:
-            cuts = self.ffrife.detect_scene_cuts("frames", 24, 0.35)
-        self.assertEqual(cuts, [7, 19])
-        command = run.call_args.args[0]
-        self.assertIn("scale=160:-2,select='gt(scene,0.35)',showinfo", command)
+    def test_transition_detector_finds_an_isolated_hard_cut(self) -> None:
+        # 6 static RGB frames, then a permanent jump to a very different
+        # color that holds - an isolated, unaligned, non-reverting spike is
+        # exactly a hard cut. Mocked rawvideo keeps this independent of an
+        # ffmpeg installation.
+        frames = [bytes([50] * (32 * 18 * 3)) for _ in range(6)]
+        frames += [bytes([200] * (32 * 18 * 3)) for _ in range(4)]
+        process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
+        process.wait.return_value = 0
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=process) as popen:
+            cuts, transitions = self.ffrife.detect_transitions("frames", source_fps=24)
+        self.assertEqual(cuts, [6])
+        self.assertEqual(transitions, [])
+        command = popen.call_args.args[0]
+        self.assertIn("rgb24", command)
+
+    def test_transition_detector_does_not_flag_a_sustained_burst_as_a_cut(self) -> None:
+        # Regression: a sustained run of large, poorly-aligned steps (e.g. a
+        # whip pan or any other extreme-but-real motion) must not be
+        # reported as a hard cut. Comparing each neighbor only to the
+        # pre-spike baseline (the old design) flags every frame in a run
+        # like this, since each one clears that baseline on its own; only
+        # comparing each neighbor to the spike's *own* size - unchanged
+        # here, since nothing settles back down - correctly rejects it.
+        values = [50, 51, 52, 220, 40, 230, 30, 210, 60, 55, 56, 57]
+        frames = [bytes([v] * (32 * 18 * 3)) for v in values]
+        process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
+        process.wait.return_value = 0
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
+            cuts, transitions = self.ffrife.detect_transitions("frames", source_fps=24)
+        self.assertEqual(cuts, [])
 
     def test_scene_cut_replacement_maps_arbitrary_target_rate(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -505,7 +526,9 @@ class FfrifeLongRunTest(unittest.TestCase):
                 incoming, outgoing, input_count=3, target_count=5, cuts=[1]
             )
             self.assertEqual(replaced, 1)
-            self.assertEqual((outgoing / "00000002.png").read_text(), "source-1")
+            # cut=1 is the zero-based index of the shot's first frame, so the
+            # replacement must come from file 2 (source-2), not file 1.
+            self.assertEqual((outgoing / "00000002.png").read_text(), "source-2")
             self.assertEqual((outgoing / "00000003.png").read_text(), "rife-3")
 
     def test_scene_detection_cli_defaults_and_overrides(self) -> None:
@@ -519,17 +542,52 @@ class FfrifeLongRunTest(unittest.TestCase):
         self.assertEqual(config["scene_detection"], "false")
 
     def test_gradual_transition_detector_finds_aligned_elevated_changes(self) -> None:
-        # 12 tiny grayscale frames: still, then a linear fade. Mock rawvideo
-        # keeps this unit test independent of an ffmpeg installation.
-        frames = [bytes([20] * (32 * 18)) for _ in range(5)]
-        frames += [bytes([value] * (32 * 18)) for value in (30, 40, 50, 60, 70, 80, 90)]
+        # 12 tiny RGB frames: still, then a linear fade. Mock rawvideo keeps
+        # this unit test independent of an ffmpeg installation.
+        frames = [bytes([20] * (32 * 18 * 3)) for _ in range(5)]
+        frames += [bytes([value] * (32 * 18 * 3)) for value in (30, 40, 50, 60, 70, 80, 90)]
         process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
         process.wait.return_value = 0
         with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
-            intervals = self.ffrife.detect_gradual_transitions(
+            cuts, transitions = self.ffrife.detect_transitions(
                 "frames", source_fps=10, min_duration=0.3, sensitivity=1.2, alignment=0.8
             )
-        self.assertEqual(intervals, [(5, 11)])
+        self.assertEqual(transitions, [(5, 11)])
+        self.assertEqual(cuts, [])
+
+    def test_gradual_transition_detector_protects_quick_dissolves(self) -> None:
+        # Regression: a fast, aligned ramp shorter than transition_min_duration
+        # (0.25s == 6 frames at 24fps here) used to be discarded outright by a
+        # minimum-run-length gate, leaving quick dissolves unprotected. The
+        # gate is gone - min_duration only sizes the baseline lookback now -
+        # so this 4-frame ramp must still be reported.
+        frames = [bytes([20] * (32 * 18 * 3)) for _ in range(6)]
+        frames += [bytes([value] * (32 * 18 * 3)) for value in (30, 50, 70, 90)]
+        frames += [bytes([90] * (32 * 18 * 3)) for _ in range(3)]
+        process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
+        process.wait.return_value = 0
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
+            cuts, transitions = self.ffrife.detect_transitions(
+                "frames", source_fps=24, min_duration=0.25, sensitivity=1.2, alignment=0.8
+            )
+        self.assertNotEqual(transitions, [])
+
+    def test_scene_cut_replacement_uses_the_post_cut_frame(self) -> None:
+        # Regression: the replacement source must be the shot that begins at
+        # `cut` (zero-based), not the frame immediately before it - copying
+        # the wrong side silently extends the outgoing shot instead of
+        # cleanly starting the incoming one.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            incoming, outgoing = root / "in", root / "out"
+            incoming.mkdir(); outgoing.mkdir()
+            (incoming / "00000001.png").write_text("old-shot")
+            (incoming / "00000002.png").write_text("new-shot")
+            (outgoing / "00000002.png").write_text("rife-hybrid")
+            self.ffrife.suppress_scene_cut_interpolation(
+                incoming, outgoing, input_count=2, target_count=3, cuts=[1]
+            )
+            self.assertEqual((outgoing / "00000002.png").read_text(), "new-shot")
 
     def test_explicit_transition_ranges_are_seconds(self) -> None:
         self.assertEqual(self.ffrife.parse_transition_ranges("1.0:1.5, 3:4", 30, 200),
