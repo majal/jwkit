@@ -687,7 +687,7 @@ class SlverseSegmentCacheTest(unittest.TestCase):
         self.assertNotEqual(a, different_lang)
         self.assertEqual(a.parent, Path("/cache/ASL/segments"))
 
-    def test_download_segment_uses_copy_and_copyts_and_retries_on_failure(self) -> None:
+    def test_download_segment_uses_zero_based_output_seek_and_retries_on_failure(self) -> None:
         calls = []
 
         def fake_run_ffmpeg(args, duration=None):
@@ -715,10 +715,12 @@ class SlverseSegmentCacheTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(len(calls), 2)  # first attempt failed, second succeeded
         for args in calls:
-            self.assertIn("-copyts", args)
+            self.assertNotIn("-copyts", args)
             self.assertEqual(args[args.index("-c") + 1], "copy")
             self.assertEqual(args[0:2], ["-ss", "10.0"])
-            self.assertIn("-to", args)
+            self.assertEqual(args[args.index("-ss") + 1], "10.0")
+            self.assertEqual(args[args.index("-to") + 1], "20.0")
+            self.assertEqual(args[args.index("-reset_timestamps") + 1], "1")
 
     def test_resolve_segment_source_reuses_cached_file_without_fetching(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -778,6 +780,52 @@ class SlverseSegmentCacheTest(unittest.TestCase):
                 check=True, capture_output=True, text=True, timeout=30,
             )
             self.assertGreater(float(probe.stdout.strip()), 0)
+
+
+class SlverseDetectCaptionBoxTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def make_frame(self, crop, glyph_box, rgb=(235, 235, 235), background=(70, 70, 70)):
+        left, top, width, height = crop
+        gx, gy, gw, gh = glyph_box
+        buf = bytearray(background * (width * height))
+        # Synthetic separated strokes exercise normal spaces without making
+        # the fixture depend on Pillow/OpenCV or an installed font.
+        for x in range(gx, gx + gw, 12):
+            for yy in range(gy, gy + gh):
+                for xx in range(x, min(x + 7, gx + gw)):
+                    offset = ((yy - top) * width + (xx - left)) * 3
+                    buf[offset:offset + 3] = bytes(rgb)
+        return bytes(buf)
+
+    def test_detects_near_white_static_caption_from_majority_vote(self) -> None:
+        config = {"overlay_x": "93", "overlay_y": "54"}
+        crop = (48, 19, 500, 105)
+        frames = [self.make_frame(crop, (95, 56, 205, 24)) for _ in range(3)]
+        with mock.patch.object(self.slverse.subprocess, "run", side_effect=[argparse.Namespace(stdout=f) for f in frames]):
+            box = self.slverse.detect_caption_box("source.mp4", 0.0, 12.0, config)
+        self.assertEqual(box, (95, 56, 205, 24))
+
+    def test_colored_bright_foreground_is_not_mistaken_for_caption(self) -> None:
+        config = {"overlay_x": "93", "overlay_y": "54"}
+        crop = (48, 19, 500, 105)
+        frames = [self.make_frame(crop, (95, 56, 205, 24), rgb=(245, 175, 140)) for _ in range(3)]
+        with mock.patch.object(self.slverse.subprocess, "run", side_effect=[argparse.Namespace(stdout=f) for f in frames]):
+            self.assertIsNone(self.slverse.detect_caption_box("source.mp4", 0.0, 12.0, config))
+
+    def test_disagreement_falls_back_instead_of_guessing(self) -> None:
+        config = {"overlay_x": "93", "overlay_y": "54"}
+        crop = (48, 19, 500, 105)
+        frames = [self.make_frame(crop, box) for box in ((95, 56, 205, 24), (95, 75, 150, 15), (95, 35, 280, 35))]
+        with mock.patch.object(self.slverse.subprocess, "run", side_effect=[argparse.Namespace(stdout=f) for f in frames]):
+            self.assertIsNone(self.slverse.detect_caption_box("source.mp4", 0.0, 12.0, config))
+
+    def test_remote_source_uses_proxy_fallback_without_three_network_seeks(self) -> None:
+        with mock.patch.object(self.slverse.subprocess, "run") as run:
+            self.assertIsNone(self.slverse.detect_caption_box("https://example/verse.mp4", 0.0, 12.0, {}))
+        run.assert_not_called()
 
 
 class SlverseInternetAvailableTest(unittest.TestCase):
@@ -1059,6 +1107,15 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         self.assertNotIn("delogo=", result)
         self.assertIn("drawtext=text='XSL'", result)
 
+    def test_confident_pixel_box_replaces_proxy_dimensions(self) -> None:
+        result = self.slverse.build_overlay_filter(
+            "BVL", "Psalm", 16, "11", self.config(default_target_lang="FSL"),
+            show_box=False, source_labels=["Salmos 16:11"], detected_caption_box=(100, 57, 200, 24),
+        )
+        self.assertIn("delogo=x=98:y=55:w=204:h=28", result)
+        self.assertIn("drawtext=text='BVL'", result)
+        self.assertIn(":y=85:alpha=", result)
+
     def test_mid_transition_fade_dips_and_recovers(self) -> None:
         # A mid-range transition (source plays on into the next verse) isn't
         # a fade to black - the source's own caption fades out, holds blank,
@@ -1214,6 +1271,7 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         self.assertEqual(self.segment_download_calls, [])  # already cached - no fetch needed
         played_source = preview_calls[0][0][0]
         self.assertEqual(played_source, str(seg_path))
+        self.assertEqual(preview_calls[0][0][1:3], (0.0, 10.0))
 
     def test_preview_source_cache_downloads_whole_chapter_once_and_plays_local_path(self) -> None:
         preview_calls = []
@@ -1280,6 +1338,7 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         url, path, start, end = self.segment_download_calls[0]
         self.assertEqual((url, start, end), ("http://example/vid.mp4", 10.0, 20.0))
         self.assertEqual(extract_calls[0][0][0], str(path))  # extract_verse's source is the cached segment
+        self.assertEqual(extract_calls[0][0][2:4], (0.0, 10.0))
         self.assertEqual(extract_calls[0][1].get("remote"), False)
 
     def test_partial_range_is_accepted_by_default(self) -> None:
