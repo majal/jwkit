@@ -645,6 +645,30 @@ class FfrifeLongRunTest(unittest.TestCase):
         result = self.ffrife.batch_output_path(Path("clip.mov"), "done", "{stem}_smooth{suffix}")
         self.assertEqual(result, Path("done/clip_smooth.mov"))
 
+    def test_batch_default_output_name_keeps_the_source_name_unsuffixed(self) -> None:
+        # -O already separates outputs into their own directory, so the
+        # default template shouldn't need a _rife suffix to avoid a
+        # collision the way a bare single-file run does.
+        parser = self.ffrife.build_parser()
+        args = parser.parse_args(["batch", "in.mp4", "-O", "done"])
+        self.assertEqual(args.output_name, "{name}")
+        self.assertEqual(self.ffrife.batch_output_path(Path("clip.mov"), "done", args.output_name),
+                         Path("done/clip.mov"))
+
+    def test_run_output_flag_is_optional(self) -> None:
+        args = self.ffrife.build_parser().parse_args(["run", "in.mp4"])
+        self.assertIsNone(args.output)
+
+    def test_default_output_path_for_a_local_source_sits_beside_it_with_rife_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "clip.mov"
+            source.write_bytes(b"fake")
+            self.assertEqual(self.ffrife.default_output_path(str(source)), Path(td) / "clip_rife.mov")
+
+    def test_default_output_path_for_a_remote_source_uses_the_url_name_in_cwd(self) -> None:
+        result = self.ffrife.default_output_path("https://example.com/videos/clip.mp4?token=abc123")
+        self.assertEqual(result, Path("clip_rife.mp4"))
+
 
 class FfrifeCmdBenchmarkSampleTrimTest(unittest.TestCase):
     """Regression coverage for a real bug hit while actually using this:

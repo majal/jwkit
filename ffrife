@@ -11,7 +11,8 @@ other tools (e.g. `ffslow`'s --rife flag) can shell out to this CLI directly.
 
   ffrife setup                          interactive: download/configure the
                                          rife-ncnn-vulkan binary
-  ffrife <input> -o <output> [options]  interpolate
+  ffrife <input> [-o <output>] [opts]   interpolate (default output:
+                                         <input>_rife<ext> alongside it)
 
 Options:
   --start SS --end SS   trim window (seconds); omit to process the whole input
@@ -1212,6 +1213,24 @@ def batch_output_path(source, output_dir, suffix):
         rendered += source.suffix
     return Path(output_dir) / rendered
 
+def default_output_path(source):
+    """Where `ffrife run <input>` writes when -o is omitted: alongside a
+    local source, using the same {stem}_rife{suffix} naming batch mode used
+    to default to everywhere - or in the current directory (from the URL's
+    own filename) for a remote source, which has no local sibling
+    directory to use. Always keeps the _rife suffix, unlike batch's own
+    default (see batch's --output-name help) - batch's separate -O
+    directory usually makes a collision with the source unlikely, but a
+    bare single-file run with no -o has nowhere else to go."""
+    source_path = Path(str(source)).expanduser()
+    if source_path.exists():
+        directory, name_source = source_path.parent, source_path
+    else:
+        directory, name_source = Path("."), Path(urllib.parse.urlsplit(str(source)).path)
+    stem = name_source.stem or "output"
+    suffix = name_source.suffix or ".mp4"
+    return directory / f"{stem}_rife{suffix}"
+
 def apply_run_overrides(args, config):
     if getattr(args, "fallback", None):
         config["rife_fallback_engine"] = args.fallback
@@ -1292,7 +1311,7 @@ def build_parser():
 
     p_run = subparsers.add_parser("run", help="Interpolate a file (also the default when no subcommand is given)")
     p_run.add_argument("input", help="Local path or remote URL")
-    p_run.add_argument("-o", "--output", required=True)
+    p_run.add_argument("-o", "--output", help="Defaults to <input>_rife<ext> alongside the input")
     add_processing_arguments(p_run)
 
     p_batch = subparsers.add_parser("batch", aliases=["bulk"], help="Interpolate folders, globs, or file lists sequentially")
@@ -1300,7 +1319,9 @@ def build_parser():
     p_batch.add_argument("--glob", dest="patterns", action="append", default=[], help="Additional glob pattern; repeatable")
     p_batch.add_argument("--list", dest="list_files", action="append", default=[], help="Text file with one input path per line; repeatable")
     p_batch.add_argument("-O", "--output-dir", required=True)
-    p_batch.add_argument("--output-name", default="{stem}_rife{suffix}", help="Output template using {stem}, {suffix}, {name}")
+    p_batch.add_argument("--output-name", default="{name}", help="Output template using {stem}, {suffix}, {name} - "
+                         "defaults to the source's own name since -O already separates outputs into their own folder; "
+                         "the usual --on-exists handling still protects against actually colliding with the source")
     p_batch.add_argument("-r", "--recursive", action="store_true", help="Recurse through input folders and ** globs")
     p_batch.add_argument("--fail-fast", action="store_true", help="Stop the batch after the first failed file")
     add_processing_arguments(p_batch, include_trim=False)
@@ -1353,7 +1374,8 @@ def main():
             value = getattr(args, arg_name, None)
             if value is not None:
                 jwkit_config[config_key] = value
-        output = _jwkit_common.resolve_output_conflict(args.output, jwkit_config)
+        requested_output = args.output or default_output_path(args.input)
+        output = _jwkit_common.resolve_output_conflict(requested_output, jwkit_config)
         if output is None:
             sys.exit(1)
 
