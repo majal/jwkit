@@ -440,8 +440,19 @@ class FfrifeLongRunTest(unittest.TestCase):
         config.update({"rife_profile": "cool", "rife_threads": "1:3:2", "cooldown_seconds": "2.5"})
         policy = self.ffrife.resolve_rife_policy(config, 10)
         self.assertEqual(policy["rife_threads"], "1:3:2")
-        self.assertEqual(policy["chunk_frames"], "1200")
+        self.assertEqual(policy["chunk_frames"], "600")
         self.assertEqual(policy["cooldown_seconds"], "2.5")
+
+    def test_cool_profile_rests_twice_as_often_as_balanced(self) -> None:
+        # cool's whole point is thermal headroom - it should rest more
+        # often than balanced, not just carry less parallel load per chunk.
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        config["rife_profile"] = "cool"
+        cool_policy = self.ffrife.resolve_rife_policy(config, 10)
+        config["rife_profile"] = "balanced"
+        balanced_policy = self.ffrife.resolve_rife_policy(config, 10)
+        self.assertEqual(cool_policy["cooldown_seconds"], balanced_policy["cooldown_seconds"])
+        self.assertEqual(int(cool_policy["chunk_frames"]) * 2, int(balanced_policy["chunk_frames"]))
 
     def test_profile_convenience_flags(self) -> None:
         parser = self.ffrife.build_parser()
