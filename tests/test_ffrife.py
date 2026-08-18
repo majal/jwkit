@@ -435,6 +435,61 @@ class FfrifeLongRunTest(unittest.TestCase):
             self.assertEqual(policy["chunk_frames"], "1200")
             self.assertEqual(policy["cooldown_seconds"], "15")
 
+    def test_workload_scale_lowers_the_effective_long_run_threshold(self) -> None:
+        # A high-resolution clip (or one asking for a much higher target fps,
+        # or slow-motion via --speed) can take as long to RIFE-process as a
+        # much longer, plainer one - workload_scale rescales input_frame_count
+        # against REFERENCE_PIXELS/REFERENCE_FPS_RATIO so auto profile
+        # selection reflects that, not just a raw source frame count.
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        config["long_run_frames"] = "1000"
+        small_frame_count = 400  # below threshold at reference resolution/fps-ratio
+        reference_policy = self.ffrife.resolve_rife_policy(config, small_frame_count, workload_scale=1.0)
+        self.assertEqual(reference_policy["resolved_rife_profile"], "performance")
+        scaled_policy = self.ffrife.resolve_rife_policy(config, small_frame_count, workload_scale=4.0)
+        self.assertEqual(scaled_policy["resolved_rife_profile"], "balanced")
+
+    def test_workload_scale_shrinks_chunk_frames_proportionally(self) -> None:
+        # A high-workload run (high resolution, a high --fps target, or
+        # slow-motion --speed) should get smaller chunks too, not just an
+        # earlier auto->balanced switch - otherwise each chunk does
+        # proportionally more RIFE synthesis than the profile intended, and
+        # an interruption loses more of it.
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        config["rife_profile"] = "balanced"
+        baseline = self.ffrife.resolve_rife_policy(config, 10, workload_scale=1.0)
+        self.assertEqual(baseline["chunk_frames"], "1200")
+        scaled = self.ffrife.resolve_rife_policy(config, 10, workload_scale=4.0)
+        self.assertEqual(scaled["chunk_frames"], "300")
+
+    def test_workload_scale_leaves_performance_profile_unchunked(self) -> None:
+        # performance's chunk_frames=0 means "no chunking at all" - a high
+        # workload_scale must not turn that into chunking the profile never
+        # asked for; the auto threshold (covered above) is what promotes a
+        # high-workload run out of performance in the first place.
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        config["rife_profile"] = "performance"
+        scaled = self.ffrife.resolve_rife_policy(config, 10, workload_scale=4.0)
+        self.assertEqual(scaled["chunk_frames"], "0")
+
+    def test_workload_scale_does_not_override_an_explicit_chunk_frames(self) -> None:
+        # Matches every other profile-selected setting: an explicit value
+        # always wins over the profile's own default, unscaled.
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        config["rife_profile"] = "balanced"
+        config["chunk_frames"] = "500"
+        scaled = self.ffrife.resolve_rife_policy(config, 10, workload_scale=4.0)
+        self.assertEqual(scaled["chunk_frames"], "500")
+
+    def test_workload_scale_of_zero_does_not_divide_by_zero(self) -> None:
+        # Regression: a near-zero target frame count (e.g. a tiny clip at a
+        # very low --fps) can make workload_scale compute to exactly 0 -
+        # scaling chunk_frames by dividing by it must not crash.
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        config["rife_profile"] = "balanced"
+        scaled = self.ffrife.resolve_rife_policy(config, 10, workload_scale=0.0)
+        self.assertEqual(scaled["chunk_frames"], "1200")
+
     def test_low_level_settings_override_profile_independently(self) -> None:
         config = dict(self.ffrife.DEFAULT_CONFIG)
         config.update({"rife_profile": "cool", "rife_threads": "1:3:2", "cooldown_seconds": "2.5"})
@@ -481,6 +536,80 @@ class FfrifeLongRunTest(unittest.TestCase):
                 first_calls = list(calls)
                 self.ffrife._render_rife_chunks("rife", incoming, outgoing, 25, "model", config, root / "state.json")
             self.assertEqual(calls, first_calls)
+
+    def test_render_rife_frames_scales_threshold_by_source_resolution(self) -> None:
+        # render_rife_frames' chunked path probes the source's actual
+        # resolution and turns it into resolve_rife_policy's workload_scale -
+        # this pins that wiring, not resolve_rife_policy's own math (covered
+        # above by test_workload_scale_lowers_the_effective_long_run_threshold).
+        # fps=60 over a 30fps source matches REFERENCE_FPS_RATIO exactly, so
+        # the fps/speed factor contributes 1.0 here and workload_scale reduces
+        # to plain pixel_scale - the fps/speed contribution itself is pinned
+        # separately by test_render_rife_frames_scales_threshold_by_speed.
+        config = {"rife_binary_path": "/fake/rife", "chunk_frames": "auto", "cooldown_seconds": "auto",
+                  "rife_threads": "auto", "scene_detection": "false"}
+        captured = {}
+
+        def fake_resolve_rife_policy(cfg, frame_count, workload_scale=1.0):
+            captured["frame_count"] = frame_count
+            captured["workload_scale"] = workload_scale
+            return {**cfg, "resolved_rife_profile": "performance", "rife_threads": "auto",
+                    "chunk_frames": "0", "cooldown_seconds": "0"}
+
+        def fake_render_chunks(_rife_path, _in_frames, out_frames, _target_count, _model_path, _cfg, _state_path):
+            Path(out_frames).mkdir(parents=True, exist_ok=True)
+            (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
+
+        def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+            if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
+                (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
+
+        with tempfile.TemporaryDirectory() as td, \
+             patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+             patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
+             patch.object(self.ffrife, "probe_source_resolution", return_value=(1280, 720)), \
+             patch.object(self.ffrife, "resolve_rife_policy", fake_resolve_rife_policy), \
+             patch.object(self.ffrife, "_render_rife_chunks", fake_render_chunks):
+            self.ffrife.render_rife_frames("in.mp4", Path(td), config, fps=60)
+
+        self.assertAlmostEqual(captured["workload_scale"], (1280 * 720) / self.ffrife.REFERENCE_PIXELS)
+
+    def test_render_rife_frames_scales_threshold_by_speed(self) -> None:
+        # Half-speed slow-motion doubles RIFE's target output frame count for
+        # the same input/resolution - workload_scale must pick that up too,
+        # not just resolution (test above) or a plain fps upscale ratio.
+        config = {"rife_binary_path": "/fake/rife", "chunk_frames": "auto", "cooldown_seconds": "auto",
+                  "rife_threads": "auto", "scene_detection": "false"}
+        captured = {}
+
+        def fake_resolve_rife_policy(cfg, frame_count, workload_scale=1.0):
+            captured["workload_scale"] = workload_scale
+            return {**cfg, "resolved_rife_profile": "performance", "rife_threads": "auto",
+                    "chunk_frames": "0", "cooldown_seconds": "0"}
+
+        def fake_render_chunks(_rife_path, _in_frames, out_frames, _target_count, _model_path, _cfg, _state_path):
+            Path(out_frames).mkdir(parents=True, exist_ok=True)
+            (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
+
+        def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+            if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
+                (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
+
+        with tempfile.TemporaryDirectory() as td, \
+             patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+             patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
+             patch.object(self.ffrife, "probe_source_resolution", return_value=(640, 360)), \
+             patch.object(self.ffrife, "resolve_rife_policy", fake_resolve_rife_policy), \
+             patch.object(self.ffrife, "_render_rife_chunks", fake_render_chunks):
+            # fps=60 over a 30fps source is REFERENCE_FPS_RATIO's own 2.0x;
+            # speed=0.5 doubles the target count again on top of that, so
+            # workload_scale should come out to 2.0 (pixel_scale is 1.0 at
+            # the reference resolution).
+            self.ffrife.render_rife_frames("in.mp4", Path(td), config, fps=60, speed=0.5)
+
+        self.assertAlmostEqual(captured["workload_scale"], 2.0)
 
     def test_run_rife_passes_resource_controls(self) -> None:
         process = MagicMock()

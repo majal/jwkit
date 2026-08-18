@@ -109,7 +109,11 @@ DEFAULT_CONFIG = {
     "rife_threads": "auto",  # auto preserves upstream's 1:2:2 default
     "chunk_frames": "auto",  # profile-selected; 0 disables chunking
     "cooldown_seconds": "auto",  # profile-selected pause between chunks
-    "long_run_frames": "3600",  # auto switches to balanced at roughly 2m of 30fps input
+    "long_run_frames": "3600",  # auto switches to balanced at roughly 2m of 30fps->60fps 640x360 input;
+                                 # rescaled by actual resolution and target/source fps ratio (see
+                                 # REFERENCE_PIXELS/REFERENCE_FPS_RATIO/resolve_rife_policy), so a higher-
+                                 # resolution clip, a higher --fps target, or slow-motion --speed all cross
+                                 # the threshold at a proportionally lower source frame count
     "resume": "true",  # keep and reuse durable per-output work state
     "keep_work": "false",  # retain completed work state for inspection
     "scene_detection": "true",  # do not synthesize hybrid frames across hard cuts
@@ -126,6 +130,14 @@ DEFAULT_CONFIG = {
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".mts", ".m2ts"}
 RIFE_PROFILES = {
     "performance": {"rife_threads": "auto", "chunk_frames": "0", "cooldown_seconds": "0"},
+    # 15s is a reasoned middle ground, not a benchmarked one (unlike the
+    # 1:2:2 vs 1:1:1 threading choice above, which is - see docs/ffrife.md):
+    # thermal headroom is a function of ambient temperature and case/laptop
+    # airflow, which vary per machine and drift over time, so there's no
+    # single "correct" number a one-time benchmark on any given dev machine
+    # could hand every user. Tune with --cooldown if chunk timings (printed
+    # per-chunk) climb over a long run - that's the signal cooldown is too
+    # short for this machine right now.
     "balanced": {"rife_threads": "auto", "chunk_frames": "1200", "cooldown_seconds": "15"},
     # Half balanced's chunk size, same 15s rest: cool's whole point is
     # thermal headroom, so it should rest twice as often, not just carry
@@ -150,18 +162,63 @@ def config_float(config, key, default=0.0, minimum=0.0):
     except (TypeError, ValueError):
         return max(minimum, default)
 
-def resolve_rife_policy(config, input_frame_count):
+REFERENCE_PIXELS = 640 * 360  # resolution long_run_frames's default (3600) is calibrated against - see
+                               # resolve_rife_policy's workload_scale and the benchmark table in docs/ffrife.md
+REFERENCE_FPS_RATIO = 2.0     # target/source fps ratio implicit in that same calibration (--fps's own
+                               # default of 60 over a typical ~30fps source) - see workload_scale below
+
+def resolve_rife_policy(config, input_frame_count, workload_scale=1.0):
+    """`workload_scale` rescales `input_frame_count` to REFERENCE_PIXELS-
+    and REFERENCE_FPS_RATIO-equivalent frames before comparing against
+    long_run_frames, so the auto threshold approximates expected wall-clock
+    RIFE time rather than a raw source frame count. Two things drive actual
+    RIFE cost independently of input_frame_count: source resolution (a
+    short but high-resolution clip can take as long to process as a longer
+    low-resolution one - see the benchmark table in docs/ffrife.md, whose
+    two data points already sit at roughly the same pixels/second) and the
+    ratio between requested output frames and input frames, i.e.
+    target_count/input_frame_count (RIFE synthesizes target_count frames,
+    not input_frame_count ones - a higher --fps target or a --speed
+    slow-motion request that doubles the target count for the same input
+    doubles the actual synthesis work without changing input_frame_count at
+    all). Callers that can't cheaply determine either (or don't care, e.g.
+    batch mode's already-forced-balanced placeholder call) can omit it and
+    get the prior frame-count-only behavior.
+
+    A non-default workload_scale also rescales a profile-selected (not
+    explicitly overridden) chunk_frames by the same factor, floored at 2, so
+    each chunk keeps doing roughly the amount of actual RIFE synthesis work
+    the profile intended - otherwise a high-workload run would turn every
+    chunk into a proportionally longer, harder-to-interrupt stretch than
+    "balanced"/"cool" promise, without the chunk_frames number itself
+    reflecting that."""
     requested = str(config.get("rife_profile", "auto")).lower()
     if requested not in {"auto", *RIFE_PROFILES}:
         raise ValueError("rife_profile must be auto, performance, balanced, or cool")
     profile = requested
     if profile == "auto":
         threshold = config_int(config, "long_run_frames", 3600, minimum=2)
-        profile = "balanced" if config.get("_batch_mode") or input_frame_count >= threshold else "performance"
+        effective_frames = input_frame_count * workload_scale
+        profile = "balanced" if config.get("_batch_mode") or effective_frames >= threshold else "performance"
     effective = dict(config)
     for key, profile_value in RIFE_PROFILES[profile].items():
         configured = str(config.get(key, "auto")).lower()
-        effective[key] = profile_value if configured == "auto" else config.get(key)
+        if configured != "auto":
+            effective[key] = config.get(key)  # explicit override always wins, unscaled
+            continue
+        if key == "chunk_frames" and profile_value != "0" and workload_scale > 0 and workload_scale != 1.0:
+            # A profile's chunk_frames is a source-frame count tuned at
+            # workload_scale==1 (reference resolution/fps-ratio); rescale it
+            # by the same factor so each chunk keeps doing roughly the same
+            # amount of actual RIFE synthesis work the profile intended,
+            # regardless of this run's resolution/--fps/--speed - otherwise a
+            # high-workload run turns every chunk into a much longer,
+            # harder-to-interrupt stretch than "balanced"/"cool" promise.
+            # workload_scale==0 (a near-zero target frame count, e.g. a tiny
+            # clip at a very low --fps) is left unscaled rather than dividing
+            # by zero - there's essentially no RIFE work to size chunks for.
+            profile_value = str(max(2, round(int(profile_value) / workload_scale)))
+        effective[key] = profile_value
     effective["resolved_rife_profile"] = profile
     return effective
 
@@ -513,6 +570,18 @@ def probe_source_fps(source):
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return float(Fraction(result.stdout.strip()))
 
+def probe_source_resolution(source):
+    """Width/height of the source's first video stream. Used to scale
+    long_run_frames by expected per-frame RIFE cost (see resolve_rife_policy)
+    - a short but high-resolution clip can take as long to run as a longer
+    low-resolution one, so a raw frame-count threshold alone underestimates
+    it."""
+    cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries",
+           "stream=width,height", "-of", "csv=s=x:p=0", str(source)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    width, height = result.stdout.strip().split("x")
+    return int(width), int(height)
+
 def resolve_target_fps(fps_spec, source_fps):
     """`fps_spec` is either a plain literal target ('60') or a source-relative
     spec: 'Nx' ('2x', '2.5x') or 'N%' ('150%'), resolved against `source_fps`
@@ -863,7 +932,10 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     if "chunk_frames" not in config:
         run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
     else:
-        effective = resolve_rife_policy(config, input_frame_count)
+        width, height = probe_source_resolution(source)
+        pixel_scale = (width * height) / REFERENCE_PIXELS if width and height else 1.0
+        fps_scale = (target_count / input_frame_count) / REFERENCE_FPS_RATIO
+        effective = resolve_rife_policy(config, input_frame_count, workload_scale=pixel_scale * fps_scale)
         print(f"RIFE profile: {effective['resolved_rife_profile']} "
               f"(threads={effective['rife_threads']}, chunks={effective['chunk_frames']}, "
               f"cooldown={effective['cooldown_seconds']}s)")
