@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -1114,7 +1115,33 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         )
         self.assertIn("delogo=x=98:y=55:w=204:h=28", result)
         self.assertIn("drawtext=text='BVL'", result)
-        self.assertIn(":y=85:alpha=", result)
+        # Label offset is a fixed line-height (fontsize*1.3 - 5 = 44 at the
+        # default fontsize 34) below the detected caption's top (57), not
+        # the caption's own tight glyph height (24) - see build_overlay_filter.
+        self.assertIn(":y=96:alpha=", result)
+
+    def test_source_label_spacing_is_unaffected_by_caption_detection(self) -> None:
+        # Regression test: a confident pixel-detected box's *tight* glyph
+        # height must not be substituted into the label's vertical gap - it
+        # used to crowd the label right up against the caption's descenders
+        # once caption_detection replaced the old, generous proxy-font
+        # height for `h`. With the detected box's top pinned to the same
+        # position build_overlay_filter would otherwise assume (overlay_x/y),
+        # the label must land at the exact same y whether or not a confident
+        # box was detected - only the *source* of the height (tight glyph vs
+        # font-metric estimate) should differ, not the label's own spacing.
+        config = self.config(default_target_lang="FSL", sign_lang_ref_language="", show_source_lang_label="true")
+        without_detection = self.slverse.build_overlay_filter(
+            "XSL", "Psalm", 16, "11", config, show_box=False, source_labels=["  PSALM 16:11  "],
+        )
+        overlay_y = int(config["overlay_y"])
+        with_detection = self.slverse.build_overlay_filter(
+            "XSL", "Psalm", 16, "11", config, show_box=False, source_labels=["  PSALM 16:11  "],
+            detected_caption_box=(int(config["overlay_x"]), overlay_y, 200, 24),
+        )
+        label_y_without = re.search(r"drawtext=text='XSL'.*?:y=(\d+):", without_detection).group(1)
+        label_y_with = re.search(r"drawtext=text='XSL'.*?:y=(\d+):", with_detection).group(1)
+        self.assertEqual(label_y_without, label_y_with)
 
     def test_mid_transition_fade_dips_and_recovers(self) -> None:
         # A mid-range transition (source plays on into the next verse) isn't

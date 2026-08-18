@@ -1245,6 +1245,15 @@ def measure_text_size(text, font_path, fontsize):
             pass
     return round(len(text) * fontsize * 0.55), round(fontsize * 1.3)
 
+def wants_overlay(lang, config):
+    """Cheap early-exit check mirroring build_overlay_filter's own: False
+    only when `lang` exactly matches the configured default_target_lang, in
+    which case no overlay is drawn at all - so callers can skip the (several
+    subprocess calls deep) caption detection pass entirely instead of
+    running it just to have build_overlay_filter discard the result."""
+    target_lang = (config.get("default_target_lang") or "").strip().upper()
+    return not (target_lang and lang.upper() == target_lang)
+
 def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box, source_labels=None, fade_outs=None, detected_caption_box=None):
     """delogo (blur out the source video's own burned-in reference caption)
     + drawtext (the correct reference, in the caption position old ffv
@@ -1279,10 +1288,10 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     label), so every distinct one is measured and the box sized to the
     widest/tallest.
     """
+    if not wants_overlay(lang, config):
+        return None
     target_lang = (config.get("default_target_lang") or "").strip().upper()
     lang_u = lang.upper()
-    if target_lang and lang_u == target_lang:
-        return None
 
     ref_lang_map = parse_kv_config(config.get("sign_lang_ref_language", DEFAULT_CONFIG["sign_lang_ref_language"]))
     source_ref = ref_lang_map.get(lang_u)
@@ -1376,7 +1385,16 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
         filters += [delogo, drawtext]
 
     if show_label:
-        label_y = source_y + h + 4 if detected_caption_box else y + h - 5
+        # A dedicated line-height, not `h`: `h` is the caption's tight glyph
+        # box once pixel-detected (no built-in leading), whereas the old
+        # fallback's `h` came from a font-metric estimate (~fontsize*1.3,
+        # full line height) that happened to double as a comfortable gap.
+        # Swapping in the tighter detected `h` here crowded the label right
+        # up against the caption's descenders. Basing the gap on that same
+        # line-height constant regardless of detection keeps the label's
+        # spacing visually consistent whether or not caption_detection
+        # found a confident box.
+        label_y = source_y + round(fontsize * 1.3) - 5
         drawtext_ll = f"drawtext=text='{lang_u}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={label_y}:alpha='{fading_alpha(label_alpha)}'"
         filters.append(drawtext_ll)
 
@@ -1480,7 +1498,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
     mpv can accept libavfilter graphs, but its embedded FFmpeg may lack
     drawtext even when the external ffmpeg-full has it, so --play/-m makes a
     quick compatibility preview clip first."""
-    detected_box = detect_caption_box(source, start_time, end_time, config)
+    detected_box = detect_caption_box(source, start_time, end_time, config) if wants_overlay(lang, config) else None
     overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
     duration = end_time - start_time
 
@@ -1615,7 +1633,7 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     has_audio_stream - so this is usually moot in practice). Not combined
     with the rife engine here - ffrife owns its own PNG extraction and
     doesn't know about kept_segments."""
-    detected_box = detect_caption_box(source, start_time, end_time, config)
+    detected_box = detect_caption_box(source, start_time, end_time, config) if wants_overlay(lang, config) else None
     overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
     engine = config.get("interpolation_engine", "none")
     duration = end_time - start_time
