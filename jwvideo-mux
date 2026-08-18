@@ -142,7 +142,7 @@ def get_lang_meta(code: str) -> tuple[str, str]:
         
     # If not found, try to fetch from API on the fly
     try:
-        color_print(f"Language '{code_upper}' not found in cache. Fetching from jw.org...", "33")
+        color_print(f"Language '{code_upper}' not found in cache. Fetching from jw.org...", "yellow")
         url = 'https://b.jw-cdn.org/apis/mediator/v1/languages/E/all'
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req) as resp:
@@ -165,7 +165,7 @@ def get_lang_meta(code: str) -> tuple[str, str]:
             with open(cache_json_path, 'w', encoding='utf-8') as f:
                 json.dump(new_langs, f, indent=4)
         except Exception as e:
-            color_print(f"Warning: Could not save {cache_json_path}: {e}", "33")
+            color_print(f"Warning: Could not save {cache_json_path}: {e}", "yellow")
             
         _LOADED_LANGUAGES.update(new_langs)
         
@@ -173,19 +173,24 @@ def get_lang_meta(code: str) -> tuple[str, str]:
             return tuple(_LOADED_LANGUAGES[code_upper])
             
     except Exception as e:
-        color_print(f"Failed to fetch languages: {e}", "31")
+        color_print(f"Failed to fetch languages: {e}", "red")
 
     # Fallback
     return (code.lower()[:3], code_upper)
 
-def color_print(msg: str, color_code: str = ""):
-    rendered = msg if not (color_code and COLOR.enabled) else f"\033[{color_code}m{msg}\033[0m"
+def color_print(msg: str, color: str = ""):
+    """`color` names a _jwkit_common.Colorizer method (red, green, yellow,
+    cyan, header, ...) rather than a raw ANSI code, so jwvideo-mux's colors
+    - including what a major pipeline-step header looks like - are defined
+    in exactly one place (COLOR above) and can't drift from the rest of
+    jwkit's tools by editing this file alone."""
+    rendered = getattr(COLOR, color)(msg) if color else msg
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     print(rendered.encode(encoding, errors="replace").decode(encoding))
 
 def check_dependencies():
     if not shutil.which("ffmpeg"):
-        color_print("ffmpeg is not installed or not in PATH.", "31")
+        color_print("ffmpeg is not installed or not in PATH.", "red")
         ans = input("Would you like to try installing ffmpeg now? [Y/n] ")
         if ans.lower() not in ("n", "no"):
             if sys.platform == "darwin":
@@ -196,7 +201,7 @@ def check_dependencies():
                 os.system("winget install -e --id Gyan.FFmpeg")
             
             if not shutil.which("ffmpeg"):
-                color_print("Failed to install ffmpeg automatically. Please install it manually.", "31")
+                color_print("Failed to install ffmpeg automatically. Please install it manually.", "red")
                 sys.exit(1)
         else:
             sys.exit(1)
@@ -229,7 +234,7 @@ def fetch_media_params(input_str: str) -> dict:
         return {"docid": match.group(1)}
         
     try:
-        color_print("Fetching URL to extract docid...", "34")
+        color_print("Fetching URL to extract docid...", "cyan")
         req = urllib.request.Request(input_str, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req) as response:
             html = response.read().decode('utf-8', errors='ignore')
@@ -237,9 +242,9 @@ def fetch_media_params(input_str: str) -> dict:
             if match:
                 return {"docid": match.group(1)}
     except Exception as e:
-        color_print(f"Failed to fetch or parse URL: {e}", "31")
+        color_print(f"Failed to fetch or parse URL: {e}", "red")
     
-    color_print("Could not extract valid media parameters from the input.", "31")
+    color_print("Could not extract valid media parameters from the input.", "red")
     sys.exit(1)
 
 def get_media_links(params: dict, lang: str, res: str) -> dict:
@@ -254,7 +259,7 @@ def get_media_links(params: dict, lang: str, res: str) -> dict:
         with urllib.request.urlopen(req) as response:
             data = json.loads(response.read().decode('utf-8'))
     except Exception as e:
-        color_print(f"Failed to fetch metadata for language {lang}: {e}", "31")
+        color_print(f"Failed to fetch metadata for language {lang}: {e}", "red")
         return {}
         
     files = data.get('files', {}).get(lang, {})
@@ -295,15 +300,15 @@ def get_media_links(params: dict, lang: str, res: str) -> dict:
 
 def download_file(url: str, dest: Path):
     if dest.exists():
-        color_print(f"  Already exists: {dest.name}", "32")
+        color_print(f"  Already exists: {dest.name}", "green")
         return
-    color_print(f"  Downloading: {dest.name}...", "36")
+    color_print(f"  Downloading: {dest.name}...", "cyan")
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req) as response, open(dest, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
     except Exception as e:
-        color_print(f"  Failed to download {url}: {e}", "31")
+        color_print(f"  Failed to download {url}: {e}", "red")
         if dest.exists():
             dest.unlink()
 
@@ -1601,7 +1606,7 @@ def main():
         sub_langs = sub_langs_explicit
         
     if not vid_langs and not aud_langs and not sub_langs:
-        color_print("Error: You must specify at least one video, audio, or subtitle language.", "31")
+        color_print("Error: You must specify at least one video, audio, or subtitle language.", "red")
         sys.exit(1)
         
     all_langs = list(dict.fromkeys(vid_langs + aud_langs + sub_langs))
@@ -1612,7 +1617,7 @@ def main():
     local_files = {}
 
     if Path(args.input).is_file():
-        color_print("\n>> Local file mode detected. Skipping API downloads...", "34")
+        color_print("\n>> Local file mode detected. Skipping API downloads...", "header")
         # Keep a deliberately supplied symlink location intact. This makes
         # local-language staging possible without copying large source videos.
         base_vid_path = Path(args.input).absolute()
@@ -1688,22 +1693,22 @@ def main():
                         break
 
             if local_files[lang]:
-                color_print(f"  [{lang}] Found local: {', '.join(local_files[lang].keys())}", "32")
+                color_print(f"  [{lang}] Found local: {', '.join(local_files[lang].keys())}", "green")
             else:
-                color_print(f"  [{lang}] No matching local files found.", "33")
+                color_print(f"  [{lang}] No matching local files found.", "yellow")
                 
     else:
         # API Mode
         params = fetch_media_params(args.input)
-        color_print(f"Extracted media params: {params}", "32")
+        color_print(f"Extracted media params: {params}", "green")
         
         downloads = {}
         
-        color_print("\n>> Fetching media links...", "34")
+        color_print("\n>> Fetching media links...", "header")
         for lang in all_langs:
             links = get_media_links(params, lang, args.res)
             if not links:
-                color_print(f"  [{lang}] No media found.", "33")
+                color_print(f"  [{lang}] No media found.", "yellow")
                 continue
                 
             downloads[lang] = {}
@@ -1712,7 +1717,7 @@ def main():
                 if 'mp4' in links:
                     downloads[lang]['video'] = links['mp4']
                 else:
-                    color_print(f"  [{lang}] Error: Video requested but no MP4 found.", "31")
+                    color_print(f"  [{lang}] Error: Video requested but no MP4 found.", "red")
                     sys.exit(1)
             
             if lang in aud_langs and lang not in vid_langs:
@@ -1732,9 +1737,9 @@ def main():
             if 'audio (via MP4 fallback)' in downloads[lang]:
                 downloads[lang]['audio'] = downloads[lang].pop('audio (via MP4 fallback)')
                 
-            color_print(f"  [{lang}] Found {', '.join(log_keys)}", "32")
+            color_print(f"  [{lang}] Found {', '.join(log_keys)}", "green")
 
-        color_print("\n>> Downloading files...", "34")
+        color_print("\n>> Downloading files...", "header")
         for lang, media in downloads.items():
             local_files[lang] = {}
             for mtype, url in media.items():
@@ -1759,39 +1764,39 @@ def main():
         color_print(
             f"\n>> Only {len(video_paths)} comparable video language(s) resolved "
             f"({', '.join(video_paths) or 'none'}); nothing to analyze, so stopping here instead of muxing.",
-            "33",
+            "yellow",
         )
         return
     if any(variant_flags):
-        color_print("\n>> Analyzing video variants...", "34")
+        color_print("\n>> Analyzing video variants...", "header")
         try:
             variant_analysis = analyze_video_variants(
                 video_paths, min_seconds=args.variant_min_seconds,
                 scan_small_regions=args.scan_small_regions, region_count=args.region_count,
             )
         except (subprocess.CalledProcessError, ValueError, OSError) as exc:
-            color_print(f"Variant analysis failed: {exc}", "31")
+            color_print(f"Variant analysis failed: {exc}", "red")
             sys.exit(1)
         if args.manual_overrides:
             if not Path(args.input).is_file():
-                color_print("  --manual-overrides only applies in local-file mode; ignoring.", "33")
+                color_print("  --manual-overrides only applies in local-file mode; ignoring.", "yellow")
             else:
                 anchor_path = Path(args.input).absolute()
                 talk_folder = anchor_path.parent.parent.name
                 try:
                     overrides = load_manual_overrides(args.manual_overrides)
                 except Exception as exc:
-                    color_print(f"Failed to load --manual-overrides file: {exc}", "31")
+                    color_print(f"Failed to load --manual-overrides file: {exc}", "red")
                     sys.exit(1)
                 manual_video = find_manual_video_entry(overrides, talk_folder, anchor_path.name)
                 if manual_video is None:
                     color_print(
                         f"  No --manual-overrides entry found for folder={talk_folder!r} anchor={anchor_path.name!r}.",
-                        "33",
+                        "yellow",
                     )
                 else:
                     updated = apply_manual_overrides(variant_analysis, manual_video)
-                    color_print(f"  Applied manual overrides for: {', '.join(updated) or 'none'}", "36")
+                    color_print(f"  Applied manual overrides for: {', '.join(updated) or 'none'}", "cyan")
         if args.analyze_video_variants:
             print(json.dumps(variant_analysis, indent=2, sort_keys=True))
             return
@@ -1810,18 +1815,18 @@ def main():
                     f"\n>> No corroborated localized differences found (reference={reference}, "
                     f"review_recommended={review or 'none'}) -- nothing to adapt, so this is really just "
                     "one video. Falling back to an ordinary single-file mux with one shared video track "
-                    "instead of building an EDL library.", "34",
+                    "instead of building an EDL library.", "header",
                 )
                 args.dedupe_visually_same = True
                 # Fall through to the dedupe_visually_same / classic-mux code below (no early return).
             else:
                 library_dir = out_dir / sanitize_filename(video_paths[reference].stem)
-                color_print(f"\n>> Adaptive library plan: reference={reference}, localized={localized}, review_recommended={review or 'none'}", "34")
-                color_print(f"  Output directory: {library_dir}", "34")
+                color_print(f"\n>> Adaptive library plan: reference={reference}, localized={localized}, review_recommended={review or 'none'}", "header")
+                color_print(f"  Output directory: {library_dir}", "cyan")
                 if not args.force:
                     ans = input("Write the adaptive mpv library now? Source files are never modified or deleted. [y/N] ")
                     if ans.lower() not in ("y", "yes"):
-                        color_print("Aborting adaptive library export.", "31")
+                        color_print("Aborting adaptive library export.", "red")
                         return
                 manifest = build_adaptive_library(
                     reference=reference, video_paths=video_paths, variant_analysis=variant_analysis,
@@ -1830,13 +1835,13 @@ def main():
                     normalize_mismatched_aspect=args.normalize_mismatched_aspect,
                 )
                 for warning in manifest["warnings"]:
-                    color_print(f"  ! {warning}", "33")
+                    color_print(f"  ! {warning}", "yellow")
                 failed = [lang for lang, v in manifest["validation"].items() if v.get("ok") is False]
                 if failed:
-                    color_print(f"  mpv validation FAILED for: {', '.join(failed)} -- inspect manifest.json before use.", "31")
+                    color_print(f"  mpv validation FAILED for: {', '.join(failed)} -- inspect manifest.json before use.", "red")
                 else:
-                    color_print("  mpv validation passed for every language presentation.", "32")
-                color_print(f"✓ Adaptive library written to {library_dir}", "32")
+                    color_print("  mpv validation passed for every language presentation.", "green")
+                color_print(f"✓ Adaptive library written to {library_dir}", "green")
                 return
         if args.dedupe_identical_video:
             duplicate_langs = {
@@ -1845,7 +1850,7 @@ def main():
                 for lang in group[1:]
             }
             if duplicate_langs:
-                color_print(f"  Reusing shared video; omitted duplicate video tracks: {', '.join(sorted(duplicate_langs))}", "32")
+                color_print(f"  Reusing shared video; omitted duplicate video tracks: {', '.join(sorted(duplicate_langs))}", "green")
                 vid_langs = [lang for lang in vid_langs if lang not in duplicate_langs]
         if args.dedupe_visually_same:
             reference = variant_analysis["reference_language"]
@@ -1854,16 +1859,16 @@ def main():
                 if record["classification"] in {"exactly_same", "visually_same"}
             }
             if reusable:
-                color_print(f"  Verified reusable as '{reference}' video (SSIM+PSNR corroborated, or byte-identical): {', '.join(sorted(reusable))}", "36")
+                color_print(f"  Verified reusable as '{reference}' video (SSIM+PSNR corroborated, or byte-identical): {', '.join(sorted(reusable))}", "cyan")
                 if not args.force:
                     ans = input("  Omit these languages' own video tracks from the mux and reuse the reference instead? [y/N] ")
                     if ans.lower() not in ("y", "yes"):
                         reusable = set()
                 if reusable:
-                    color_print(f"  Reusing {reference} video after visual verification; omitted: {', '.join(sorted(reusable))}", "32")
+                    color_print(f"  Reusing {reference} video after visual verification; omitted: {', '.join(sorted(reusable))}", "green")
                     vid_langs = [lang for lang in vid_langs if lang == reference or lang not in reusable]
 
-    color_print("\n>> Muxing...", "34")
+    color_print("\n>> Muxing...", "header")
     
     # 1. Mux into a single multi-stream MKV/MP4
     ff_inputs = []
@@ -1951,7 +1956,7 @@ def main():
             if lang not in langs_loaded: langs_loaded.append(lang)
 
     if not langs_loaded:
-        color_print("No media to mux. Exiting.", "31")
+        color_print("No media to mux. Exiting.", "red")
         sys.exit(1)
 
     # Find a base file path for naming
@@ -1999,18 +2004,18 @@ def main():
                 jwkit_config[config_key] = value
     resolved_out_path = _jwkit_common.resolve_output_conflict(out_path, jwkit_config)
     if resolved_out_path is None:
-        color_print("Aborting muxing.", "31")
+        color_print("Aborting muxing.", "red")
         sys.exit(0)
     out_path = resolved_out_path
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + ff_inputs + ff_maps + ff_meta + ["-c:v", "copy", "-c:a", "copy", str(out_path)]
     
-    color_print(f"Creating merged {args.container.upper()}: {out_name}", "36")
+    color_print(f"Creating merged {args.container.upper()}: {out_name}", "cyan")
     res = subprocess.run(cmd)
     if res.returncode == 0:
-        color_print("✓ Merged video created successfully.", "32")
+        color_print("✓ Merged video created successfully.", "green")
     else:
-        color_print("✗ Merged video creation failed.", "31")
+        color_print("✗ Merged video creation failed.", "red")
 
     # Every path actually handed to ffmpeg as an -i input, across the merge above and the
     # single-stream loop below. This -- not "everything local-file discovery happened to resolve" --
@@ -2025,7 +2030,7 @@ def main():
         base_vid = local_files.get(base_vid_lang, {}).get('video')
 
         if base_vid:
-            color_print("\n>> Creating single-stream videos...", "34")
+            color_print("\n>> Creating single-stream videos...", "header")
             used_source_paths.add(str(base_vid))
             for lang in aud_langs:
                 if lang == base_vid_lang and len(aud_langs) == 1:
@@ -2043,7 +2048,7 @@ def main():
                             single_jwkit_config[config_key] = value
                 resolved_out_single = _jwkit_common.resolve_output_conflict(out_single, single_jwkit_config)
                 if resolved_out_single is None:
-                    color_print(f"Skipping {out_single.name}", "33")
+                    color_print(f"Skipping {out_single.name}", "yellow")
                     continue
                 out_single = resolved_out_single
 
@@ -2071,11 +2076,11 @@ def main():
 
                 cmd_single += maps + ["-c:v", "copy", "-c:a", "copy", str(out_single)]
                 subprocess.run(cmd_single)
-                color_print(f"  ✓ Single-stream created: {out_single.name}", "32")
+                color_print(f"  ✓ Single-stream created: {out_single.name}", "green")
 
     # Cleanup
     if args.cleanup:
-        color_print("\n>> Cleaning up source files actually used above (never anything merely discovered)...", "33")
+        color_print("\n>> Cleaning up source files actually used above (never anything merely discovered)...", "header")
         skipped_unused = []
         for lang, media in local_files.items():
             for mtype, path in media.items():
@@ -2086,13 +2091,13 @@ def main():
                     try:
                         path.unlink()
                     except Exception as e:
-                        color_print(f"  Failed to delete {path.name}: {e}", "31")
+                        color_print(f"  Failed to delete {path.name}: {e}", "red")
         if skipped_unused:
             color_print(
                 f"  Left {len(skipped_unused)} file(s) untouched (resolved but never used in any output): "
-                f"{', '.join(sorted(set(skipped_unused)))}", "36",
+                f"{', '.join(sorted(set(skipped_unused)))}", "cyan",
             )
-        color_print("  Cleanup complete.", "32")
+        color_print("  Cleanup complete.", "green")
 
 if __name__ == "__main__":
     main()
