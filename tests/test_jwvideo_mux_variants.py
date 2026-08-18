@@ -29,7 +29,7 @@ class VideoVariantPureLogicTest(unittest.TestCase):
         original_stdout = self.module.sys.stdout
         try:
             self.module.sys.stdout = console
-            self.module.color_print("✓ complete", "32")
+            self.module.color_print("✓ complete", "green")
             console.flush()
         finally:
             self.module.sys.stdout = original_stdout
