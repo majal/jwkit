@@ -119,6 +119,19 @@ Time every video encoder this machine's ffmpeg build actually has against a real
 ./ffrife benchmark --sample your-clip.mp4 --apply
 ```
 
+Interpolate a full video, changing nothing else - subtitles, chapters, extra audio tracks, embedded cover art, fonts/attachments, and global tags all carry over automatically:
+
+```bash
+./ffrife input.mkv -o output.mkv
+```
+
+Force a specific output container regardless of the source's own, or opt out of carrying over one particular thing for this run:
+
+```bash
+./ffrife input.mkv -o output.mp4 --container mp4
+./ffrife input.mkv -o output.mkv --no-subtitles --no-chapters
+```
+
 ## Important Behavior / Defaults
 
 - Global configuration is saved in `~/.config/jwkit/ffrife/config.toml` (separate from `slverse`'s own config - `slverse` bridges its own `hardware_encoder`/`video_crf`/etc. into a call to `ffrife` rather than needing them kept in sync across two files by hand).
@@ -154,6 +167,10 @@ Time every video encoder this machine's ffmpeg build actually has against a real
 - `ffrife setup` re-checks an already-configured RIFE install against this: it smoke-tests the configured binary+model with a couple of throwaway synthetic frames, and if that install predates the always-pass-`-n`/`-m` behavior above (or was pointed at an incompatible model), it explains why and offers to download+install a fresh release instead of just reporting "already configured."
 - `--speed` under 1 slows down, over 1 speeds up. RIFE generates the final retimed frame count directly (for example, half speed produces twice as many synthesized frames) rather than stretching timestamps and duplicating frames; the result still needs only the final merge encode.
 - `-o`/`--output` goes through the shared overwrite-conflict handling (`on_output_exists`/`--on-exists`, etc. - see the README's Output is colored.../overwrite paragraph) before `interpolate()` ever runs, same as every other jwkit tool.
+- On a plain `ffrife run`/`batch`, the only thing that changes versus the source is the frame rate: subtitles, chapters, extra audio tracks (alternate dubs, commentary), attachments (embedded fonts, etc.), embedded cover art/thumbnail, and global container tags (title, comment, encoder, ...) all carry over by default. The RIFE pipeline's frame-extraction + isolated-primary-audio merge cannot see those itself, so a second cheap remux reattaches them (skipped when the source has none). Each has its own `--no-<thing>`/`keep_<thing>` config toggle: `--no-subtitles`/`keep_subtitles`, `--no-chapters`/`keep_chapters`, `--no-extra-audio-tracks`/`keep_extra_audio_tracks`, `--no-attachments`/`keep_attachments`, `--no-thumbnail`/`keep_thumbnail`, `--no-source-metadata`/`keep_source_metadata`. Attachments are always dropped for an mp4/mov-family output because that container has no equivalent. A subtitle codec ffmpeg cannot convert for the target container falls back to dropping just subtitles/attachments rather than failing the interpolation.
+- `--start`/`--end` clips and rebases subtitle cues, chapter intervals, and secondary audio to the same zero-based output window. Chapters wholly outside the window are dropped; a chapter crossing a boundary is clipped to it. `--speed` still drops those time-sensitive extras because arbitrary subtitle formats cannot be losslessly retimed, while attachments/thumbnail/global tags remain eligible. The primary audio is decoded for a trimmed/retimed run, bounded with `atrim`, reset to zero with `asetpts`, and retimed before the final merge; this prevents copied source chapters/timestamps from extending the container after the final video frame. This carryover step never runs for a caller supplying its own `metadata_args` (as `slverse` does), because that caller owns the output tags/chapters.
+- MP4/MOV chapters normally appear in `ffprobe -show_streams` as an extra `bin_data` stream. That is ffmpeg's QuickTime-style chapter text track, not leaked source data or an interpolation regression; use `-show_chapters` to inspect the actual chapter boundaries.
+- `--container mp4`/`--container mkv` (or `container = "mp4"`/`"mkv"` in `config.toml`) overrides the output's file extension, regardless of what `-o` or the source's own extension would otherwise produce - useful for standardizing every output on one container without renaming `-o` by hand each time.
 
 ## Notes / Caveats
 

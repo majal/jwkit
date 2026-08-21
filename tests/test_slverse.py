@@ -1822,6 +1822,15 @@ class SlverseBuildSectionedFilterComplexTest(unittest.TestCase):
         self.assertIn("[base]trim=0:10,setpts=PTS-STARTPTS[v1];", fc)
         self.assertNotIn("[0:v]", fc)
 
+    def test_audio_sections_are_pitch_preserving_and_concatenated_with_video(self) -> None:
+        fc, _ = self.slverse.build_sectioned_filter_complex([10, 20], 0.5, "slow", "[0:v]", audio=True)
+        self.assertIn("[0:a]atrim=10:20,asetpts=PTS-STARTPTS[a2]", fc)
+        self.assertIn("[a2]atempo=0.5[ar2]", fc)
+        self.assertIn("[v1][a1][r2][ar2][v3][a3]concat=n=3:v=1:a=1[out][aout]", fc)
+
+    def test_audio_speed_over_atempo_limit_is_chained(self) -> None:
+        self.assertEqual(self.slverse.section_atempo_chain(3), "atempo=2,atempo=1.5")
+
 
 class SlverseExtractVerseSectionsTest(unittest.TestCase):
     # Fresh module per test - monkeypatches load_ffrife/build_overlay_filter/
@@ -1829,6 +1838,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.slverse = load_script_module("slverse")
         self.slverse.build_overlay_filter = lambda *a, **k: None  # overlay covered elsewhere
+        self.slverse.has_audio_stream = lambda source: False
 
     def test_fast_mode_uses_single_pass_filter_complex(self) -> None:
         calls = []
@@ -1843,7 +1853,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)  # exactly one ffmpeg pass, no per-section temp files
         cmd = calls[0]
         self.assertEqual(cmd[cmd.index("-ss") + 1], "10.0")
-        self.assertEqual(cmd[cmd.index("-to") + 1], "20.0")
+        self.assertEqual(cmd[cmd.index("-t") + 1], "10.0")
         fc = cmd[cmd.index("-filter_complex") + 1]
         self.assertIn("setpts=PTS/3", fc)
 
@@ -1860,6 +1870,23 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         fc = calls[0][calls[0].index("-filter_complex") + 1]
         self.assertIn("setpts=PTS/0.5", fc)
+
+    def test_non_rife_sectioned_audio_is_retimed_and_mapped(self) -> None:
+        calls = []
+        self.slverse.run_ffmpeg = lambda cmd, duration=None: calls.append(cmd)
+        self.slverse.has_audio_stream = lambda source: True
+        config = {"interpolation_engine": "none"}
+
+        self.slverse.extract_verse_sections(
+            "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
+            "fast", [5.0], 3,
+        )
+
+        cmd = calls[0]
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[0:a]atrim=0:5.0", fc)
+        self.assertIn("atempo=2,atempo=1.5", fc)
+        self.assertIn("[aout]", cmd)
 
     def test_slow_mode_with_rife_engine_delegates_per_section_to_ffrife(self) -> None:
         ffrife_calls = []
@@ -2030,6 +2057,45 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0][2], [(10.0, 14.0, None, True), (16.0, 20.0, None, True)])
         self.assertEqual(calls[0][0][3], 60.0)
+
+
+class SlversePreviewGroupingTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    @staticmethod
+    def row(lang, verse, found=True, start=None, end=None):
+        return {
+            "lang": lang, "chapter": 13, "verse": verse, "found": found,
+            "url": f"https://example/{lang}.mp4" if found else None,
+            "start": start if start is not None else verse * 10.0,
+            "end": end if end is not None else verse * 10.0 + 10.0,
+        }
+
+    def test_two_connected_verses_become_one_window_per_language(self) -> None:
+        rows = [self.row(lang, verse) for lang in ("ASL", "FSL", "INI", "SPE") for verse in (16, 17)]
+        groups = self.slverse.group_contiguous_preview_rows(rows)
+        self.assertEqual(len(groups), 4)
+        self.assertTrue(all(group["verses"] == [16, 17] for group in groups))
+        self.assertTrue(all(group["end"] - group["start"] == 20.0 for group in groups))
+
+    def test_missing_or_skipped_verse_never_gets_spanned(self) -> None:
+        groups = self.slverse.group_contiguous_preview_rows([
+            self.row("ASL", 16), self.row("ASL", 17, found=False), self.row("ASL", 18),
+        ])
+        self.assertEqual([group["verses"] for group in groups], [[16], [18]])
+
+    def test_preview_parallelism_has_config_and_short_and_long_flags(self) -> None:
+        parser = argparse.ArgumentParser()
+        self.slverse.add_find_parallel_argument(parser)
+        self.slverse.add_generic_config_overrides(parser)
+        short = parser.parse_args(["-j", "2"])
+        long = parser.parse_args(["--preview-max-parallel", "6"])
+        for args, expected in ((short, "2"), (long, "6")):
+            config = dict(self.slverse.DEFAULT_CONFIG)
+            self.slverse.apply_generic_config_overrides(args, config)
+            self.assertEqual(config["preview_max_parallel"], expected)
 
 
 class SlverseLaunchMpvTest(unittest.TestCase):

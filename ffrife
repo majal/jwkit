@@ -25,6 +25,21 @@ Options:
                           pass that extracts frames (no extra re-encode)
   --fallback E            none|framerate|minterpolate - what to do if RIFE
                           isn't installed/configured (default: none)
+  --container mp4|mkv     output container - overrides -o/the source's own
+                          extension
+
+On a plain untrimmed, unretimed run, the ONLY thing
+that changes is the frame rate: subtitles, chapters, attachments (fonts,
+etc.), extra audio tracks, embedded cover art, and global container tags all
+carry over from the source by default, same as a plain ffmpeg passthrough
+would. Each has its own --no-<thing>/keep_<thing> config flag to drop it
+instead (--no-subtitles, --no-chapters, --no-extra-audio-tracks,
+--no-attachments, --no-thumbnail, --no-source-metadata); attachments are
+always dropped for an mp4/mov-family container regardless, since that
+container format has no equivalent. --start/--end clip and rebase the
+time-sensitive streams; --speed drops them because arbitrary subtitle
+formats cannot be retimed losslessly. Attachments/thumbnail/source-metadata
+have no time dimension and remain eligible.
 """
 import argparse
 import glob
@@ -125,6 +140,52 @@ DEFAULT_CONFIG = {
     "transition_sensitivity": "1.35",  # change magnitude relative to recent motion
     "transition_alignment": "0.80",  # successive pixel-change vector cosine similarity
     "transition_ranges": "",  # explicit START:END seconds, comma-separated
+    "container": "",  # mp4, mkv, or empty to keep whatever extension -o/the default output path already has
+    "keep_subtitles": "true",  # carry over source subtitle tracks; trimmed runs clip/rebase them, while --speed drops them because cue retiming is not lossless
+    "keep_chapters": "true",  # carry over source chapter marks; trimmed runs clip/rebase them, while --speed drops them
+    "keep_extra_audio_tracks": "true",  # carry over audio tracks beyond the first; trimmed runs clip/rebase them, while --speed drops them
+    "keep_attachments": "true",  # carry over non-image attachments (embedded fonts, etc.) - always attempted regardless of trim/speed; dropped automatically for an mp4/mov-family container, which doesn't support them
+    "keep_thumbnail": "true",  # carry over embedded cover art/thumbnail - always attempted regardless of trim/speed
+    "keep_source_metadata": "true",  # carry over global container tags (title, comment, encoder, ...) - always attempted regardless of trim/speed
+}
+
+# One-line description per DEFAULT_CONFIG key, shown by 'ffrife config
+# list'/'ffrife config get <key>' so the full config surface is discoverable
+# without opening this file - see slverse's identical CONFIG_HELP pattern.
+CONFIG_HELP = {
+    "rife_binary_path": "Path to the rife-ncnn-vulkan executable (set by 'ffrife setup')",
+    "rife_fallback_engine": "none, framerate, or minterpolate - what to do when RIFE isn't installed/configured",
+    "rife_model": "RIFE model directory name; must support custom -n/-m (rife-v4 or rife-v4.6)",
+    "hardware_encoder": "cpu, videotoolbox, nvenc, or qsv",
+    "video_codec": "h264, hevc, or av1 - falls back down the tier automatically if unavailable",
+    "video_crf": "Encode quality (lower = higher quality/larger file); auto uses the codec's own default",
+    "video_preset": "ffmpeg encoder preset (e.g. slow, medium, fast)",
+    "ffmpeg_binary": "Override ffmpeg binary auto-detection",
+    "ffprobe_binary": "Override ffprobe binary auto-detection",
+    "rife_profile": "auto, performance, balanced, or cool - long-run chunking/cooldown policy",
+    "rife_gpu": "auto, cpu, or a numeric GPU id",
+    "rife_threads": "RIFE load:process:save threads; auto lets the profile choose",
+    "chunk_frames": "Source frames per resumable chunk; auto uses the profile's own value, 0 disables chunking",
+    "cooldown_seconds": "Seconds to rest between chunks; auto uses the profile's own value",
+    "long_run_frames": "Source frame count (at reference resolution/fps-ratio) above which rife_profile=auto picks balanced instead of performance",
+    "resume": "Keep and reuse durable per-output work state so an interrupted run can pick back up",
+    "keep_work": "Retain completed work state (extracted/interpolated frames) after a successful run, for inspection",
+    "scene_detection": "Detect hard cuts and replace RIFE's hybrid frames there instead of interpolating across them",
+    "scene_threshold": "Spike multiplier over recent motion needed to flag a hard cut; lower is more sensitive",
+    "scene_floor": "Absolute pixel-change floor below which nothing can be flagged as a hard cut",
+    "scene_revert_fraction": "How much a neighboring frame's motion must fall relative to a spike's own size to still count it as an isolated cut",
+    "gradual_transition_detection": "Also detect fades/dissolves, not just hard cuts",
+    "transition_min_duration": "Seconds of baseline lookback used to judge a gradual transition (not a minimum transition length)",
+    "transition_sensitivity": "Change magnitude relative to recent motion needed to flag a gradual transition",
+    "transition_alignment": "Required cosine similarity between successive pixel-change vectors for a gradual transition",
+    "transition_ranges": "Explicit START:END second ranges to protect from interpolation, comma-separated",
+    "container": "mp4, mkv, or empty to keep whatever extension -o/the default output path already has",
+    "keep_subtitles": "Carry over source subtitle tracks; --start/--end clips and rebases them",
+    "keep_chapters": "Carry over source chapter marks; --start/--end clips and rebases them",
+    "keep_extra_audio_tracks": "Carry over audio tracks beyond the first; --start/--end clips and rebases them",
+    "keep_attachments": "Carry over non-image attachments (embedded fonts, etc.); always attempted, but dropped automatically for an mp4/mov-family container, which doesn't support them",
+    "keep_thumbnail": "Carry over embedded cover art/thumbnail; always attempted regardless of trim/speed",
+    "keep_source_metadata": "Carry over global container tags (title, comment, encoder, ...); always attempted regardless of trim/speed",
 }
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".mts", ".m2ts"}
@@ -582,6 +643,370 @@ def probe_source_resolution(source):
     width, height = result.stdout.strip().split("x")
     return int(width), int(height)
 
+# --- Source "extras": everything a full-video source can carry that the
+# RIFE frame+isolated-audio merge (and the ffmpeg fallback's own -map-less
+# default stream selection) has no way to see: extra audio tracks,
+# subtitles, chapters, attachments (fonts, etc.), and embedded cover art.
+# carry_over_source_extras below reattaches whatever this finds.
+COVER_ART_CODECS = {  # codec_name -> (extension, mimetype) for extracting + reattaching embedded cover art
+    "mjpeg": (".jpg", "image/jpeg"),
+    "png": (".png", "image/png"),
+    "bmp": (".bmp", "image/bmp"),
+    "gif": (".gif", "image/gif"),
+}
+MP4_LIKE_CONTAINERS = {".mp4", ".m4v", ".mov", ".m4a"}
+
+def describe_source_extras(source):
+    """Probe `source` for everything beyond its primary video+first-audio
+    track: extra audio stream indices, subtitle/attachment stream counts, an
+    embedded cover-art stream (ffmpeg surfaces this as a video stream with
+    the attached_pic disposition, distinct from a real codec_type=attachment
+    like an embedded font - confirmed empirically, not documented anywhere
+    obvious), and whether the source has any chapters at all."""
+    cmd = [FFPROBE_BIN, "-v", "error", "-show_entries",
+           "stream=index,codec_type,codec_name:stream_disposition=attached_pic",
+           "-of", "json", str(source)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    streams = json.loads(result.stdout).get("streams", [])
+    audio = [s for s in streams if s.get("codec_type") == "audio"]
+    subtitle_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
+    subtitle_count = len(subtitle_streams)
+    attachment_count = sum(1 for s in streams if s.get("codec_type") == "attachment")
+    cover = next((s for s in streams if s.get("codec_type") == "video"
+                  and s.get("disposition", {}).get("attached_pic")), None)
+
+    chapters_cmd = [FFPROBE_BIN, "-v", "error", "-show_chapters", "-of", "json", str(source)]
+    chapters_result = subprocess.run(chapters_cmd, capture_output=True, text=True, check=True)
+    chapter_count = len(json.loads(chapters_result.stdout).get("chapters", []))
+
+    return {
+        "extra_audio_indices": [s["index"] for s in audio[1:]],
+        "subtitle_indices": [s["index"] for s in subtitle_streams],
+        "subtitle_count": subtitle_count,
+        "attachment_count": attachment_count,
+        "cover": {"index": cover["index"], "codec_name": cover.get("codec_name")} if cover else None,
+        "chapter_count": chapter_count,
+    }
+
+def has_any_extras(extras):
+    return bool(extras["extra_audio_indices"] or extras["subtitle_count"]
+                or extras["attachment_count"] or extras["cover"] or extras["chapter_count"])
+
+def _extract_cover_art(source, cover, work_dir):
+    """Pull the source's embedded cover-art stream out to its own small
+    image file, so it can be reattached with whichever mechanism the target
+    container actually needs (see carry_over_source_extras) instead of
+    trying to map it directly out of `source` alongside everything else."""
+    ext, _mimetype = COVER_ART_CODECS.get(cover["codec_name"], (".jpg", "image/jpeg"))
+    cover_path = Path(work_dir) / f"cover{ext}"
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y",
+           "-i", str(source), "-map", f"0:{cover['index']}", "-frames:v", "1"]
+    # An unrecognized still-image codec is re-encoded to plain jpeg rather
+    # than copied verbatim, so reattaching it below always has a codec the
+    # target container actually supports.
+    cmd += ["-c", "copy"] if cover["codec_name"] in COVER_ART_CODECS else ["-c:v", "mjpeg"]
+    cmd += [str(cover_path)]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return cover_path
+
+def source_window_args(start=None, end=None):
+    """Input-side ffmpeg arguments for an exact source window.
+
+    ``-to`` after an input ``-ss`` is easy to misread and, with copied
+    streams carrying source timestamps/chapters, has produced containers
+    whose duration outlived their video. Express the endpoint as a duration
+    instead. The caller is still responsible for rebasing copied timestamps
+    or decoding audio when sample-exact duration matters.
+    """
+    args = []
+    if start is not None:
+        args += ["-ss", str(start)]
+    if end is not None:
+        duration = end - (start or 0.0)
+        if duration <= 0:
+            raise ValueError("--end must be greater than --start")
+        args += ["-t", str(duration)]
+    return args
+
+
+def _ffmetadata_escape(value):
+    return str(value).replace("\\", "\\\\").replace("\n", "\\\n").replace("=", "\\=").replace(";", "\\;").replace("#", "\\#")
+
+
+def _srt_seconds(value):
+    hours, minutes, rest = value.replace(".", ",").split(":")
+    seconds, millis = rest.split(",")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000
+
+
+def _srt_timestamp(seconds):
+    millis = max(0, round(seconds * 1000))
+    hours, millis = divmod(millis, 3_600_000)
+    minutes, millis = divmod(millis, 60_000)
+    secs, millis = divmod(millis, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def clip_srt_file(source_path, output_path, start, end):
+    """Clip SRT cues against a source window and rebase them to zero."""
+    text = Path(source_path).read_text(encoding="utf-8-sig", errors="replace")
+    window_start = float(start or 0.0)
+    window_end = float(end) if end is not None else float("inf")
+    timing = re.compile(r"(?m)^(\d{2,}:\d{2}:\d{2}[,.]\d{3})\s+-->\s+(\d{2,}:\d{2}:\d{2}[,.]\d{3})(.*)$")
+    output_blocks = []
+    for block in re.split(r"\r?\n\s*\r?\n", text.strip()):
+        match = timing.search(block)
+        if not match:
+            continue
+        cue_start, cue_end = _srt_seconds(match.group(1)), _srt_seconds(match.group(2))
+        clipped_start, clipped_end = max(cue_start, window_start), min(cue_end, window_end)
+        if clipped_end <= clipped_start:
+            continue
+        body = block[match.end():].lstrip("\r\n")
+        output_blocks.append(
+            f"{len(output_blocks) + 1}\n{_srt_timestamp(clipped_start - window_start)} --> "
+            f"{_srt_timestamp(clipped_end - window_start)}{match.group(3)}\n{body}"
+        )
+    Path(output_path).write_text("\n\n".join(output_blocks) + ("\n" if output_blocks else ""), encoding="utf-8")
+    return bool(output_blocks)
+
+
+def write_clipped_chapters(source, start, end, work_dir):
+    """Write source chapters intersecting ``[start, end)`` on a zero-based
+    timeline. Chapters crossing either boundary are clipped, and chapters
+    wholly outside it are omitted."""
+    cmd = [FFPROBE_BIN, "-v", "error", "-show_chapters", "-of", "json", str(source)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    chapters = json.loads(result.stdout).get("chapters", [])
+    window_start = float(start or 0.0)
+    window_end = float(end) if end is not None else float("inf")
+    lines = [";FFMETADATA1"]
+    kept = 0
+    for chapter in chapters:
+        chapter_start = float(chapter.get("start_time", 0.0))
+        chapter_end = float(chapter.get("end_time", chapter_start))
+        clipped_start = max(chapter_start, window_start)
+        clipped_end = min(chapter_end, window_end)
+        if clipped_end <= clipped_start:
+            continue
+        kept += 1
+        lines += [
+            "[CHAPTER]", "TIMEBASE=1/1000",
+            f"START={round((clipped_start - window_start) * 1000)}",
+            f"END={round((clipped_end - window_start) * 1000)}",
+        ]
+        for key, value in chapter.get("tags", {}).items():
+            lines.append(f"{_ffmetadata_escape(key)}={_ffmetadata_escape(value)}")
+    if not kept:
+        return None
+    path = Path(work_dir) / "chapters.ffmetadata"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def prepare_clipped_stream_extras(source, extras, start, end, work_dir, *, want_subtitles, want_extra_audio):
+    """Clip/rebase subtitle and secondary-audio streams into a small
+    Matroska sidecar. Subtitle streams are normalized to SRT then cues are
+    explicitly clipped; audio is decoded through atrim/asetpts. Input-side
+    stream copy alone cannot enforce either boundary correctly."""
+    if not (want_subtitles or want_extra_audio):
+        return None, False
+    work_dir = Path(work_dir)
+    clipped_subtitles = []
+    if want_subtitles:
+        for position, index in enumerate(extras.get("subtitle_indices", [])):
+            raw = work_dir / f"subtitle-{position}-source.srt"
+            clipped = work_dir / f"subtitle-{position}-clipped.srt"
+            extract = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(source),
+                       "-map", f"0:{index}", "-c:s", "srt", str(raw)]
+            try:
+                subprocess.run(extract, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError:
+                # Bitmap or otherwise non-text subtitles may not convert to
+                # SRT. Keep processing the other streams; carryover's normal
+                # contract is that an unsupported subtitle never sinks the
+                # finished interpolation.
+                continue
+            if clip_srt_file(raw, clipped, start, end):
+                clipped_subtitles.append(clipped)
+    if not clipped_subtitles and not want_extra_audio:
+        return None, False
+    path = work_dir / "timed-extras.mkv"
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y"] + source_window_args(start, end) + ["-i", str(source)]
+    for subtitle in clipped_subtitles:
+        cmd += ["-i", str(subtitle)]
+    audio_maps = []
+    if want_extra_audio:
+        filters = []
+        duration = (end - (start or 0.0)) if end is not None else None
+        for position, index in enumerate(extras["extra_audio_indices"]):
+            chain = f"[0:{index}]"
+            if duration is not None:
+                chain += f"atrim=duration={duration:.12g},"
+            chain += f"asetpts=PTS-STARTPTS[extraa{position}]"
+            filters.append(chain)
+            audio_maps += ["-map", f"[extraa{position}]"]
+        cmd += ["-filter_complex", ";".join(filters)] + audio_maps
+    for input_index in range(1, len(clipped_subtitles) + 1):
+        cmd += ["-map", f"{input_index}:s:0"]
+    cmd += ["-map_metadata", "0", "-map_chapters", "-1"]
+    if want_extra_audio:
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
+    if clipped_subtitles:
+        cmd += ["-c:s", "srt"]
+    cmd += [str(path)]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return path, bool(clipped_subtitles)
+
+
+def _build_remux_cmd(encoded_file, source, output_file, extras, container, cover_path, *,
+                      want_subtitles, want_attachments, want_chapters, want_extra_audio, want_metadata,
+                      timed_extras=None, chapters_file=None):
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y",
+           "-i", str(encoded_file), "-i", str(source)]
+    timed_input = None
+    chapters_input = None
+    if timed_extras:
+        timed_input = 2
+        cmd += ["-i", str(timed_extras)]
+    if chapters_file:
+        chapters_input = 2 + bool(timed_extras)
+        cmd += ["-f", "ffmetadata", "-i", str(chapters_file)]
+    maps = ["-map", "0:v:0", "-map", "0:a:0?"]
+    # Every stream type gets its own explicit -c:<type>, never a blanket -c
+    # copy - ffmpeg applies a later, narrower -c:s/-c:v:N over an earlier
+    # blanket one just fine, but warns about it on every single run
+    # ("Multiple -codec options specified..."), which reads as something
+    # having gone wrong when it hasn't.
+    codec_args = ["-c:v", "copy", "-c:a", "copy"]
+    if want_extra_audio:
+        if timed_input is not None:
+            maps += ["-map", f"{timed_input}:a?"]
+        else:
+            for index in extras["extra_audio_indices"]:
+                maps += ["-map", f"1:{index}?"]
+    if want_subtitles:
+        maps += ["-map", f"{timed_input if timed_input is not None else 1}:s?"]
+        codec_args += ["-c:s", "mov_text" if container in MP4_LIKE_CONTAINERS else "copy"]
+    if want_attachments:
+        maps += ["-map", "1:t?"]
+        codec_args += ["-c:t", "copy"]
+    meta_args = ["-map_chapters", str(chapters_input if chapters_input is not None else 1) if want_chapters else "-1",
+                 "-map_metadata", "1" if want_metadata else "-1"]
+    thumbnail_args = []
+    if cover_path:
+        if container in MP4_LIKE_CONTAINERS:
+            cover_input = 2 + bool(timed_extras) + bool(chapters_file)
+            cmd += ["-i", str(cover_path)]
+            maps += ["-map", f"{cover_input}:v:0"]
+            codec_args += ["-disposition:v:1", "attached_pic"]
+        else:
+            # Matroska has no equivalent of the mp4-style attached_pic video
+            # stream (confirmed empirically: -disposition:v:N attached_pic is
+            # silently dropped by the matroska muxer) - cover art there is a
+            # real Attachment element instead, written with -attach. Its
+            # attachment-stream index follows whatever real attachments (see
+            # want_attachments above) were already mapped ahead of it.
+            attachment_slot = extras["attachment_count"] if want_attachments else 0
+            thumbnail_args = ["-attach", str(cover_path), f"-metadata:s:t:{attachment_slot}", "mimetype=image/jpeg"]
+    return cmd + maps + codec_args + meta_args + thumbnail_args + [str(output_file)]
+
+def carry_over_source_extras(source, encoded_file, output_file, config, extras, start=None, end=None, speed=None):
+    """Second, cheap stream-copy pass that reattaches everything the primary
+    encode (RIFE's frame+isolated-audio merge, or the ffmpeg fallback's own
+    -map-less default stream selection) had no way to carry over from
+    `source`: extra audio tracks, subtitles, attachments, chapters, global
+    container tags, and embedded cover art. `encoded_file` is the already
+    fps-changed video+first-audio output; `extras` is describe_source_extras's
+    result for `source`. Moves `encoded_file` straight to `output_file`
+    with no extra pass at all if nothing configured to keep is actually
+    present in the source.
+
+    A --start/--end window clips and rebases subtitles, chapters, and extra
+    audio tracks before this remux. --speed still drops those time-sensitive
+    streams: retiming arbitrary subtitle formats losslessly is not generally
+    possible. Global metadata, attachments, and the thumbnail have no time
+    dimension, so those remain eligible in either case.
+
+    Falls back to retrying once with subtitles/attachments dropped if the
+    full remux fails - a bitmap subtitle codec (e.g. DVD/PGS) can't convert
+    to mp4's mov_text, and an unusual attachment codec may not be one the
+    target container supports either; neither should sink an otherwise-good
+    interpolation over a side channel."""
+    container = Path(output_file).suffix.lower()
+    retimed = bool(speed and speed != 1)
+    trimmed = start is not None or end is not None
+    want_subtitles = not retimed and config_bool(config, "keep_subtitles", True) and extras["subtitle_count"] > 0
+    want_attachments = (config_bool(config, "keep_attachments", True) and extras["attachment_count"] > 0
+                        and container not in MP4_LIKE_CONTAINERS)
+    want_chapters = not retimed and config_bool(config, "keep_chapters", True) and extras["chapter_count"] > 0
+    want_extra_audio = (not retimed and config_bool(config, "keep_extra_audio_tracks", True)
+                        and bool(extras["extra_audio_indices"]))
+    want_thumbnail = config_bool(config, "keep_thumbnail", True) and extras["cover"] is not None
+    want_metadata = config_bool(config, "keep_source_metadata", True)
+
+    if not (want_subtitles or want_attachments or want_chapters or want_extra_audio or want_thumbnail or want_metadata):
+        shutil.move(str(encoded_file), str(output_file))
+        return
+
+    def _last_error_line(exc):
+        detail = (exc.stderr or "").strip().splitlines()
+        return detail[-1] if detail else str(exc)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="ffrife-remux-"))
+    try:
+        timed_extras = None
+        chapters_file = None
+        if trimmed:
+            timed_extras, subtitles_kept = prepare_clipped_stream_extras(
+                source, extras, start, end, work_dir,
+                want_subtitles=want_subtitles, want_extra_audio=want_extra_audio,
+            )
+            if want_subtitles and not subtitles_kept:
+                want_subtitles = False
+            chapters_file = write_clipped_chapters(source, start, end, work_dir) if want_chapters else None
+            if want_chapters and chapters_file is None:
+                want_chapters = False
+        try:
+            cover_path = _extract_cover_art(source, extras["cover"], work_dir) if want_thumbnail else None
+        except subprocess.CalledProcessError as exc:
+            print(f"Note: couldn't extract the source's embedded cover art ({_last_error_line(exc)}) - skipping it.")
+            cover_path = None
+            want_thumbnail = False
+
+        cmd = _build_remux_cmd(encoded_file, source, output_file, extras, container, cover_path,
+                               want_subtitles=want_subtitles, want_attachments=want_attachments,
+                               want_chapters=want_chapters, want_extra_audio=want_extra_audio,
+                               want_metadata=want_metadata, timed_extras=timed_extras,
+                               chapters_file=chapters_file)
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            if not (want_subtitles or want_attachments):
+                # Nothing left to drop and retry without - fall through to
+                # the outer handler below, which keeps the good encode
+                # rather than losing it over a side channel.
+                raise
+            print(f"Note: metadata remux failed with subtitles/attachments included "
+                  f"({_last_error_line(exc)}) - retrying without them.")
+            cmd = _build_remux_cmd(encoded_file, source, output_file, extras, container, cover_path,
+                                   want_subtitles=False, want_attachments=False,
+                                   want_chapters=want_chapters, want_extra_audio=want_extra_audio,
+                                   want_metadata=want_metadata, timed_extras=timed_extras,
+                                   chapters_file=chapters_file)
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        # Even the reduced retry (or the only attempt, if there was nothing
+        # left to drop) failed - keep the already-good interpolated video
+        # rather than losing it: fall back to the pre-carryover behavior of
+        # just delivering the plain encode, with no metadata attached.
+        print(f"Note: metadata remux failed ({_last_error_line(exc)}) - delivering the plain encode with no source metadata attached.")
+        shutil.move(str(encoded_file), str(output_file))
+    else:
+        Path(encoded_file).unlink(missing_ok=True)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
 def resolve_target_fps(fps_spec, source_fps):
     """`fps_spec` is either a plain literal target ('60') or a source-relative
     spec: 'Nx' ('2x', '2.5x') or 'N%' ('150%'), resolved against `source_fps`
@@ -889,11 +1314,7 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     out_frames = frames_root / "out"
     in_frames.mkdir(parents=True)
     out_frames.mkdir(parents=True)
-    trim_args = []
-    if start is not None:
-        trim_args += ["-ss", str(start)]
-    if end is not None:
-        trim_args += ["-to", str(end)]
+    trim_args = source_window_args(start, end)
     duration = (end - start) if (start is not None and end is not None) else None
     extract_cmd = trim_args + ["-i", str(source)]
     if vf:
@@ -992,13 +1413,33 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
     else:
         fps = float(fps)
     duration = (end - start) if (start is not None and end is not None) else None
-    trim_args = []
-    if start is not None:
-        trim_args += ["-ss", str(start)]
-    if end is not None:
-        trim_args += ["-to", str(end)]
+    trim_args = source_window_args(start, end)
     speed_vf = f"setpts=PTS/{speed:.6g}" if speed and speed != 1 else None
     speed_af = atempo_chain(speed)
+
+    # Carrying source extras (subtitles, chapters, attachments, extra audio
+    # tracks, embedded cover art, global tags) onto the output is only for a
+    # bare `ffrife run`/`batch` invocation, never for a caller that already
+    # built its own metadata_args (slverse's own per-verse title/comment
+    # tags, notably) - -map_metadata from the source would otherwise
+    # overwrite exactly the tags that caller went to the trouble of setting,
+    # and none of subtitles/chapters/fonts/cover-art make sense carried onto
+    # a short slice cut from a much longer source anyway.
+    carryover_eligible = metadata_args is None
+    extras = None
+    if carryover_eligible and any(config_bool(config, key, True) for key in EXTRAS_OVERRIDE_KEYS):
+        try:
+            extras = describe_source_extras(source)
+        except Exception:
+            # Probing is a pure nice-to-have layered on top of a working
+            # pipeline - any failure to read it back (unusual ffprobe
+            # output, an unreachable remote source, ...) just skips
+            # carryover and proceeds exactly as ffrife has always behaved,
+            # rather than risking the interpolation itself over a side
+            # channel.
+            extras = None
+        if extras is not None and not has_any_extras(extras):
+            extras = None
 
     rife_path = config.get("rife_binary_path")
     if not rife_path or not command_exists(rife_path):
@@ -1019,11 +1460,25 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
             vf_chain.append(speed_vf)
         if output_vf:
             vf_chain.append(output_vf)
-        cmd = trim_args + ["-i", str(source)]
-        if vf_chain:
-            cmd += ["-vf", ",".join(vf_chain)]
-        cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"]) + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
-        run_ffmpeg(cmd, duration=retimed_duration(duration, speed))
+        carryover_dir = Path(tempfile.mkdtemp(prefix="ffrife-extras-")) if extras else None
+        try:
+            primary_target = (carryover_dir / f"encoded{Path(output_file).suffix}") if carryover_dir else output_file
+            cmd = trim_args + ["-i", str(source)]
+            if vf_chain:
+                cmd += ["-vf", ",".join(vf_chain)]
+            if speed_af:
+                cmd += ["-af", f"asetpts=PTS-STARTPTS,{speed_af}"]
+            elif trim_args:
+                cmd += ["-af", "asetpts=PTS-STARTPTS"]
+            else:
+                cmd += ["-c:a", "copy"]
+            cmd += build_encode_args(config) + (metadata_args or []) + [str(primary_target)]
+            run_ffmpeg(cmd, duration=retimed_duration(duration, speed))
+            if carryover_dir:
+                carry_over_source_extras(source, primary_target, output_file, config, extras, start=start, end=end, speed=speed)
+        finally:
+            if carryover_dir:
+                shutil.rmtree(carryover_dir, ignore_errors=True)
         return True
 
     options = {"start": start, "end": end, "vf": vf, "fps": fps, "speed": speed,
@@ -1053,9 +1508,37 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
             return False
         out_frames, fps, _ = rendered
 
-        audio_path = temp_dir_path / "audio.aac"
-        audio_cmd = [FFMPEG_BIN, "-y"] + trim_args + ["-i", str(source), "-vn", "-c:a", "copy", str(audio_path)]
+        # .mka (Matroska), not a bare .aac elementary stream - a plain .aac
+        # file has no room for per-stream tags at all, silently dropping the
+        # source audio track's own language/title (confirmed empirically:
+        # copying into .mka keeps them, copying into .aac loses them), and
+        # those ride back onto the final merge below for free since ffmpeg
+        # copies a mapped stream's own tags along with it by default.
+        exact_audio = bool(trim_args) or bool(speed_af)
+        audio_path = temp_dir_path / ("audio.m4a" if exact_audio else "audio.mka")
+        # Explicit -map (the first audio stream by index) rather than
+        # ffmpeg's own default "best" stream auto-selection (highest
+        # channel count) - deterministic, and what makes extra_audio_indices
+        # above an accurate list of everything ELSE the source has, for
+        # carry_over_source_extras to pick up separately.
+        audio_cmd = [FFMPEG_BIN, "-y"] + trim_args + ["-i", str(source), "-map", "0:a:0?", "-map_chapters", "-1"]
+        if exact_audio:
+            audio_filters = ["asetpts=PTS-STARTPTS"]
+            if duration is not None:
+                audio_filters.insert(0, f"atrim=duration={duration:.12g}")
+            if speed_af:
+                audio_filters.append(speed_af)
+            audio_cmd += ["-af", ",".join(audio_filters), "-c:a", "aac", "-b:a", "192k"]
+        else:
+            audio_cmd += ["-c:a", "copy"]
+        audio_cmd += [str(audio_path)]
         subprocess.run(audio_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # primary_target lives inside work_path (not a separate temp dir) so
+        # a failure between here and the carryover pass below is cleaned up
+        # (or kept for resume) by the existing work_path handling at the
+        # bottom of this function, same as everything else RIFE produces.
+        primary_target = (temp_dir_path / f"encoded{Path(output_file).suffix}") if extras else output_file
 
         merge_cmd = ["-r", str(fps), "-i", f"{out_frames}/%08d.png"]
         has_audio = audio_path.exists() and audio_path.stat().st_size > 0
@@ -1065,9 +1548,11 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         if output_vf:
             merge_cmd += ["-vf", output_vf]
         if has_audio:
-            merge_cmd += (["-af", speed_af] if speed_af else ["-c:a", "copy"])
-        merge_cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]
+            merge_cmd += ["-c:a", "copy"]
+        merge_cmd += build_encode_args(config) + (metadata_args or []) + [str(primary_target)]
         run_ffmpeg(merge_cmd, duration=retimed_duration(duration, speed))
+        if extras:
+            carry_over_source_extras(source, primary_target, output_file, config, extras, start=start, end=end, speed=speed)
     except BaseException:
         if durable:
             print(f"Work saved for resume: {work_path}")
@@ -1223,16 +1708,26 @@ def cmd_config(args, config):
         print(f"Set {args.key} = {args.value}")
     elif args.action == "get" and args.key:
         print(f"{args.key} = {config.get(args.key)}")
+        help_text = CONFIG_HELP.get(args.key)
+        if help_text:
+            print(f"  {help_text}")
     else:
+        # CONFIG_HELP covers every DEFAULT_CONFIG key, so this doubles as
+        # the full documented config surface - see also docs/ffrife.md.
+        width = max((len(k) for k in config), default=0)
         for k, v in config.items():
-            print(f"{k} = {v}")
+            help_text = CONFIG_HELP.get(k, "")
+            suffix = f"  # {help_text}" if help_text else ""
+            print(f"{k:<{width}} = {v}{suffix}")
 
 # DEFAULT_CONFIG keys with their own dedicated per-run flag already -
 # excluded from the generic --<key> override loop (see slverse's own
 # GENERIC_OVERRIDE_EXCLUDED_KEYS for the same pattern).
 GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset",
                                   "rife_profile", "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds",
-                                  "resume", "keep_work", "scene_detection", "gradual_transition_detection"}
+                                  "resume", "keep_work", "scene_detection", "gradual_transition_detection",
+                                  "container", "keep_subtitles", "keep_chapters", "keep_extra_audio_tracks",
+                                  "keep_attachments", "keep_thumbnail", "keep_source_metadata"}
 
 def add_generic_config_overrides(parser):
     for key in DEFAULT_CONFIG:
@@ -1279,6 +1774,14 @@ def collect_batch_inputs(inputs, patterns=None, list_files=None, recursive=False
             result.append(resolved); seen.add(resolved)
     return result
 
+def apply_container_override(path, config):
+    """Rewrite `path`'s extension to config's `container` (mp4/mkv), if
+    set - applied after -o/the default naming has already picked a path, so
+    --container (or a saved config default) always wins over whatever
+    extension the source or -o itself implied."""
+    container = str(config.get("container", "")).strip().lower()
+    return Path(path).with_suffix(f".{container}") if container else Path(path)
+
 def batch_output_path(source, output_dir, suffix):
     rendered = suffix.format(stem=source.stem, suffix=source.suffix, name=source.name)
     if not Path(rendered).suffix:
@@ -1303,11 +1806,14 @@ def default_output_path(source):
     suffix = name_source.suffix or ".mp4"
     return directory / f"{stem}_rife{suffix}"
 
+EXTRAS_OVERRIDE_KEYS = ("keep_subtitles", "keep_chapters", "keep_extra_audio_tracks",
+                        "keep_attachments", "keep_thumbnail", "keep_source_metadata")
+
 def apply_run_overrides(args, config):
     if getattr(args, "fallback", None):
         config["rife_fallback_engine"] = args.fallback
     for arg_name, config_key in (("encoder", "hardware_encoder"), ("codec", "video_codec"),
-                                 ("crf", "video_crf"), ("preset", "video_preset")):
+                                 ("crf", "video_crf"), ("preset", "video_preset"), ("container", "container")):
         value = getattr(args, arg_name, None)
         if value is not None:
             config[config_key] = value
@@ -1317,6 +1823,21 @@ def apply_run_overrides(args, config):
         config["scene_detection"] = args.scene_detection
     if getattr(args, "gradual_transition_detection", None) is not None:
         config["gradual_transition_detection"] = args.gradual_transition_detection
+    for key in EXTRAS_OVERRIDE_KEYS:
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+
+def add_bool_flag(parser, dest, flag_stem, help_on=None, help_off=None):
+    """Mutually-exclusive --flag-stem/--no-flag-stem pair overriding a
+    tri-state DEFAULT_CONFIG boolean (dest) for one run - both default to
+    None so apply_run_overrides only touches config when the run actually
+    passed one of them, leaving the configured/default value alone
+    otherwise."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(f"--{flag_stem}", dest=dest, action="store_const", const="true", default=None, help=help_on)
+    group.add_argument(f"--no-{flag_stem}", dest=dest, action="store_const", const="false", help=help_off)
+    return group
 
 def add_processing_arguments(parser, include_trim=True):
     if include_trim:
@@ -1341,25 +1862,30 @@ def add_processing_arguments(parser, include_trim=True):
     parser.add_argument("-j", "--rife-threads", help="RIFE load:process:save threads; auto lets the profile choose")
     parser.add_argument("-c", "--chunk-frames", help="Source frames per resumable chunk; auto uses profile, 0 disables")
     parser.add_argument("--cooldown", "--cooldown-seconds", dest="cooldown_seconds", help="Seconds to rest between chunks")
-    resume_group = parser.add_mutually_exclusive_group()
-    resume_group.add_argument("--resume", dest="resume", action="store_const", const="true", default=None)
-    resume_group.add_argument("--no-resume", dest="resume", action="store_const", const="false")
-    keep_group = parser.add_mutually_exclusive_group()
-    keep_group.add_argument("--keep-work", dest="keep_work", action="store_const", const="true", default=None,
-                            help="Keep completed intermediate frames for inspection")
-    keep_group.add_argument("--no-keep-work", dest="keep_work", action="store_const", const="false")
-    scene_group = parser.add_mutually_exclusive_group()
-    scene_group.add_argument("--scene-detection", dest="scene_detection", action="store_const", const="true", default=None,
-                             help="Detect hard cuts and replace RIFE hybrids (default)")
-    scene_group.add_argument("--no-scene-detection", dest="scene_detection", action="store_const", const="false",
-                             help="Skip scene-cut detection and postprocessing")
-    gradual_group = parser.add_mutually_exclusive_group()
-    gradual_group.add_argument("--gradual-transition-detection", dest="gradual_transition_detection",
-                               action="store_const", const="true", default=None,
-                               help="Detect fades/dissolves as well as hard cuts (default)")
-    gradual_group.add_argument("--no-gradual-transition-detection", dest="gradual_transition_detection",
-                               action="store_const", const="false",
-                               help="Protect hard cuts only")
+    parser.add_argument("--container", choices=["mp4", "mkv"], help="Output container - overrides -o/the source's own extension")
+    add_bool_flag(parser, "resume", "resume")
+    add_bool_flag(parser, "keep_work", "keep-work", help_on="Keep completed intermediate frames for inspection")
+    add_bool_flag(parser, "scene_detection", "scene-detection",
+                 help_on="Detect hard cuts and replace RIFE hybrids (default)",
+                 help_off="Skip scene-cut detection and postprocessing")
+    add_bool_flag(parser, "gradual_transition_detection", "gradual-transition-detection",
+                 help_on="Detect fades/dissolves as well as hard cuts (default)",
+                 help_off="Protect hard cuts only")
+    # Everything below carries over from the source by default (see
+    # carry_over_source_extras). --start/--end clips and rebases the
+    # time-sensitive streams; --speed drops those streams because arbitrary
+    # subtitle formats cannot be retimed losslessly.
+    add_bool_flag(parser, "keep_subtitles", "subtitles",
+                 help_off="Drop the source's subtitle tracks (trimmed and rebased by default with --start/--end)")
+    add_bool_flag(parser, "keep_chapters", "chapters",
+                 help_off="Drop the source's chapter marks (trimmed and rebased by default with --start/--end)")
+    add_bool_flag(parser, "keep_extra_audio_tracks", "extra-audio-tracks",
+                 help_off="Drop audio tracks beyond the first, e.g. alternate-language dubs (trimmed and rebased by default with --start/--end)")
+    add_bool_flag(parser, "keep_attachments", "attachments",
+                 help_off="Drop non-image attachments like embedded fonts (kept by default; always dropped for an mp4/mov-family container)")
+    add_bool_flag(parser, "keep_thumbnail", "thumbnail", help_off="Drop embedded cover art/thumbnail")
+    add_bool_flag(parser, "keep_source_metadata", "source-metadata",
+                 help_off="Drop global container tags (title, comment, encoder, ...)")
     parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"])
     parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"])
     parser.add_argument("--overwrite-timeout", type=float)
@@ -1446,7 +1972,7 @@ def main():
             value = getattr(args, arg_name, None)
             if value is not None:
                 jwkit_config[config_key] = value
-        requested_output = args.output or default_output_path(args.input)
+        requested_output = apply_container_override(args.output or default_output_path(args.input), config)
         output = _jwkit_common.resolve_output_conflict(requested_output, jwkit_config)
         if output is None:
             sys.exit(1)
@@ -1477,7 +2003,7 @@ def main():
         print(f"Batch: {len(sources)} file(s), processed sequentially to limit sustained load.")
         for index, source in enumerate(sources, 1):
             print(f"\n[{index}/{len(sources)}] {source}")
-            requested = batch_output_path(source, output_dir, args.output_name)
+            requested = apply_container_override(batch_output_path(source, output_dir, args.output_name), config)
             output = _jwkit_common.resolve_output_conflict(requested, jwkit_config)
             if output is None:
                 skipped += 1
