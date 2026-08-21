@@ -143,6 +143,7 @@ DEFAULT_CONFIG = {
     "auto_sync_background": "true",  # run the once-a-day refresh as a detached subprocess so it never blocks the current command; false restores the old blocking-in-foreground behavior
     "preview_source": "segment",  # extract's preview mode (no --write) and find --play: 'segment' fetches and caches just the verse window being previewed - fast, no repeat bandwidth for the same window, but never pulls a whole chapter just to preview a few seconds of it; 'cache' instead downloads the WHOLE chapter once and reuses that, worth it only if you'll preview several different verses from the same chapter; 'remote' always streams straight from the URL and never touches disk
     "preview_window_size": "65%",  # multi-language preview windows (slverse find --play, or 'ffv all <ref> -p'), as an mpv --autofit percentage of screen size - ignored for a single-language preview, which still autoplays fullscreen
+    "preview_max_parallel": "4",  # concurrent segment downloads for find --play / ffv all -p; each completed language window opens while the remaining downloads continue
     "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
     "font_family": "noto-sans-display",  # noto-sans-display, inter, google-sans-flex - see FONT_FAMILIES
     "api_language": "E",  # Priority-ordered language codes for book names (e.g. "VT,E" for Vietnamese then English)
@@ -210,7 +211,7 @@ def validate_config_value(key, value):
     try:
         if key in ("overlay_alpha", "overlay_source_label_alpha") and not 0 <= float(value) <= 1:
             return f"{key} must be between 0 and 1"
-        if key in ("sync_workers", "extract_workers", "download_max_attempts", "caption_detection_samples") and int(value) < 1:
+        if key in ("sync_workers", "extract_workers", "preview_max_parallel", "download_max_attempts", "caption_detection_samples") and int(value) < 1:
             return f"{key} must be at least 1"
         if key == "caption_detection_samples" and int(value) > 9:
             return f"{key} must be at most 9"
@@ -248,6 +249,7 @@ CONFIG_HELP = {
     "auto_sync_background": "Run the automatic refresh as a detached background process instead of blocking",
     "preview_source": "segment (default, cache just the verse window), cache (download the whole chapter once, reuse), or remote (always stream) - for preview (extract without --write) and find --play",
     "preview_window_size": "mpv --autofit percentage for 'find --play' multi-language preview windows",
+    "preview_max_parallel": "Concurrent segment downloads for find --play / ffv all -p (default 4)",
     "font_path": "Manual font file override (skips font_family)",
     "font_family": "noto-sans-display, inter, or google-sans-flex",
     "font_weight_main": "Google Fonts weight for the drawn verse-reference label",
@@ -1852,7 +1854,20 @@ def build_trim_concat_filter_complex(segments, base_label="[0:v]", audio=False):
         fc += "".join(v_labels) + f"concat=n={len(segments)}:v=1[vout]"
     return fc
 
-def build_sectioned_filter_complex(boundaries, speed, mode, base_label):
+def section_atempo_chain(speed):
+    factors = []
+    remaining = float(speed)
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return ",".join(f"atempo={factor:.12g}" for factor in factors)
+
+
+def build_sectioned_filter_complex(boundaries, speed, mode, base_label, audio=False, audio_label="[0:a]"):
     """Builds a filter_complex that trims [0:v] (or `base_label`, if an
     ffmpeg-filter interpolation engine already ran on it) into N alternating
     normal/retimed sections at `boundaries` (seconds, relative to whatever
@@ -1864,6 +1879,7 @@ def build_sectioned_filter_complex(boundaries, speed, mode, base_label):
     n = len(boundaries) + 1
     fc = ""
     labels = []
+    audio_labels = []
     for i in range(1, n + 1):
         if i == 1:
             fc += f"{base_label}trim=0:{boundaries[0]},setpts=PTS-STARTPTS[v{i}];"
@@ -1877,7 +1893,23 @@ def build_sectioned_filter_complex(boundaries, speed, mode, base_label):
             labels.append(f"r{i}")
         else:
             labels.append(f"v{i}")
-    fc += "".join(f"[{l}]" for l in labels) + f"concat=n={n}:v=1:a=0[out]"
+        if audio:
+            if i == 1:
+                fc += f"{audio_label}atrim=0:{boundaries[0]},asetpts=PTS-STARTPTS[a{i}];"
+            elif i == n:
+                fc += f"{audio_label}atrim=start={boundaries[i - 2]},asetpts=PTS-STARTPTS[a{i}];"
+            else:
+                fc += f"{audio_label}atrim={boundaries[i - 2]}:{boundaries[i - 1]},asetpts=PTS-STARTPTS[a{i}];"
+            if retime:
+                fc += f"[a{i}]{section_atempo_chain(speed)}[ar{i}];"
+                audio_labels.append(f"ar{i}")
+            else:
+                audio_labels.append(f"a{i}")
+    if audio:
+        pairs = "".join(f"[{video}][{audio_name}]" for video, audio_name in zip(labels, audio_labels))
+        fc += pairs + f"concat=n={n}:v=1:a=1[out][aout]"
+    else:
+        fc += "".join(f"[{label}]" for label in labels) + f"concat=n={n}:v=1:a=0[out]"
     return fc, "[out]"
 
 
@@ -1917,16 +1949,36 @@ def encode_rife_frame_sections(source, output_file, sections, target_fps, config
                 inputs += ["-framerate", f"{target_fps:g}", "-i", str(value / "%08d.png")]
                 normalize = "settb=AVTB,setpts=PTS-STARTPTS"
             else:
-                inputs += ["-ss", str(seg_start), "-to", str(seg_end), "-i", str(value)]
+                inputs += ["-ss", str(seg_start), "-t", str(seg_end - seg_start), "-i", str(value)]
                 normalize = f"fps={target_fps:g},settb=AVTB,setpts=PTS-STARTPTS"
             filters += f"[{i}:v]{normalize}[p{i}];"
             labels.append(f"[p{i}]")
-        filters += "".join(labels) + f"concat=n={len(sections)}:v=1:a=0[out]"
+        audio = has_audio_stream(source)
+        audio_map = []
+        if audio:
+            window_start = sections[0][0]
+            window_end = sections[-1][1]
+            audio_input = len(prepared_inputs)
+            inputs += ["-ss", str(window_start), "-t", str(window_end - window_start), "-i", str(source)]
+            audio_labels = []
+            for i, (seg_start, seg_end, speed, _use_rife) in enumerate(sections):
+                rel_start, rel_end = seg_start - window_start, seg_end - window_start
+                filters += f"[{audio_input}:a]atrim={rel_start}:{rel_end},asetpts=PTS-STARTPTS[a{i}];"
+                if speed:
+                    filters += f"[a{i}]{section_atempo_chain(speed)}[ar{i}];"
+                    audio_labels.append(f"[ar{i}]")
+                else:
+                    audio_labels.append(f"[a{i}]")
+            filters += "".join(labels) + f"concat=n={len(sections)}:v=1:a=0[out];"
+            filters += "".join(audio_labels) + f"concat=n={len(sections)}:v=0:a=1[aout]"
+            audio_map = ["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]
+        else:
+            filters += "".join(labels) + f"concat=n={len(sections)}:v=1:a=0[out]"
         map_label = "[out]"
         if overlay:
             filters += f";[out]{overlay}[final]"
             map_label = "[final]"
-        cmd = inputs + ["-filter_complex", filters, "-map", map_label] + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
+        cmd = inputs + ["-filter_complex", filters, "-map", map_label] + audio_map + build_encode_args(config) + (metadata_args or []) + [str(output_file)]
         output_duration = sum((end - start) / (speed or 1.0) for start, end, speed, _ in sections)
         run_ffmpeg(cmd, duration=output_duration)
 
@@ -1934,12 +1986,10 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
     """--slow/--fast: split the verse window at `boundaries` (seconds,
     relative to the verse's own start) into alternating normal/retimed
     sections at `speed` - ported from the standalone ffslow/fffast tools'
-    own section handling (see build_sectioned_filter_complex). Like those
-    tools, the sectioned output is video-only: the concat step only carries
-    a video stream (mixing RIFE'd and plain-trimmed pieces, or applying
-    setpts to only half the timeline, leaves no single consistent audio
-    track to carry through) - the single-window extract_verse path above
-    still keeps audio."""
+    own section handling (see build_sectioned_filter_complex). When the
+    source has audio, each matching audio section is trimmed and pitch-
+    preserving atempo-retimed before the audio pieces are concatenated, so
+    it stays aligned with both ffmpeg- and RIFE-retimed video."""
     detected_box = detect_caption_box(source, start_time, end_time, config)
     overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, detected_caption_box=detected_box)
     engine = config.get("interpolation_engine", "none")
@@ -1994,7 +2044,8 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
         prefix = f"[0:v]framerate=fps={config.get('interpolation_target_fps', DEFAULT_CONFIG['interpolation_target_fps'])}[base];"
         base_label = "[base]"
 
-    fc, out_label = build_sectioned_filter_complex(boundaries, speed, mode, base_label)
+    audio = has_audio_stream(source)
+    fc, out_label = build_sectioned_filter_complex(boundaries, speed, mode, base_label, audio=audio)
     fc = prefix + fc
     map_label = out_label
     if overlay:
@@ -2004,7 +2055,9 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
     # -ss/-to before -i: same input-side seek extract_verse uses, so
     # `boundaries` stay relative to the verse's own start (0) rather than
     # needing the caller to add start_time to each one.
-    cmd = ["-ss", str(start_time), "-to", str(end_time), "-i", str(source), "-filter_complex", fc, "-map", map_label]
+    cmd = ["-ss", str(start_time), "-t", str(end_time - start_time), "-i", str(source), "-filter_complex", fc, "-map", map_label]
+    if audio:
+        cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]
     cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]
     run_ffmpeg(cmd, duration=duration)
 
@@ -2695,6 +2748,11 @@ def add_generic_config_overrides(parser):
         else:
             parser.add_argument(flag, dest=key, help=CONFIG_HELP.get(key, ""))
 
+
+def add_find_parallel_argument(parser):
+    parser.add_argument("-j", dest="preview_max_parallel", metavar="N",
+                        help="Concurrent preview downloads (same as --preview-max-parallel; default: configured value, initially 4)")
+
 def apply_generic_config_overrides(args, config):
     for key in DEFAULT_CONFIG:
         if key in GENERIC_OVERRIDE_EXCLUDED_KEYS:
@@ -2986,6 +3044,39 @@ def cmd_extract(args, config):
         else:
             print(f"[{lang}] Preview finished.")
 
+def group_contiguous_preview_rows(results):
+    """Collapse found verse rows into one exact preview window per
+    language and contiguous requested run. A missing or skipped verse breaks
+    the run, so a clip never silently spans material the user did not ask
+    for. The cache key remains the exact language/chapter/start/end tuple;
+    therefore the combined file is independently trackable without blurring
+    any verse boundary metadata in the sync index."""
+    groups = []
+    by_lang = {}
+    for row in results:
+        by_lang.setdefault(row["lang"], []).append(row)
+    for rows in by_lang.values():
+        current = None
+        for row in rows:
+            if not row["found"]:
+                current = None
+                continue
+            can_extend = (
+                current is not None
+                and row["url"] == current["url"]
+                and row["chapter"] == current["chapter"]
+                and row["verse"] == current["verses"][-1] + 1
+            )
+            if can_extend:
+                current["verses"].append(row["verse"])
+                current["end"] = row["end"]
+            else:
+                current = dict(row)
+                current["verses"] = [row["verse"]]
+                groups.append(current)
+    return groups
+
+
 def cmd_find(args, config):
     """Default output is a compact checkmark table grouped by language -
     easiest to scan at a glance, and the format non-technical users actually
@@ -3068,48 +3159,57 @@ def cmd_find(args, config):
         if not command_exists("mpv"):
             print(COLOR.yellow("(--play needs mpv, which isn't installed)"))
         else:
-            to_play = [r for r in results if r["found"]]
+            to_play = group_contiguous_preview_rows(results)
             multi = len(to_play) > 1
             window_size = config.get("preview_window_size", DEFAULT_CONFIG["preview_window_size"])
             # Same preview_source knob extract's own no-write preview uses:
             # 'remote' streams straight from the CDN and never touches disk;
             # anything else (default 'segment', or 'cache') fetches just
-            # this verse window and caches it (see resolve_segment_source) -
+            # this exact contiguous requested window and caches it (see
+            # resolve_segment_source) -
             # cheap even across every matched language at once, since it's
             # never the whole chapter. A repeat 'ffv all' of the same verse,
             # or a later 'ffv <lang>' extract, then reuses the same small
             # clip instead of hitting the network again.
             use_cache = config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower() != "remote"
             if multi:
-                print(f"\nOpening {len(to_play)} preview windows, one per language, all paused - unpause each to review it.")
-            for i, r in enumerate(to_play):
-                start_str = f"{int(r['start']//3600):02d}:{int(r['start']%3600//60):02d}:{r['start']%60:06.3f}"
-                dur = r["end"] - r["start"]
-                play_source = r["url"]
+                print(f"\nOpening {len(to_play)} preview windows, one per language/contiguous range, all paused - unpause each to review it.")
+
+            def resolve_preview(item):
+                i, row = item
+                start_str = f"{int(row['start']//3600):02d}:{int(row['start']%3600//60):02d}:{row['start']%60:06.3f}"
+                dur = row["end"] - row["start"]
+                play_source = row["url"]
                 if use_cache:
-                    play_source, cached_segment = resolve_segment_source(r["url"], r["lang"], book_num, r["chapter"], r["start"], r["end"], config, state)
+                    play_source, cached_segment = resolve_segment_source(row["url"], row["lang"], book_num, row["chapter"], row["start"], row["end"], config, state)
                     if cached_segment:
                         start_str = "00:00:00.000"
-                # Multiple matches: windowed (not fullscreen, so several can
-                # be visible at once), sized to preview_window_size (percent
-                # of screen, aspect preserved - mpv works this out itself,
-                # no need to know actual screen resolution here), and
-                # cascaded a bit so they don't stack exactly on top of each
-                # other. A single match keeps the old fullscreen-and-autoplay
-                # behavior. Every mpv window here is spawned via
-                # subprocess.Popen with wait=False, so this loop never
-                # blocks - true on macOS/Linux/Windows alike, since a Popen
-                # child outlives its parent's normal exit on all three
-                # without any extra detachment flags.
-                launch_mpv(
-                    [f"--start={start_str}", f"--length={dur:.3f}", play_source],
-                    wait=False,
-                    fullscreen=not multi,
-                    paused=multi,
-                    config=config,
-                    autofit=window_size if multi else None,
-                    geometry=f"+{40 + (i % 5) * 60}+{40 + (i % 5) * 60}" if multi else None,
-                )
+                return i, row, start_str, dur, play_source
+
+            workers = min(len(to_play), int(config.get("preview_max_parallel", DEFAULT_CONFIG["preview_max_parallel"])))
+            if use_cache and workers > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    resolved = (future.result() for future in concurrent.futures.as_completed(
+                        [pool.submit(resolve_preview, item) for item in enumerate(to_play)]
+                    ))
+                    for i, r, start_str, dur, play_source in resolved:
+                        launch_mpv(
+                            [f"--start={start_str}", f"--length={dur:.3f}", play_source],
+                            wait=False, fullscreen=not multi, paused=multi, config=config,
+                            autofit=window_size if multi else None,
+                            geometry=f"+{40 + (i % 5) * 60}+{40 + (i % 5) * 60}" if multi else None,
+                        )
+            else:
+                for item in enumerate(to_play):
+                    i, r, start_str, dur, play_source = resolve_preview(item)
+                    # Multiple matches are windowed/paused and cascaded;
+                    # a single match keeps fullscreen autoplay.
+                    launch_mpv(
+                        [f"--start={start_str}", f"--length={dur:.3f}", play_source],
+                        wait=False, fullscreen=not multi, paused=multi, config=config,
+                        autofit=window_size if multi else None,
+                        geometry=f"+{40 + (i % 5) * 60}+{40 + (i % 5) * 60}" if multi else None,
+                    )
             save_state(state)
 
 def cmd_cache(args, config):
@@ -3324,6 +3424,7 @@ def main():
     p_find.add_argument("chapter", type=int)
     p_find.add_argument("verse", help="Single verse, a range (25-27), or a comma list (1,3,5)")
     p_find.add_argument("-p", "--play", action="store_true", help="Also stream-preview each match with mpv")
+    add_find_parallel_argument(p_find)
     p_find.add_argument("-v", "--verbose", action="store_true", help="Show full match details (URL, mpv command) instead of the compact checkmark list")
     p_find.add_argument("--json", action="store_true", help="Machine-readable JSON instead of the checkmark list (always includes every synced language, found or not)")
     find_sync = p_find.add_mutually_exclusive_group()

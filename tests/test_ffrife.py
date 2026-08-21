@@ -201,6 +201,55 @@ class FfrifeRetimedDurationTest(unittest.TestCase):
         self.assertIsNone(self.ffrife.retimed_duration(None, 0.5))
 
 
+class FfrifeTrimmedExtrasTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_source_window_uses_duration_not_absolute_to(self) -> None:
+        args = self.ffrife.source_window_args(179.446, 206.606)
+        self.assertEqual(args[:2], ["-ss", "179.446"])
+        self.assertEqual(args[2], "-t")
+        self.assertAlmostEqual(float(args[3]), 27.16)
+        self.assertNotIn("-to", args)
+
+    def test_chapters_are_clipped_rebased_and_outside_rows_dropped(self) -> None:
+        probe = MagicMock(stdout='''{"chapters":[
+          {"start_time":"0", "end_time":"5", "tags":{"title":"Intro"}},
+          {"start_time":"5", "end_time":"12", "tags":{"title":"Main"}},
+          {"start_time":"12", "end_time":"20", "tags":{"title":"End"}}
+        ]}''')
+        with tempfile.TemporaryDirectory() as td, patch.object(self.ffrife.subprocess, "run", return_value=probe):
+            path = self.ffrife.write_clipped_chapters("source.mkv", 3, 9, td)
+            text = path.read_text()
+        self.assertIn("START=0\nEND=2000\ntitle=Intro", text)
+        self.assertIn("START=2000\nEND=6000\ntitle=Main", text)
+        self.assertNotIn("title=End", text)
+
+    def test_trimmed_stream_sidecar_rebases_and_bounds_extra_audio(self) -> None:
+        extras = {"extra_audio_indices": [4], "subtitle_count": 0, "subtitle_indices": []}
+        with tempfile.TemporaryDirectory() as td, patch.object(self.ffrife.subprocess, "run") as run:
+            self.ffrife.prepare_clipped_stream_extras(
+                "source.mkv", extras, 3, 9, td, want_subtitles=False, want_extra_audio=True,
+            )
+        cmd = run.call_args.args[0]
+        self.assertLess(cmd.index("-ss"), cmd.index("-i"))
+        self.assertEqual(cmd[cmd.index("-t") + 1], "6")
+        self.assertIn("atrim=duration=6,asetpts=PTS-STARTPTS", cmd[cmd.index("-filter_complex") + 1])
+        self.assertEqual(cmd[cmd.index("-map_chapters") + 1], "-1")
+
+    def test_subtitle_cues_are_clipped_at_both_window_boundaries(self) -> None:
+        source = """1\n00:00:01,000 --> 00:00:04,000\nIntro\n\n2\n00:00:06,000 --> 00:00:11,000\nMain\n"""
+        with tempfile.TemporaryDirectory() as td:
+            src, dst = Path(td) / "source.srt", Path(td) / "clipped.srt"
+            src.write_text(source)
+            self.assertTrue(self.ffrife.clip_srt_file(src, dst, 3, 9))
+            result = dst.read_text()
+        self.assertIn("00:00:00,000 --> 00:00:01,000", result)
+        self.assertIn("00:00:03,000 --> 00:00:06,000", result)
+        self.assertNotIn("00:00:08,000", result)
+
+
 class FfrifeSpeedRetimingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -219,8 +268,44 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         cmd = calls[0]
         vf = cmd[cmd.index("-vf") + 1]
         self.assertIn("setpts=PTS/0.5", vf)
-        self.assertEqual(cmd[cmd.index("-af") + 1], "atempo=0.5")
+        self.assertEqual(cmd[cmd.index("-af") + 1], "asetpts=PTS-STARTPTS,atempo=0.5")
         self.assertNotIn("-c:a", cmd)  # -af and -c:a copy are mutually exclusive for the audio stream
+
+    def test_trim_uses_duration_and_reencodes_zero_based_audio(self) -> None:
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
+        ffmpeg_calls = []
+        subprocess_calls = []
+
+        def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+            ffmpeg_calls.append(cmd)
+            if cmd and str(cmd[-1]).endswith("%08d.png"):
+                (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"png")
+
+        def fake_run_rife(_rife, _incoming, outgoing, target_count=None, **_kwargs):
+            (Path(outgoing) / "00000001.png").write_bytes(b"png")
+
+        def fake_subprocess_run(cmd, **_kwargs):
+            subprocess_calls.append(cmd)
+            if str(cmd[-1]).endswith("audio.m4a"):
+                Path(cmd[-1]).write_bytes(b"audio")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+             patch.object(self.ffrife, "run_rife", fake_run_rife), \
+             patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
+             patch.object(self.ffrife.subprocess, "run", fake_subprocess_run):
+            self.ffrife.interpolate("in.mp4", "out.mp4", config, start=179.446, end=206.606, fps=60)
+
+        extract = ffmpeg_calls[0]
+        self.assertIn("-t", extract)
+        self.assertAlmostEqual(float(extract[extract.index("-t") + 1]), 27.16)
+        self.assertNotIn("-to", extract)
+        audio = next(c for c in subprocess_calls if str(c[-1]).endswith("audio.m4a"))
+        self.assertIn("atrim=duration=27.16,asetpts=PTS-STARTPTS", audio)
+        self.assertEqual(audio[audio.index("-map_chapters") + 1], "-1")
+        merge = ffmpeg_calls[-1]
+        self.assertEqual(merge[merge.index("-c:a") + 1], "copy")
 
     def test_fallback_path_passes_retimed_duration_to_progress_bar(self) -> None:
         config = {"rife_binary_path": "", "rife_fallback_engine": "none"}
