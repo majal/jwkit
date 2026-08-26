@@ -4,6 +4,10 @@ Guidance for future contributors and AI agents working in this repo.
 
 Repo name: `jwkit`
 
+Template compliance: repo-template-standard.md v1.0.0, checked 2026-08-26.
+Check `bin/new-agent-repo.d/repo-template-standard.md` for the current
+version and re-review this repo against its changelog when they diverge.
+
 ## Purpose
 
 `jwkit` holds tools for pulling and processing content from jw.org: Bible sign-language clips (`slverse`), music/periodicals/video (`jwdl`), multi-language video downloading and muxing (`jwvideo-mux`), and AI frame interpolation (`ffrife`, used as a library by `slverse` but not jw.org-specific itself).
@@ -60,6 +64,28 @@ Root-level one-liner installers for non-technical users (`curl | bash` on macOS/
 - `install.ps1` is **not verified on a real Windows machine** as of 2026-08-13 — it was written to the same patterns as `install.sh` (idempotent, guarded PATH edits, friendly error trap) but there was no Windows environment available to test it in. Treat changes to it with extra care and prefer a real Windows test before relying on it.
 - Windows needs `.cmd` shims (`slverse.cmd`, etc.) alongside the actual scripts, since Windows doesn't run a `#!/usr/bin/env python3` shebang line directly the way macOS/Linux do — `install.sh` doesn't need this, since the scripts are already directly executable there once `chmod +x`'d.
 - Both scripts are designed to be safe to re-run (used as the update mechanism) — don't add steps that aren't idempotent (e.g. that fail or duplicate on a second run) without guarding them.
+
+## Agent Working Rules
+
+- **CLI tools before GUI tools.** Default to CLI/API tools for anything in
+  this repo — more context density, fewer tokens, more composable than
+  GUI or browser automation. Reach for GUI/browser automation only when a
+  task genuinely has no CLI/API path. (Distinct from the tools' own
+  config-first CLI design under Configuration above — that's about how
+  jwkit's tools expose settings to their end users, this is about how an
+  agent should work in the repo.)
+- **Artifacts stay local by default.** Reports, audits, and sweeps touching
+  this repo go in `docs/reports/`, never a hosted `claude.ai` artifact,
+  gist, pastebin, or similar — unless the operator explicitly asks for a
+  shareable link. Not that this repo is likely to produce much of this
+  kind of writeup, given its scope, but the scaffold costs nothing.
+
+## Local Memory
+
+See `memory/README.md` for the full contract. Short version:
+`memory/MEMORY.md` is the only file to load by default; `memory/topics/*.md`
+holds the actual entries, opened only when relevant. Gitignored — public
+GitHub repo, same as `bin`/`maj-scripts`.
 
 ## Public Repo And Secrets
 
