@@ -1,3 +1,15 @@
+.codex
+.codex-last
+docs/reports/private/
+
+# Local cross-agent memory (continuity notes for this checkout). This repo
+# is public on GitHub; internal working notes don't belong in its history.
+memory/
+
+# No secrets live in this repo today, but reserve the pattern -- see
+# AGENTS.md's Public Repo And Secrets section.
+secrets/
+
 __pycache__/
 *.pyc
 *.pyo
