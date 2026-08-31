@@ -1,17 +1,18 @@
 # jwkit Reports
 
-Dated, evidence-backed writeups — audits, sweeps, plans, and handoffs are
-the same genre; they live here rather than a separately-named directory.
-Each report is `YYYY-MM-DD-<slug>.md`. `completed/` is for reports that
-have been fully executed and carry a formal "Applied" (date, work-package
-id, commit) lineage entry.
+Dated, evidence-backed writeups — audits, sweeps, plans, handoffs are all
+the same genre; keep them here rather than splitting them across
+differently-named directories. Each report is `YYYY-MM-DD-<slug>.md`.
 
-This is separate from `docs/<tool>.md` (the per-tool reference docs
-required by this repo's own README Rules) — reports are dated writeups
-about a piece of work, not standing tool documentation.
+Move a report to `completed/` once fully executed, keeping an "Applied"
+section (date, work-package id, commit) for lineage.
 
-No reports yet — this scaffold exists so there's no "where do reports go"
-decision to make later.
+**No hand-maintained index below.** A filename/status table here would
+duplicate the directory listing and drift out of sync — check current
+reports directly:
 
-| Date | Report | Notes |
-| --- | --- | --- |
+    ls docs/reports/*.md          # active
+    ls docs/reports/completed/    # completed
+
+If a human-browsable index is genuinely useful later, generate one on
+demand rather than hand-editing this file.
