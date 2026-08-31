@@ -4,7 +4,7 @@ Guidance for future contributors and AI agents working in this repo.
 
 Repo name: `jwkit`
 
-Template compliance: repo-template-standard.md v1.0.0, checked 2026-08-26.
+Template compliance: repo-template-standard.md v1.2.0, reviewed 2026-08-31 (previously v1.0.0). Config-first/flag-parity retrofit, Unix-style config comments, and UNIX-philosophy/modularity refactor for existing code are tracked in `ags/docs/reports/2026-08-31-cross-repo-standards-rollout-handoff.md` -- not yet applied here.
 Check `bin/new-agent-repo.d/repo-template-standard.md` for the current
 version and re-review this repo against its changelog when they diverge.
 
@@ -27,6 +27,20 @@ Tools here don't carry a `jw` prefix by default — the repo name already scopes
 All tools share one config namespace, `~/.config/jwkit/<tool>/` (e.g. `~/.config/jwkit/slverse/`, `~/.config/jwkit/jwdl/`, `~/.config/jwkit/ffrife/`). Each tool auto-migrates its config on first run from wherever it used to live (pre-jwkit `~/.config/maj-scripts/<tool>/`, or `slverse`'s brief standalone `~/.config/slverse/` waypoint) — nothing is lost across a rename or the unification, including `ffrife`'s downloaded RIFE binary and `slverse`'s synced verse-marker index. New tools should follow this same `~/.config/jwkit/<tool>/` layout from the start rather than inventing their own.
 
 Design tools config-first whenever behavior is reasonably user-customizable. Every persisted config setting must have a corresponding long CLI flag for a one-run override, and the most common flags should also have short aliases. Keep config, CLI help, docs, and tests in sync; do not hardcode one operator's language order, player layout, paths, or workflow preferences as universal behavior. Positional identifiers and intrinsically one-shot actions do not need persisted config merely for symmetry.
+
+## Push cadence
+
+**Smart batched deploy, with "push" as the deploy step** — this repo has
+no separate server-side deploy; a push to `main` is what goes live, since
+`jwdl-weekly.service`/`jwsl-sync-weekly.service` on `emeth4` auto-update
+by fast-forwarding against `origin` before every unattended run (see
+"Auto-Update" above). Commit continuously as work lands; test locally and
+push right away once you're happy with a verified change, rather than
+holding it "just in case" — but hold the push (keep committing locally)
+if you already know concrete follow-up is coming in the same session and
+nothing needs the fix live yet. This is `repo-template-standard.md`'s
+named "smart batched deploy" pattern, just with push standing in for
+deploy.
 
 ## Operational Notes
 
