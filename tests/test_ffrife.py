@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -1440,6 +1441,31 @@ class FfrifeStreamingEncodeTest(unittest.TestCase):
             with patch.object(self.ffrife.subprocess, "run",
                               side_effect=self.ffrife.subprocess.CalledProcessError(1, ["ffmpeg"])):
                 self.assertFalse(self.ffrife._validate_media_file(bad))
+
+    def test_validate_timeout_scales_with_file_size(self) -> None:
+        # A timeout reads as corruption to the caller, so a big-but-good
+        # segment (or a whole-clip video.mkv) must never hit it just for
+        # being slow to decode - that would discard reusable RIFE work on
+        # exactly the long runs resume matters most for.
+        with tempfile.TemporaryDirectory() as td:
+            big = Path(td) / "big.mkv"
+            big.write_bytes(b"x")
+            os.truncate(big, 400_000_000)  # sparse: size without the bytes
+            seen = {}
+
+            def fake_run(cmd, **kwargs):
+                seen.update(kwargs)
+                return MagicMock(returncode=0)
+
+            with patch.object(self.ffrife.subprocess, "run", fake_run):
+                self.assertTrue(self.ffrife._validate_media_file(big))
+            self.assertGreater(seen["timeout"], self.ffrife.VALIDATE_TIMEOUT_FLOOR)
+
+            small = Path(td) / "small.mkv"
+            small.write_bytes(b"x" * 10)
+            with patch.object(self.ffrife.subprocess, "run", fake_run):
+                self.assertTrue(self.ffrife._validate_media_file(small))
+            self.assertEqual(seen["timeout"], self.ffrife.VALIDATE_TIMEOUT_FLOOR)
 
     def test_concat_single_segment_moves_it_into_place_with_no_ffmpeg_call(self) -> None:
         with tempfile.TemporaryDirectory() as td:
