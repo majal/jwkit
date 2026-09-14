@@ -173,19 +173,117 @@ def videotoolbox_quality_from_crf(crf):
     return max(1, min(100, round(100 - crf_val)))
 
 
+# x264/x265's named preset ladder, slowest (best compression) to fastest.
+# This is the scale every jwkit tool's `video_preset`/`--preset` is written
+# in, because it's the one users already know - but it is NOT what every
+# encoder actually accepts, which is what preset_args below exists to
+# reconcile.
+PRESET_LADDER = ["placebo", "veryslow", "slower", "slow", "medium", "fast",
+                 "faster", "veryfast", "superfast", "ultrafast"]
+# SVT-AV1 takes a number 0-13 (lower = slower/better) and rejects every one
+# of those names outright - `-preset medium` on libsvtav1 is not a slower
+# encode, it's a hard ffmpeg failure ("Unable to parse preset option value",
+# exit 234), which is why only the literal "slow" used to work: it was the
+# single name special-cased into "6". Everything else silently blew up the
+# whole run on the default codec.
+_SVTAV1_PRESET_BY_NAME = {"placebo": 1, "veryslow": 2, "slower": 4, "slow": 6, "medium": 8,
+                          "fast": 9, "faster": 10, "veryfast": 11, "superfast": 12, "ultrafast": 13}
+# libaom-av1 has no -preset option at all; it spells the same idea
+# -cpu-used 0-8.
+_AOM_CPU_USED_BY_NAME = {"placebo": 0, "veryslow": 1, "slower": 2, "slow": 3, "medium": 4,
+                         "fast": 5, "faster": 6, "veryfast": 7, "superfast": 8, "ultrafast": 8}
+_PRESET_WARNED = set()
+
+
+def _preset_number(preset):
+    """`preset` as an int if it's written as a plain number, else None."""
+    try:
+        return int(str(preset).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _nearest_preset_name(number):
+    """Nearest PRESET_LADDER name to an SVT-AV1-scale number (0-13) - the
+    reverse of _SVTAV1_PRESET_BY_NAME, for handing a numeric `video_preset`
+    to an encoder that only speaks names (nvenc, notably)."""
+    return min(_SVTAV1_PRESET_BY_NAME, key=lambda name: abs(_SVTAV1_PRESET_BY_NAME[name] - number))
+
+
+def _preset_notice(message):
+    if message not in _PRESET_WARNED:
+        _PRESET_WARNED.add(message)
+        print(message)
+
+
+def preset_args(vcodec, preset, notice=True):
+    """The `-preset`-equivalent arguments for `vcodec`, translating between
+    the named x264/x265 ladder every jwkit tool's config is written in and
+    whatever scale this particular encoder actually accepts.
+
+    Returns a list (possibly empty - videotoolbox has no speed/quality
+    preset knob at all). An unrecognized value is dropped with a one-line
+    notice rather than passed through to fail the encode, since a bad
+    `video_preset` should cost a default-speed encode, not the whole run."""
+    preset = str(preset).strip()
+    number = _preset_number(preset)
+    name = preset.lower() if number is None else None
+    if name is not None and name not in _SVTAV1_PRESET_BY_NAME:
+        name = None  # unknown word: handled per-encoder below
+
+    if vcodec == "libsvtav1":
+        if number is not None:
+            return ["-preset", str(max(0, min(13, number)))]
+        if name is None:
+            if notice:
+                _preset_notice(f"(video_preset={preset!r} isn't a preset libsvtav1 understands - using its default instead)")
+            return []
+        return ["-preset", str(_SVTAV1_PRESET_BY_NAME[name])]
+
+    if vcodec == "libaom-av1":
+        # -cpu-used, not -preset: libaom-av1 has no -preset option, so the
+        # old pass-through didn't just pick the wrong speed here, it made
+        # ffmpeg reject the option outright.
+        if number is not None:
+            return ["-cpu-used", str(max(0, min(8, number)))]
+        if name is None:
+            if notice:
+                _preset_notice(f"(video_preset={preset!r} isn't a preset libaom-av1 understands - using its default instead)")
+            return []
+        return ["-cpu-used", str(_AOM_CPU_USED_BY_NAME[name])]
+
+    if vcodec.endswith("_videotoolbox"):
+        return []  # quality is -q:v only; no speed preset exists
+
+    # libx264/libx265/nvenc/qsv all speak the named ladder. x264/x265 also
+    # accept a bare number (an index into their own preset list), but nvenc
+    # does not - normalize a numeric value (someone's AV1-scale setting,
+    # reaching a fallback encoder) to the nearest name so it works on all
+    # of them rather than only two.
+    if number is not None:
+        return ["-preset", _nearest_preset_name(number)]
+    if name is None:
+        # Not on the shared ladder, but x264/x265 have their own extra
+        # names (e.g. tuned builds) - pass it through and let the encoder
+        # be the judge, which is the historical behavior for these codecs.
+        return ["-preset", preset]
+    return ["-preset", name]
+
+
 def _encode_args_for(hw, codec, vcodec, used_hw, crf, preset):
     """The actual -c:v/... argument shape for one specific, already-resolved
     (hw, codec, vcodec) combo - factored out of build_encode_args so
     run_encoder_benchmark can build args for combos it's explicitly testing
     without going through resolve_video_encoder's fallback-chain logic."""
+    speed = preset_args(vcodec, preset)
     if used_hw and hw == "nvenc":
-        args = ["-c:v", vcodec, "-preset", preset, "-cq", str(nvenc_quality_from_crf(crf))]
+        args = ["-c:v", vcodec] + speed + ["-cq", str(nvenc_quality_from_crf(crf))]
     elif used_hw and hw == "videotoolbox":
         args = ["-c:v", vcodec, "-q:v", str(videotoolbox_quality_from_crf(crf))]
     elif used_hw and hw == "qsv":
-        args = ["-c:v", vcodec, "-preset", preset, "-global_quality", str(crf)]
+        args = ["-c:v", vcodec] + speed + ["-global_quality", str(crf)]
     else:
-        args = ["-c:v", vcodec, "-crf", str(crf), "-preset", ("6" if codec == "av1" and preset == "slow" else preset)]
+        args = ["-c:v", vcodec, "-crf", str(crf)] + speed
         if codec == "av1" and vcodec == "libsvtav1":
             args += ["-svtav1-params", "tune=0"]
     return args + ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]

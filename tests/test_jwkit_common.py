@@ -157,6 +157,68 @@ class JwkitCommonFormatEtaTest(unittest.TestCase):
         self.assertEqual(self.common.format_eta(125.7), "2m 05s")
 
 
+class JwkitCommonPresetTranslationTest(unittest.TestCase):
+    """`video_preset`/`--preset` is written in x264/x265's named ladder, but
+    libsvtav1 (the DEFAULT codec) only accepts a number 0-13 and rejects
+    every name outright, and libaom-av1 has no -preset option at all. Only
+    the literal "slow" used to be translated, so any other name was a hard
+    ffmpeg failure on the default codec rather than a different speed."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def test_every_ladder_name_becomes_a_number_for_svtav1(self) -> None:
+        for name in self.common.PRESET_LADDER:
+            args = self.common.preset_args("libsvtav1", name, notice=False)
+            self.assertEqual(args[0], "-preset", f"{name} did not produce a -preset")
+            self.assertTrue(0 <= int(args[1]) <= 13, f"{name} -> {args[1]}")
+
+    def test_svtav1_preset_order_matches_the_named_ladder(self) -> None:
+        # Slowest name must map to the smallest (slowest/best) number, and
+        # the mapping must stay monotonic across the whole ladder.
+        numbers = [int(self.common.preset_args("libsvtav1", name, notice=False)[1])
+                   for name in self.common.PRESET_LADDER]
+        self.assertEqual(numbers, sorted(numbers))
+        self.assertEqual(self.common.preset_args("libsvtav1", "slow", notice=False), ["-preset", "6"])
+
+    def test_libaom_uses_cpu_used_not_preset(self) -> None:
+        for name in self.common.PRESET_LADDER:
+            args = self.common.preset_args("libaom-av1", name, notice=False)
+            self.assertEqual(args[0], "-cpu-used")
+            self.assertTrue(0 <= int(args[1]) <= 8, f"{name} -> {args[1]}")
+
+    def test_named_ladder_passes_through_for_x264_x265_nvenc_qsv(self) -> None:
+        for vcodec in ("libx264", "libx265", "h264_nvenc", "av1_qsv"):
+            self.assertEqual(self.common.preset_args(vcodec, "medium", notice=False), ["-preset", "medium"])
+
+    def test_numeric_preset_normalizes_to_a_name_for_name_only_encoders(self) -> None:
+        # nvenc accepts p1-p7 and the named ladder but not a bare number,
+        # so an AV1-scale numeric setting reaching a fallback encoder has to
+        # come back as the nearest name rather than pass straight through.
+        self.assertEqual(self.common.preset_args("h264_nvenc", "6", notice=False), ["-preset", "slow"])
+        self.assertEqual(self.common.preset_args("libx264", "8", notice=False), ["-preset", "medium"])
+
+    def test_numeric_preset_is_clamped_to_each_av1_encoder_scale(self) -> None:
+        self.assertEqual(self.common.preset_args("libsvtav1", "99", notice=False), ["-preset", "13"])
+        self.assertEqual(self.common.preset_args("libaom-av1", "99", notice=False), ["-cpu-used", "8"])
+
+    def test_videotoolbox_has_no_speed_preset(self) -> None:
+        self.assertEqual(self.common.preset_args("hevc_videotoolbox", "slow", notice=False), [])
+
+    def test_unknown_name_is_dropped_for_av1_but_kept_for_x264(self) -> None:
+        # A bad video_preset should cost a default-speed encode, not the
+        # whole run - but x264/x265 have their own extra names, so those
+        # still pass through and let the encoder be the judge.
+        self.assertEqual(self.common.preset_args("libsvtav1", "bogus", notice=False), [])
+        self.assertEqual(self.common.preset_args("libx264", "bogus", notice=False), ["-preset", "bogus"])
+
+    def test_encode_args_carry_the_translated_preset(self) -> None:
+        args = self.common._encode_args_for("cpu", "av1", "libsvtav1", False, "30", "medium")
+        self.assertEqual(args[args.index("-preset") + 1], "8")
+        self.assertNotIn("medium", args)
+
+
 class JwkitCommonBenchmarkTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
