@@ -42,6 +42,7 @@ formats cannot be retimed losslessly. Attachments/thumbnail/source-metadata
 have no time dimension and remain eligible.
 """
 import argparse
+import collections
 import glob
 import hashlib
 import json
@@ -133,7 +134,10 @@ DEFAULT_CONFIG = {
     "keep_work": "false",  # retain completed work state for inspection
     "space_check": "true",  # estimate temp space needed before running RIFE and abort if short
     "space_check_margin": "1.15",  # required-vs-free safety multiplier for the space check
-    "stream_segment_chunks": "8",  # RIFE chunks per encode segment before their PNGs are freed; see docs/ffrife.md's "Streaming encode" section
+    "stream_segment_chunks": "auto",  # RIFE chunks per encode segment before their PNGs are freed; auto lets plan_pipeline size it from whatever disk is actually free
+    "pipeline_mode": "auto",  # auto, fast, or compact - see plan_pipeline; auto runs the fastest pipeline whose peak temp usage still fits the disk budget
+    "disk_budget_fraction": "0.70",  # share of the work filesystem's FREE space plan_pipeline may spend on temporary frames
+    "extraction_mode": "auto",  # auto, full, or windowed - windowed decodes each chunk's source frames on demand instead of extracting the whole clip upfront
     "scene_detection": "true",  # do not synthesize hybrid frames across hard cuts
     "scene_threshold": "3.0",  # spike multiplier over recent motion; lower is more sensitive
     "scene_floor": "0.05",  # absolute pixel-change floor below which nothing can be a hard cut
@@ -175,7 +179,10 @@ CONFIG_HELP = {
     "keep_work": "Retain completed work state (extracted/interpolated frames) after a successful run, for inspection",
     "space_check": "Estimate temp disk space needed for extracted+interpolated frames before running RIFE and abort if short",
     "space_check_margin": "Required-vs-free safety multiplier for the space check (1.15 = require 15% headroom over the estimate)",
-    "stream_segment_chunks": "RIFE chunks encoded together as one segment before their PNGs are freed - lower uses less peak disk but resets the encoder's lookahead more often",
+    "stream_segment_chunks": "RIFE chunks encoded together as one segment before their PNGs are freed; auto sizes it from free disk (lower uses less peak disk but resets the encoder's lookahead more often)",
+    "pipeline_mode": "auto, fast, or compact - auto runs the fastest pipeline whose peak temporary disk usage still fits the budget",
+    "disk_budget_fraction": "Share of the work filesystem's free space the planner may spend on temporary frames (0.70 = 70%)",
+    "extraction_mode": "auto, full, or windowed - windowed decodes each chunk's source frames on demand instead of extracting the whole clip upfront",
     "scene_detection": "Detect hard cuts and replace RIFE's hybrid frames there instead of interpolating across them",
     "scene_threshold": "Spike multiplier over recent motion needed to flag a hard cut; lower is more sensitive",
     "scene_floor": "Absolute pixel-change floor below which nothing can be flagged as a hard cut",
@@ -315,6 +322,28 @@ def save_config(config):
 # --- System / binaries ---
 def command_exists(cmd):
     return shutil.which(cmd) is not None
+
+_PASSTHROUGH_FPS_ARGS = None
+
+def passthrough_fps_args():
+    """Args telling ffmpeg to emit exactly the frames it decoded, with no
+    CFR conforming - `-fps_mode passthrough` on ffmpeg 5.1+, and the older
+    `-vsync 0` spelling on anything that doesn't recognize it.
+
+    Windowed extraction is wrong without this (see WindowedFrameProvider),
+    so it's worth one cached probe rather than assuming either spelling."""
+    global _PASSTHROUGH_FPS_ARGS
+    if _PASSTHROUGH_FPS_ARGS is None:
+        modern = ["-fps_mode", "passthrough"]
+        try:
+            probe = subprocess.run([FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
+                                    "-f", "lavfi", "-i", "nullsrc=s=16x16:d=0.1", *modern,
+                                    "-frames:v", "1", "-f", "null", "-"],
+                                   capture_output=True, timeout=30)
+            _PASSTHROUGH_FPS_ARGS = modern if probe.returncode == 0 else ["-vsync", "0"]
+        except (subprocess.SubprocessError, OSError):
+            _PASSTHROUGH_FPS_ARGS = ["-vsync", "0"]
+    return list(_PASSTHROUGH_FPS_ARGS)
 
 def ffmpeg_has_filter(ffmpeg_bin, filter_name):
     try:
@@ -1037,7 +1066,7 @@ def _sample_avg_frame_bytes(frame_dir, sample_size=20):
     sampled = frames[::step][:sample_size]
     return sum(f.stat().st_size for f in sampled) / len(sampled)
 
-def _check_disk_space(frames_root, in_frames, target_count, config, peak_frames=None):
+def _check_disk_space(frames_root, in_frames, target_count, config, peak_frames=None, avg_bytes=None):
     """Estimate the temp bytes RIFE's interpolated output is about to add
     and abort before it starts if free space on frames_root's filesystem
     looks short. Source extraction has already completed by the time this
@@ -1056,9 +1085,9 @@ def _check_disk_space(frames_root, in_frames, target_count, config, peak_frames=
     disk at the same time, not the whole clip."""
     if not config_bool(config, "space_check", True):
         return
-    avg_bytes = _sample_avg_frame_bytes(in_frames)
+    avg_bytes = avg_bytes or _sample_avg_frame_bytes(in_frames)
     if not avg_bytes:
-        return  # nothing extracted to calibrate from - skip rather than guess
+        return  # nothing to calibrate from - skip rather than guess
     peak_frames = target_count if peak_frames is None else peak_frames
     needed = peak_frames * avg_bytes
     margin = config_float(config, "space_check_margin", 1.15)
@@ -1076,6 +1105,226 @@ def _check_disk_space(frames_root, in_frames, target_count, config, peak_frames=
     print(f"Disk space check: ~{needed / 1e9:.1f}GB estimated for RIFE's output frames, "
           f"{free / 1e9:.1f}GB free - OK.")
 
+def _human_bytes(value):
+    """Readable size for the planner's own one-line summaries. GB/MB rather
+    than GiB/MiB deliberately: it's the same unit `df`-style free-space
+    numbers and the existing disk-space check already print."""
+    value = float(value or 0)
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if value >= scale:
+            return f"{value / scale:.1f}{unit}"
+    return f"{value:.0f}B"
+
+
+def probe_source_duration(source):
+    """Container duration in seconds, or None. Used only to aim
+    _probe_frame_bytes at a representative frame (the middle of the clip
+    rather than frame 1, which is disproportionately often a black or
+    title frame and would skew the whole plan's bytes-per-frame estimate)."""
+    try:
+        result = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nokey=1:noprint_wrappers=1", str(source)],
+            capture_output=True, text=True, timeout=30)
+        return float(result.stdout.strip()) or None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+PROBE_POSITIONS = (0.08, 0.28, 0.5, 0.72, 0.92)
+
+def _probe_frame_bytes(source, vf=None, start=None, end=None, per_position=2):
+    """Average extracted-PNG size for THIS source through THIS filter chain,
+    measured from real frames spread across the window instead of guessed
+    from resolution.
+
+    PNG size tracks content detail as much as pixel count - a flat title
+    card and a grainy handheld shot at the same resolution differ several
+    fold - so every byte figure the planner reasons about is calibrated on
+    the clip itself. This runs *before* extraction (that's the whole point:
+    the plan decides whether extracting everything is even affordable), so
+    unlike _sample_avg_frame_bytes it has to decode its own samples.
+
+    Spreading those samples over several positions is not fussiness. A
+    single clump of consecutive frames measures one shot, and one shot is
+    routinely nothing like the clip's average: on a three-scene test clip
+    whose real average was 14.2KB/frame, a midpoint-only probe landed in a
+    static colour-bars section and reported 2.1KB - a 7x underestimate,
+    which is exactly the direction that makes the planner think an
+    unaffordable job fits. A handful of extra seeks costs milliseconds
+    against a run measured in minutes. Returns None if nothing decoded,
+    leaving the caller to fall back to its own estimate."""
+    window_start = float(start or 0.0)
+    window_end = float(end) if end is not None else probe_source_duration(source)
+    if window_end and window_end > window_start:
+        seeks = [window_start + (window_end - window_start) * fraction for fraction in PROBE_POSITIONS]
+    else:
+        seeks = [window_start]
+    sizes = []
+    probe_dir = Path(tempfile.mkdtemp(prefix="ffrife-probe-"))
+    try:
+        for index, seek in enumerate(seeks):
+            spot = probe_dir / f"{index:03d}"
+            spot.mkdir()
+            cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{seek:.6f}", "-i", str(source)]
+            if vf:
+                cmd += ["-vf", vf]
+            cmd += ["-frames:v", str(per_position), f"{spot}/%08d.png"]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=180)
+            except (subprocess.SubprocessError, OSError):
+                continue
+            sizes.extend(f.stat().st_size for f in spot.glob("*.png"))
+        return (sum(sizes) / len(sizes)) if sizes else None
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+# --- Pipeline planning ---------------------------------------------------
+#
+# A RIFE run has two independent speed-vs-disk axes, and the right setting
+# for a four-second verse clip is not the right setting for a forty-minute
+# program:
+#
+#   extraction - decode every source frame to PNG upfront (one clean
+#                sequential pass, fastest) or decode each chunk's own window
+#                on demand (an extra seek+decode per chunk, but the whole
+#                source frame set never has to be resident at once).
+#   encode     - hand every interpolated frame to one whole-clip encode at
+#                the end (fastest, and best compression: one encoder
+#                process, one uninterrupted lookahead) or encode and free
+#                them in bounded segments as they're produced (bounded peak
+#                disk, at a fixed per-segment process-startup cost and a
+#                lookahead reset per boundary).
+#
+# The fast end of both axes is strictly better wherever it fits, so the
+# planner is not trading time for space on principle - it spends as much of
+# the available disk as it safely can in order to buy time back. A clip
+# whose whole frame set fits gets the single-encode pipeline verbatim; one
+# that doesn't gets the largest segments that do, so the wall-clock penalty
+# is the smallest one that still bounds the run; and one whose *source*
+# frames alone would crowd out the budget gets windowed extraction, instead
+# of the mid-run disk-exhaustion failure that used to be the only other
+# outcome (the existing disk check runs only after extraction has already
+# completed, treating those frames as a sunk cost).
+PipelinePlan = collections.namedtuple(
+    "PipelinePlan",
+    "extraction stream segment_chunks chunk_frames chunk_count peak_bytes budget_bytes free_bytes avg_bytes reason",
+)
+
+# Encoded video is a rounding error beside raw PNG frames (a few percent at
+# the CRFs these tools use) but it isn't zero, and it lands on the same
+# filesystem - hold a little of the budget back for the segments and the
+# final muxed output rather than planning to spend every last byte.
+ENCODED_OUTPUT_ALLOWANCE = 0.08
+# Above this share of the budget, keeping the whole source frame set
+# resident leaves too little room for segments to be worth encoding in - at
+# which point windowed extraction buys far more than it costs.
+SOURCE_SHARE_LIMIT = 0.75
+# pipeline_mode=compact plans against a quarter of the normal budget: the
+# point of asking for compact is to leave the disk mostly alone, not merely
+# to stay under the same ceiling auto already respects.
+COMPACT_BUDGET_SCALE = 0.25
+
+
+def plan_pipeline(config, *, input_frame_count, target_count, avg_bytes, free_bytes, chunk_frames):
+    """Pick the fastest extraction/encode pipeline whose peak temporary disk
+    usage still fits the configured share of free space.
+
+    `chunk_frames` is the profile's own resumability-driven choice (0 for
+    unchunked) - the planner only ever shrinks it, and only when bounding
+    peak disk requires it, since chunking is what makes a bound possible at
+    all. `avg_bytes` is this clip's own measured bytes-per-PNG (see
+    _probe_frame_bytes). Returns a PipelinePlan; `reason` is the one-line
+    human explanation printed with it."""
+    mode = str(config.get("pipeline_mode", "auto")).strip().lower()
+    if mode not in {"auto", "fast", "compact"}:
+        raise ValueError("pipeline_mode must be auto, fast, or compact")
+    extraction_mode = str(config.get("extraction_mode", "auto")).strip().lower()
+    if extraction_mode not in {"auto", "full", "windowed"}:
+        raise ValueError("extraction_mode must be auto, full, or windowed")
+
+    budget = max(0.0, float(free_bytes) * config_float(config, "disk_budget_fraction", 0.70))
+    budget *= (1.0 - ENCODED_OUTPUT_ALLOWANCE)
+    if mode == "compact":
+        budget *= COMPACT_BUDGET_SCALE
+    avg_bytes = max(1.0, float(avg_bytes or 1.0))
+    input_frame_count = max(1, int(input_frame_count))
+    ratio = max(0.01, float(target_count) / input_frame_count)
+    source_bytes = input_frame_count * avg_bytes
+    interp_bytes = float(target_count) * avg_bytes
+
+    requested_segments = str(config.get("stream_segment_chunks", "auto")).strip().lower()
+    pinned_segments = None if requested_segments in {"", "auto"} else config_int(config, "stream_segment_chunks", 8, minimum=1)
+
+    def finish(extraction, stream, planned_chunk_frames, segment_chunks, reason):
+        ranges = _chunk_ranges(input_frame_count, planned_chunk_frames)
+        count = len(ranges)
+        if stream:
+            segment_chunks = pinned_segments if pinned_segments is not None else segment_chunks
+            segment_chunks = max(1, min(int(segment_chunks), count))
+        else:
+            segment_chunks = count
+        resident_source = source_bytes if extraction == "full" else max(end - start for start, end in ranges) * avg_bytes
+        resident_interp = interp_bytes * (min(1.0, segment_chunks / count) if stream else 1.0)
+        return PipelinePlan(extraction, stream, segment_chunks, planned_chunk_frames, count,
+                            resident_source + resident_interp, budget, float(free_bytes), avg_bytes, reason)
+
+    if mode == "fast":
+        return finish("full", False, chunk_frames, 0,
+                      "pipeline_mode=fast - one upfront extraction and one whole-clip encode, peak disk unbounded")
+    if mode == "auto" and extraction_mode != "windowed" and source_bytes + interp_bytes <= budget:
+        return finish("full", False, chunk_frames, 0,
+                      f"whole job fits the budget ({_human_bytes(source_bytes + interp_bytes)} of "
+                      f"{_human_bytes(budget)}) - nothing to gain from bounding it")
+
+    # Everything below bounds peak disk, which is only possible with
+    # chunking - an unchunked profile (chunk_frames=0) has exactly one chunk
+    # covering the whole clip, so there is nothing to encode and free early.
+    windowed = extraction_mode == "windowed" or (
+        extraction_mode == "auto" and source_bytes > budget * SOURCE_SHARE_LIMIT)
+
+    if windowed:
+        # Peak is one chunk's own source frames plus the segment they feed,
+        # so a chunk costs (1 + ratio) frame-sizes of budget.
+        affordable = int(budget / (avg_bytes * (1.0 + ratio)))
+        planned = max(2, min(chunk_frames or input_frame_count, max(2, affordable)))
+        room = max(avg_bytes, budget - planned * avg_bytes)
+        segments = max(1, int(room / (planned * ratio * avg_bytes)))
+        reason = (f"source frames alone ({_human_bytes(source_bytes)}) would crowd out a "
+                  f"{_human_bytes(budget)} budget - decoding each chunk's window on demand instead")
+        if extraction_mode == "windowed":
+            reason = "extraction_mode=windowed - decoding each chunk's source window on demand"
+        return finish("windowed", True, planned, segments, reason)
+
+    # Full extraction, streamed encode: the source set stays resident, so
+    # only what's left over bounds a segment.
+    room = max(avg_bytes, budget - source_bytes)
+    affordable = int(room / (avg_bytes * ratio))
+    planned = max(2, min(chunk_frames or input_frame_count, max(2, affordable)))
+    segments = max(1, int(room / (planned * ratio * avg_bytes)))
+    reason = (f"{_human_bytes(source_bytes + interp_bytes)} of frames would exceed the "
+              f"{_human_bytes(budget)} budget - encoding and freeing them in segments")
+    if mode == "compact":
+        reason = f"pipeline_mode=compact - bounding peak disk to a {_human_bytes(budget)} working set"
+    return finish("full", True, planned, segments, reason)
+
+
+def describe_plan(plan, input_frame_count, target_count):
+    """The planner's decision as two printable lines - what it chose, and
+    the numbers it chose from, so a surprising choice can be checked against
+    real figures rather than guessed at."""
+    pipeline = ("windowed extraction" if plan.extraction == "windowed" else "full extraction")
+    pipeline += (f", streamed encode ({plan.segment_chunks} chunk(s)/segment, {plan.chunk_count} chunk(s))"
+                 if plan.stream else ", single whole-clip encode")
+    return [
+        f"Pipeline: {pipeline}",
+        f"  {plan.reason}",
+        f"  {input_frame_count} source -> {target_count} output frames at ~{_human_bytes(plan.avg_bytes)}/frame; "
+        f"peak temp ~{_human_bytes(plan.peak_bytes)} of {_human_bytes(plan.free_bytes)} free",
+    ]
+
+
 def _link_or_copy(source, destination):
     try:
         os.link(source, destination)
@@ -1088,7 +1337,7 @@ def _write_json_atomic(path, payload):
     temp.replace(path)
 
 def suppress_scene_cut_interpolation_range(in_frames, out_frames, input_count, target_count, cuts,
-                                            range_start=0, range_end=None, index_offset=0):
+                                            range_start=0, range_end=None, index_offset=0, source_offset=0):
     """Replace output samples strictly between each cut's real endpoints,
     restricted to the global output-index window [range_start, range_end).
 
@@ -1099,7 +1348,12 @@ def suppress_scene_cut_interpolation_range(in_frames, out_frames, input_count, t
     whole clip in one call, identical to this function's prior whole-clip-
     only behavior - see _render_rife_chunks for the per-chunk caller, which
     narrows the window instead so each chunk can be encoded and freed
-    without waiting for the rest of the clip."""
+    without waiting for the rest of the clip.
+
+    `source_offset` is the same idea for the *input* side: under windowed
+    extraction (see WindowedFrameProvider) `in_frames` holds only one
+    chunk's own source frames, also numbered from 1, so the global
+    zero-based source index of a cut has to be rebased the same way."""
     if range_end is None:
         range_end = target_count
     if input_count < 2 or target_count < 2:
@@ -1113,7 +1367,9 @@ def suppress_scene_cut_interpolation_range(in_frames, out_frames, input_count, t
         last = math.ceil(cut * scale) - 1
         # `cut` is the zero-based index of the shot's first frame; frame
         # files are one-based, so the post-cut source is at `cut + 1`.
-        source = Path(in_frames) / f"{cut + 1:08d}.png"
+        source = Path(in_frames) / f"{cut + 1 - source_offset:08d}.png"
+        if not source.exists():
+            continue  # a cut belonging to a neighbouring chunk's own window
         for output_zero_index in range(max(first, range_start), min(last, range_end - 1) + 1):
             destination = Path(out_frames) / f"{output_zero_index - index_offset + 1:08d}.png"
             if destination.exists():
@@ -1125,10 +1381,73 @@ def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_
     """Whole-clip convenience wrapper - see suppress_scene_cut_interpolation_range."""
     return suppress_scene_cut_interpolation_range(in_frames, out_frames, input_count, target_count, cuts)
 
+def _tiny_frame_stream(input_args, pre_vf, width, height):
+    """ffmpeg command streaming `input_args` as raw width x height rgb24
+    frames on stdout - the shared front end of detect_transitions and
+    count_decoded_frames.
+
+    `input_args` is either an extracted-PNG sequence or the source video
+    itself; `pre_vf` is the run's own -vf chain, which has to be applied
+    *before* the downscale when reading from the source so the frames
+    detection sees are the same frames RIFE will (a filter chain that
+    crops, pads, or changes the frame count must not diverge between the
+    two).
+
+    The explicit `format=rgb24` before the downscale is what makes those
+    two inputs actually comparable, and it is not cosmetic. Left out,
+    ffmpeg scales a video source in its native yuv420p - averaging
+    already-subsampled chroma - while a PNG sequence is scaled in full RGB,
+    and the two produce measurably different 32x18 frames. Detection then
+    finds different gradual transitions for the same clip depending only on
+    which input it happened to read (observed directly: identical hard cuts,
+    but 2 transition intervals from PNGs against 4 from the source, on the
+    same file). Converting first makes both paths scale identical RGB data,
+    and is a no-op for the PNG input that is already rgb24."""
+    scale = f"format=rgb24,scale={width}:{height}"
+    return [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", *input_args,
+            "-vf", f"{pre_vf},{scale}" if pre_vf else scale,
+            "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+
+
+def frames_input_args(in_frames, source_fps):
+    """detect_transitions' default input: the already-extracted PNG sequence."""
+    return ["-framerate", f"{float(source_fps):.12g}", "-i", str(Path(in_frames) / "%08d.png")]
+
+
+def count_decoded_frames(input_args, pre_vf=None):
+    """Exact post-filter frame count for `input_args`, by decoding it to
+    tiny raw frames and counting them.
+
+    Windowed extraction needs the source's real frame count before any
+    frame has been extracted (it sizes the chunk ranges), and neither
+    ffprobe's `nb_frames` (frequently absent, and wrong for anything
+    remuxed) nor duration x fps (wrong for VFR, and off by a frame either
+    way at the boundaries) is trustworthy enough to slice chunks on. This
+    costs one decode pass at 2x2, which is the cheapest correct answer
+    available. detect_transitions already returns the same count for free
+    when scene detection is on, so this only runs when it's off."""
+    proc = subprocess.Popen(_tiny_frame_stream(input_args, pre_vf, 2, 2),
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    count = 0
+    while len(proc.stdout.read(12)) == 12:
+        count += 1
+    proc.stdout.close()
+    if proc.wait() != 0:
+        raise RuntimeError("could not count the source's frames")
+    return count
+
+
 def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.05,
                         revert_fraction=0.5, min_duration=0.25,
-                        sensitivity=1.35, alignment=0.80, detect_gradual=True):
+                        sensitivity=1.35, alignment=0.80, detect_gradual=True,
+                        input_args=None, pre_vf=None):
     """Single-pass detection of hard cuts and gradual transitions.
+
+    `input_args` overrides the default "read the extracted PNG sequence in
+    `in_frames`" input with any other ffmpeg input (windowed extraction
+    passes the source video itself, since there is no complete extracted
+    sequence to read); `pre_vf` is then the run's own filter chain, applied
+    before the downscale so both paths see the identical frame sequence.
 
     Tiny RGB frames (32x18, cheap enough to hold in memory for the whole
     clip) make this cheap, and colour - not just luma - matters: a cut
@@ -1167,15 +1486,15 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
       same as long ones; the magnitude/alignment gates already reject
       one-off motion spikes.
 
-    Returns ``(cuts, transitions)``: ``cuts`` is a sorted list of
-    zero-based indices of frames that begin a new shot; ``transitions`` is
-    a list of zero-based ``(start, end)`` frame ranges for sustained
-    fades/dissolves.
+    Returns ``(cuts, transitions, frame_count)``: ``cuts`` is a sorted list
+    of zero-based indices of frames that begin a new shot; ``transitions``
+    is a list of zero-based ``(start, end)`` frame ranges for sustained
+    fades/dissolves; ``frame_count`` is how many frames this pass actually
+    saw, which windowed extraction uses as the clip's authoritative source
+    frame count (it has no extracted sequence to count instead).
     """
     width, height = 32, 18
-    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-framerate",
-           f"{float(source_fps):.12g}", "-i", str(Path(in_frames) / "%08d.png"),
-           "-vf", f"scale={width}:{height}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+    cmd = _tiny_frame_stream(input_args or frames_input_args(in_frames, source_fps), pre_vf, width, height)
     size = width * height * 3
     minimum = max(3, round(float(min_duration) * float(source_fps)))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -1204,7 +1523,7 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
     if proc.wait() != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
     if frame_count < 3:
-        return [], []
+        return [], [], frame_count
 
     def baseline_at(index):
         history_end = max(1, index - minimum)
@@ -1261,7 +1580,7 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
                 next_magnitude >= magnitude * float(revert_fraction)):
             continue  # part of a sustained burst (e.g. a whip pan), not a one-off cut
         cuts.append(frame_index)
-    return sorted(set(cuts)), transitions
+    return sorted(set(cuts)), transitions, frame_count
 
 def parse_transition_ranges(value, source_fps, input_count):
     ranges = []
@@ -1305,23 +1624,30 @@ def _chunk_ranges(frame_count, chunk_frames):
         start = end - 1  # overlap one endpoint so RIFE sees the seam
     return ranges
 
-def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config):
-    """Returns (cuts, transition_count): cuts is a sorted, deduped list of
-    global zero-based hard-cut frame indices (explicit --transition-ranges
-    plus anything scene_detection found), or (None, 0) if scene_detection is
-    off. Split out of render_rife_frames because the streaming-encode branch
-    below needs this resolved *before* RIFE runs (so each chunk can suppress
-    its own cut-adjacent frames as it's generated), while the plain branch
-    keeps doing it after, exactly as before - see _render_rife_chunks'
-    ``encode`` parameter."""
+def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config, input_args=None, pre_vf=None):
+    """Returns (cuts, transition_count, frame_count): cuts is a sorted,
+    deduped list of global zero-based hard-cut frame indices (explicit
+    --transition-ranges plus anything scene_detection found), or None if
+    scene_detection is off. Split out of render_rife_frames because the
+    streaming-encode branch below needs this resolved *before* RIFE runs (so
+    each chunk can suppress its own cut-adjacent frames as it's generated),
+    while the plain branch keeps doing it after, exactly as before - see
+    _render_rife_chunks' ``encode`` parameter.
+
+    `input_args`/`pre_vf` let windowed extraction run the same detection
+    straight off the source video, since it deliberately never has the whole
+    extracted PNG sequence on disk to read - see detect_transitions.
+    `frame_count` is what that pass actually saw (None when detection is
+    off), which windowed extraction needs as the clip's real source frame
+    count."""
     if not (config_bool(config, "scene_detection", True) and input_frame_count > 1):
-        return None, 0
+        return None, 0, None
     scene_threshold = config_float(config, "scene_threshold", 3.0)
     if scene_threshold <= 0:
         raise ValueError("scene_threshold must be greater than 0")
     explicit_transitions = parse_transition_ranges(config.get("transition_ranges", ""), source_fps, input_frame_count)
     print(f"Detecting scene cuts and transitions (sensitivity={scene_threshold:g})...")
-    cuts, transitions = detect_transitions(
+    cuts, transitions, frame_count = detect_transitions(
         in_frames, source_fps,
         cut_sensitivity=scene_threshold,
         cut_floor=config_float(config, "scene_floor", 0.05),
@@ -1330,11 +1656,12 @@ def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config):
         sensitivity=config_float(config, "transition_sensitivity", 1.35),
         alignment=config_float(config, "transition_alignment", 0.80),
         detect_gradual=config_bool(config, "gradual_transition_detection", True),
+        input_args=input_args, pre_vf=pre_vf,
     )
     transitions = list(explicit_transitions) + transitions
     for start_frame, end_frame in transitions:
         cuts.extend(range(start_frame + 1, end_frame + 1))
-    return sorted(set(cuts)), len(transitions)
+    return sorted(set(cuts)), len(transitions), frame_count
 
 def _validate_media_file(path):
     """Cheap corruption/truncation check: does `path` decode cleanly start
@@ -1376,6 +1703,110 @@ def _concat_video_segments(segment_paths, output_path):
     for p in segment_paths:
         p.unlink(missing_ok=True)
 
+class WindowedExtractionError(RuntimeError):
+    """On-demand chunk extraction produced something that can't be trusted
+    to line up with the rest of the clip - see WindowedFrameProvider. Never
+    fatal on its own: render_rife_frames catches it and redoes the run with
+    ordinary upfront extraction, because a silently misaligned chunk would
+    be a quality bug nobody notices, while a slower run is merely slower."""
+
+
+class FullFrameProvider:
+    """Every source frame was extracted upfront; a chunk's input is just
+    hardlinks into that one directory. This is what ffrife has always done,
+    and it stays the default whenever the whole source frame set comfortably
+    fits the disk budget (see plan_pipeline) - one clean sequential decode
+    is the fastest way to get frames on disk."""
+
+    windowed = False
+
+    def __init__(self, in_frames, count=None):
+        self.in_frames = Path(in_frames)
+        self._frames = sorted(self.in_frames.glob("*.png"))
+        self.count = len(self._frames) if count is None else count
+
+    def materialize(self, start, end, chunk_in):
+        """Populate `chunk_in` with source frames [start, end), and return
+        the (directory, global-index offset) that cut suppression should
+        read this chunk's own source frames from."""
+        for local_index, source_frame in enumerate(self._frames[start:end], 1):
+            _link_or_copy(source_frame, Path(chunk_in) / f"{local_index:08d}.png")
+        return self.in_frames, 0
+
+
+class WindowedFrameProvider:
+    """Decodes each chunk's own source window on demand instead of
+    extracting the whole clip upfront.
+
+    This is the one thing that bounds the *source* side of peak disk. Even
+    with streaming encode holding the interpolated side to one segment, a
+    long or high-resolution clip's extracted source PNGs are a hard floor
+    that has to be paid in full before RIFE starts - tens of GB on a
+    feature-length 1080p input - and the existing disk check can't help,
+    because it only runs once extraction has already completed and treats
+    those frames as a sunk cost. Windowed extraction turns that floor into
+    one chunk's worth.
+
+    Correctness rests on ffmpeg's accurate input-side seek (`-ss` before
+    `-i`, which decodes from the preceding keyframe and discards up to the
+    seek point) landing on exactly the frame asked for. Three things make
+    that hold:
+
+    * The seek time is aimed half a frame *before* the wanted frame, so
+      ordinary rounding can't tip it to the next one.
+    * ``-fps_mode passthrough``. Without it ffmpeg conforms the output to a
+      CFR grid starting at the seek time, and since a seek lands between
+      two frame timestamps it emits a *duplicate* of the first frame to fill
+      the gap - which shifts every later frame in the chunk by one. Measured,
+      not theorised: on a plain CFR 30fps h264 clip, every chunk after the
+      first was wrong by exactly that one duplicated frame, and every chunk
+      became byte-exact with passthrough on.
+    * Every chunk is then verified anyway: it must produce exactly the
+      frames requested, and - because _chunk_ranges deliberately overlaps
+      one source frame between neighbours - its first frame must be
+      byte-identical to the previous chunk's last. A VFR source, a bad fps
+      probe, or an ffmpeg quirk none of the above anticipated fails that
+      check and falls back to upfront extraction, rather than silently
+      shifting a chunk by a frame."""
+
+    windowed = True
+
+    def __init__(self, source, count, source_fps, window_start=0.0, vf=None):
+        self.source = source
+        self.count = int(count)
+        self.source_fps = float(source_fps)
+        self.window_start = float(window_start or 0.0)
+        self.vf = vf
+        self._seam_digest = None
+
+    def materialize(self, start, end, chunk_in):
+        chunk_in = Path(chunk_in)
+        # Half a frame early: accurate seek keeps frames at or after the
+        # seek time, so aiming at (start - 0.5)/fps lands on `start` itself
+        # for any rounding within half a frame either way.
+        seek = self.window_start + max(0.0, start - 0.5) / self.source_fps
+        cmd = ["-ss", f"{seek:.6f}", "-i", str(self.source)]
+        if self.vf:
+            cmd += ["-vf", self.vf]
+        cmd += passthrough_fps_args() + ["-frames:v", str(end - start), f"{chunk_in}/%08d.png"]
+        run_ffmpeg(cmd, label=f"Extracting source frames {start + 1}-{end}")
+        frames = sorted(chunk_in.glob("*.png"))
+        if len(frames) != end - start:
+            raise WindowedExtractionError(
+                f"on-demand extraction of source frames {start + 1}-{end} produced "
+                f"{len(frames)} frame(s), not {end - start}")
+        if self._seam_digest is not None and _file_digest(frames[0]) != self._seam_digest:
+            raise WindowedExtractionError(
+                f"on-demand extraction of source frames {start + 1}-{end} did not resume "
+                f"from the previous chunk's last frame - the source's timing can't be seeked reliably")
+        self._seam_digest = _file_digest(frames[-1])
+        return chunk_in, start
+
+
+def _file_digest(path):
+    return hashlib.md5(Path(path).read_bytes()).hexdigest()
+
+
 def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, config, state_path,
                          cuts=None, input_count=None, encode=None):
     """Run RIFE over `in_frames` in resumable chunks (see docs/ffrife.md).
@@ -1408,9 +1839,14 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
     interruption can only cost the batch that was still in progress, not
     the whole run - see docs/ffrife.md's "Streaming encode" section.
     `out_frames`/`target_count`'s frame-file contract is unused in this
-    mode; the return value is the finalized segment video paths instead."""
-    inputs = sorted(Path(in_frames).glob("*.png"))
-    ranges = _chunk_ranges(len(inputs), config_int(config, "chunk_frames", 0))
+    mode; the return value is the finalized segment video paths instead.
+
+    `in_frames` is either a directory of already-extracted source frames
+    (wrapped in a FullFrameProvider, the historical shape) or a provider
+    that materializes one chunk's frames at a time - see
+    WindowedFrameProvider, which never needs the whole source set on disk."""
+    provider = in_frames if hasattr(in_frames, "materialize") else FullFrameProvider(in_frames)
+    ranges = _chunk_ranges(provider.count, config_int(config, "chunk_frames", 0))
     state = {}
     if state_path.exists():
         try:
@@ -1418,7 +1854,7 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         except (OSError, ValueError):
             state = {}
     completed = set(state.get("completed_chunks", []))
-    total_intervals = max(1, len(inputs) - 1)
+    total_intervals = max(1, provider.count - 1)
     target_intervals = max(0, target_count - 1)
 
     if encode is None:
@@ -1441,8 +1877,7 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
             shutil.rmtree(chunk_in, ignore_errors=True)
             shutil.rmtree(chunk_out, ignore_errors=True)
             chunk_in.mkdir(parents=True); chunk_out.mkdir(parents=True)
-            for local_index, source_frame in enumerate(inputs[start:end], 1):
-                _link_or_copy(source_frame, chunk_in / f"{local_index:08d}.png")
+            provider.materialize(start, end, chunk_in)
             first_interval = round(start * target_intervals / total_intervals)
             last_interval = round((end - 1) * target_intervals / total_intervals)
             chunk_target = max(2, last_interval - first_interval + 1)
@@ -1536,20 +1971,24 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         shutil.rmtree(chunk_in, ignore_errors=True)
         shutil.rmtree(chunk_out, ignore_errors=True)
         chunk_in.mkdir(parents=True); chunk_out.mkdir(parents=True)
-        for local_index, source_frame in enumerate(inputs[start:end], 1):
-            _link_or_copy(source_frame, chunk_in / f"{local_index:08d}.png")
+        cut_source, cut_source_offset = provider.materialize(start, end, chunk_in)
         first_interval = round(start * target_intervals / total_intervals)
         last_interval = round((end - 1) * target_intervals / total_intervals)
         chunk_target = max(2, last_interval - first_interval + 1)
         print(f"RIFE chunk {index + 1}/{len(ranges)} ({end - start} source frames)...")
         run_rife(rife_path, chunk_in, chunk_out, chunk_target, model_path=model_path,
                  threads=config.get("rife_threads"), gpu=config.get("rife_gpu"))
-        shutil.rmtree(chunk_in, ignore_errors=True)
         if cuts:
+            # Before chunk_in goes away, not after: under windowed
+            # extraction those frames ARE the only copy of this chunk's
+            # source, and cut suppression reads them to replace RIFE's
+            # hybrids with real held frames.
             replaced_total += suppress_scene_cut_interpolation_range(
-                in_frames, chunk_out, input_count, target_count, cuts,
+                cut_source, chunk_out, input_count, target_count, cuts,
                 range_start=first_interval, range_end=last_interval + 1, index_offset=first_interval,
+                source_offset=cut_source_offset,
             )
+        shutil.rmtree(chunk_in, ignore_errors=True)
         pending_batch.append(index)
         if len(pending_batch) >= segment_chunks or index + 1 == len(ranges):
             _finalize_segment()
@@ -1564,6 +2003,53 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         print(f"Transitions: {replaced_total} interpolated frame(s) replaced across cut/transition boundaries.")
     return [segments_dir / seg["file"] for seg in segments]
 
+def _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration):
+    """Decode the whole source window to PNGs in one sequential pass, reusing
+    a complete extraction left behind by an interrupted run. Returns the
+    frame count actually on disk."""
+    extracted_count = len(list(in_frames.glob("*.png")))
+    expected_extracted_count = None
+    if extract_marker.exists():
+        try:
+            expected_extracted_count = int(json.loads(extract_marker.read_text())["frame_count"])
+        except (OSError, ValueError, KeyError, TypeError):
+            expected_extracted_count = None
+    if expected_extracted_count and extracted_count == expected_extracted_count:
+        print(f"Resuming: {extracted_count} extracted source frames already complete.")
+        return extracted_count
+    if extract_marker.exists() or extracted_count:
+        print("Extracted-frame resume data is incomplete; rebuilding it.")
+    shutil.rmtree(in_frames, ignore_errors=True)
+    in_frames.mkdir(parents=True)
+    extract_cmd = trim_args + ["-i", str(source)]
+    if vf:
+        extract_cmd += ["-vf", vf]
+    extract_cmd += [f"{in_frames}/%08d.png"]
+    run_ffmpeg(extract_cmd, duration=duration, label="Extracting")
+    count = len(list(in_frames.glob("*.png")))
+    _write_json_atomic(extract_marker, {"frame_count": count})
+    return count
+
+
+def _estimate_source_frame_count(source, source_fps, start, end):
+    """Roughly how many frames the requested window holds, for planning only.
+
+    The planner needs a frame count *before* anything is extracted - that's
+    the whole point, since one of the things it decides is whether
+    extracting everything is affordable at all. Duration x fps is good to a
+    frame or two, which is far below the resolution of a disk-budget
+    decision; the exact count always comes from the extraction (or the
+    detection pass, under windowed extraction) afterwards, and every real
+    chunk boundary is computed from that."""
+    window = (end - start) if (start is not None and end is not None) else None
+    if window is None:
+        duration = probe_source_duration(source)
+        window = max(0.0, duration - float(start or 0.0)) if duration else None
+    if not window or not source_fps:
+        return None
+    return max(1, round(window * float(source_fps)))
+
+
 def render_rife_frames(source, frames_root, config, start=None, end=None, vf=None, fps=60, speed=None, source_fps=None,
                         output_vf=None, stream_encode=False):
     """Decode a source window, synthesize its final retimed RIFE frame
@@ -1575,13 +2061,17 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     configured ffmpeg fallback without creating an intermediate video.
 
     ``stream_encode=True`` (used only by interpolate()'s own RIFE branch,
-    never by the sectioned/library callers above) switches the chunked path
-    to _render_rife_chunks' "Streaming encode" mode instead: ``out_frames``
-    in the return tuple is then a single finished, video-only .mkv file
-    (chunks encoded and freed in bounded batches, then losslessly joined),
-    not a directory of PNGs - see docs/ffrife.md. ``output_vf`` is only
-    meaningful in that mode, applied per-segment since there's no later
-    separate merge step for video to apply it in.
+    never by the sectioned/library callers above) does not force the
+    streaming pipeline - it says this caller can *accept* one, i.e. that a
+    finished video-only .mkv is an acceptable return value in place of a
+    directory of PNGs. Which pipeline actually runs is plan_pipeline's
+    decision, made from this clip's own measured frame size against the free
+    space on ``frames_root``'s filesystem: a clip whose whole frame set fits
+    still gets the single whole-clip encode, because that is both faster and
+    better-compressing than segmenting it for no reason. Callers that can
+    only take PNGs leave this False and always get them. ``output_vf`` is
+    only meaningful when a streaming pipeline is actually chosen, applied
+    per-segment since there's no later separate merge step for video then.
     """
     if str(fps).strip().lower().endswith(("x", "%")):
         fps = resolve_target_fps(fps, probe_source_fps(source))
@@ -1603,93 +2093,170 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     out_frames.mkdir(parents=True, exist_ok=True)
     trim_args = source_window_args(start, end)
     duration = (end - start) if (start is not None and end is not None) else None
-    extract_cmd = trim_args + ["-i", str(source)]
-    if vf:
-        extract_cmd += ["-vf", vf]
-    extract_cmd += [f"{in_frames}/%08d.png"]
     extract_marker = frames_root / "extract-complete.json"
-    extracted_count = len(list(in_frames.glob("*.png")))
-    expected_extracted_count = None
-    if extract_marker.exists():
-        try:
-            expected_extracted_count = int(json.loads(extract_marker.read_text())["frame_count"])
-        except (OSError, ValueError, KeyError, TypeError):
-            expected_extracted_count = None
-    if expected_extracted_count and extracted_count == expected_extracted_count:
-        print(f"Resuming: {extracted_count} extracted source frames already complete.")
-    else:
-        if extract_marker.exists() or extracted_count:
-            print("Extracted-frame resume data is incomplete; rebuilding it.")
-        shutil.rmtree(in_frames, ignore_errors=True)
-        in_frames.mkdir(parents=True)
-        run_ffmpeg(extract_cmd, duration=duration, label="Extracting")
-        _write_json_atomic(extract_marker, {"frame_count": len(list(in_frames.glob("*.png")))})
-
-    input_frame_count = len(list(in_frames.glob("*.png")))
-    if input_frame_count == 0:
-        print("No frames extracted - nothing to interpolate.")
-        return None
-    source_fps = float(source_fps) if source_fps is not None else probe_source_fps(source)
-    # Generate the final temporal samples directly. For half speed this is
-    # twice the normal target count, avoiding setpts-driven frame duplication.
+    source_input_args = trim_args + ["-i", str(source)]
     speed_factor = speed if speed and speed != 1 else 1.0
-    target_count = round(input_frame_count * fps / source_fps / speed_factor)
-    model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
+
     # Library callers historically pass only the settings they own - keep
     # that API compatible. No chunk_frames means no chunking, which means
-    # no disk-spike concern to address, so stream_encode has no effect
-    # here either: same single run_rife() call and flat out_frames
-    # directory as always, regardless of which mode the caller asked for.
+    # neither streaming nor windowed extraction is available anyway (both
+    # need chunk boundaries to encode and free at): one run_rife() call and
+    # one flat out_frames directory, as always.
     if "chunk_frames" not in config:
+        input_frame_count = _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration)
+        if input_frame_count == 0:
+            print("No frames extracted - nothing to interpolate.")
+            return None
+        source_fps = float(source_fps) if source_fps is not None else probe_source_fps(source)
+        target_count = round(input_frame_count * fps / source_fps / speed_factor)
+        model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
         _check_disk_space(frames_root, in_frames, target_count, config)
         run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
-        cuts, transition_count = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
+        cuts, transition_count, _ = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
         if cuts is not None:
             replaced = suppress_scene_cut_interpolation(in_frames, out_frames, input_frame_count, target_count, cuts)
             print(f"Transitions: {transition_count} gradual interval(s), {len(cuts)} protected boundary/boundaries; "
                   f"{replaced} interpolated frame(s) replaced.")
         return out_frames, fps, retimed_duration(duration, speed)
 
+    source_fps = float(source_fps) if source_fps is not None else probe_source_fps(source)
+    model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
+    joined_video = frames_root / "video.mkv"
+    if stream_encode and joined_video.exists() and _validate_media_file(joined_video):
+        # A previous run got as far as losslessly joining every segment and
+        # was interrupted during the cheap mux/remux that follows. Without
+        # this check, resume would find the segment files already consumed
+        # by that join, discard the whole segment list as unverifiable, and
+        # redo every RIFE chunk - by far the most expensive thing in the
+        # pipeline - to rebuild a file that is already sitting right here.
+        print("Resuming: interpolated video already complete.")
+        return joined_video, fps, retimed_duration(duration, speed)
+
+    # --- Plan the pipeline before committing to an extraction strategy ---
     width, height = probe_source_resolution(source)
+    extracted_count = len(list(in_frames.glob("*.png")))
+    resuming_extraction = extract_marker.exists() and extracted_count > 0
+    if resuming_extraction:
+        # Already paid for upfront extraction on an earlier attempt; the
+        # frames are real data, so measure them instead of probing.
+        estimated_count, avg_bytes = extracted_count, _sample_avg_frame_bytes(in_frames)
+    else:
+        estimated_count = _estimate_source_frame_count(source, source_fps, start, end)
+        avg_bytes = _probe_frame_bytes(source, vf=vf, start=start, end=end)
+    if not estimated_count or not avg_bytes:
+        # Nothing reliable to plan from (an unseekable stream, a failed
+        # probe): fall back to what ffrife has always done rather than guess.
+        estimated_count = estimated_count or 1
+        avg_bytes = avg_bytes or 0
+        config = dict(config, extraction_mode="full")
+
+    estimated_target = round(estimated_count * fps / source_fps / speed_factor)
     pixel_scale = (width * height) / REFERENCE_PIXELS if width and height else 1.0
-    fps_scale = (target_count / input_frame_count) / REFERENCE_FPS_RATIO
-    effective = resolve_rife_policy(config, input_frame_count, workload_scale=pixel_scale * fps_scale)
+    fps_scale = (estimated_target / estimated_count) / REFERENCE_FPS_RATIO
+    effective = resolve_rife_policy(config, estimated_count, workload_scale=pixel_scale * fps_scale)
     print(f"RIFE profile: {effective['resolved_rife_profile']} "
           f"(threads={effective['rife_threads']}, chunks={effective['chunk_frames']}, "
           f"cooldown={effective['cooldown_seconds']}s)")
 
-    if stream_encode:
-        # Cuts must be known before any chunk runs, not after every chunk
-        # exists, so each one can suppress its own cut-adjacent frames as
-        # soon as it's generated - see _render_rife_chunks' "Streaming
-        # encode" mode and _resolve_scene_cuts.
-        cuts, transition_count = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
-        segment_chunks = config_int(config, "stream_segment_chunks", 8, minimum=1)
-        ranges = _chunk_ranges(input_frame_count, config_int(effective, "chunk_frames", 0))
-        peak_frames = round(target_count * min(1.0, segment_chunks / max(1, len(ranges))))
-        _check_disk_space(frames_root, in_frames, target_count, config, peak_frames=peak_frames)
-        encode = {
-            "segment_chunks": segment_chunks,
-            "fps": fps, "output_vf": output_vf, "encode_args": build_encode_args(config),
-        }
-        segments = _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, effective,
+    plan_config = dict(config)
+    if not stream_encode or resuming_extraction:
+        # Streaming is what makes windowed extraction viable (something has
+        # to free each chunk's frames as it goes), and a caller that can
+        # only take a PNG directory can't have either. A resumed run has
+        # already extracted everything, so windowing it now would throw that
+        # work away for nothing.
+        plan_config["pipeline_mode"] = "fast" if not stream_encode else plan_config.get("pipeline_mode", "auto")
+        plan_config["extraction_mode"] = "full"
+    plan = plan_pipeline(plan_config, input_frame_count=estimated_count, target_count=estimated_target,
+                         avg_bytes=avg_bytes or 1, free_bytes=shutil.disk_usage(frames_root).free,
+                         chunk_frames=config_int(effective, "chunk_frames", 0))
+
+    def _prepare(plan):
+        """Get this run's source frames into whatever shape `plan` chose,
+        and resolve the cuts each chunk will need, returning
+        (provider, cuts, transition_count, input_frame_count)."""
+        if plan.extraction == "windowed":
+            cuts, transition_count, counted = _resolve_scene_cuts(
+                in_frames, source_fps, estimated_count, config,
+                input_args=source_input_args, pre_vf=vf)
+            # Detection already decoded the whole clip, so it knows the real
+            # frame count for free; only a run with detection turned off has
+            # to pay for a separate counting pass.
+            count = counted or count_decoded_frames(source_input_args, vf)
+            provider = WindowedFrameProvider(source, count, source_fps, window_start=start or 0.0, vf=vf)
+            return provider, cuts, transition_count, count
+        count = _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration)
+        if count == 0:
+            return None, None, 0, 0
+        cuts, transition_count = None, 0
+        if plan.stream:
+            # Cuts must be known before any chunk runs, not after every
+            # chunk exists, so each one can suppress its own cut-adjacent
+            # frames as soon as it's generated - see _render_rife_chunks'
+            # "Streaming encode" mode.
+            cuts, transition_count, _ = _resolve_scene_cuts(in_frames, source_fps, count, config)
+        return FullFrameProvider(in_frames, count), cuts, transition_count, count
+
+    def _execute(plan):
+        provider, cuts, transition_count, input_frame_count = _prepare(plan)
+        if provider is None:
+            print("No frames extracted - nothing to interpolate.")
+            return None
+        target_count = round(input_frame_count * fps / source_fps / speed_factor)
+        # Re-plan against the real numbers now they're known, pinned to the
+        # extraction strategy already committed to above. Under full
+        # extraction the frames themselves are now on disk, so segment
+        # sizing can use their real average size rather than the pre-
+        # extraction probe's estimate of it.
+        measured_bytes = (_sample_avg_frame_bytes(in_frames) if plan.extraction == "full" else None) or avg_bytes or 1
+        final = plan_pipeline(dict(plan_config, extraction_mode=plan.extraction),
+                              input_frame_count=input_frame_count, target_count=target_count,
+                              avg_bytes=measured_bytes, free_bytes=shutil.disk_usage(frames_root).free,
+                              chunk_frames=config_int(effective, "chunk_frames", 0))
+        for line in describe_plan(final, input_frame_count, target_count):
+            print(line)
+        run_config = dict(effective, chunk_frames=str(final.chunk_frames))
+        ranges = _chunk_ranges(input_frame_count, final.chunk_frames)
+        # Source frames already extracted are a sunk cost against free
+        # space; only what's still to be written needs checking for.
+        pending_source = max(end - start for start, end in ranges) if final.extraction == "windowed" else 0
+        resident_interp = round(target_count * (final.segment_chunks / len(ranges) if final.stream else 1.0))
+        _check_disk_space(frames_root, in_frames, target_count, config,
+                          peak_frames=pending_source + resident_interp, avg_bytes=measured_bytes)
+
+        if not final.stream:
+            _render_rife_chunks(rife_path, provider, out_frames, target_count, model_path, run_config,
+                                frames_root / "rife-state.json")
+            cuts, transition_count, _ = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
+            if cuts is not None:
+                replaced = suppress_scene_cut_interpolation(in_frames, out_frames, input_frame_count, target_count, cuts)
+                print(f"Transitions: {transition_count} gradual interval(s), {len(cuts)} protected boundary/boundaries; "
+                      f"{replaced} interpolated frame(s) replaced.")
+            return out_frames, fps, retimed_duration(duration, speed)
+
+        encode = {"segment_chunks": final.segment_chunks, "fps": fps,
+                  "output_vf": output_vf, "encode_args": build_encode_args(config)}
+        segments = _render_rife_chunks(rife_path, provider, out_frames, target_count, model_path, run_config,
                                        frames_root / "rife-state.json",
                                        cuts=cuts, input_count=input_frame_count, encode=encode)
-        video_path = frames_root / "video.mkv"
-        _concat_video_segments(segments, video_path)
-        return video_path, fps, retimed_duration(duration, speed)
+        _concat_video_segments(segments, joined_video)
+        return joined_video, fps, retimed_duration(duration, speed)
 
-    _check_disk_space(frames_root, in_frames, target_count, config)
-    _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, effective,
-                        frames_root / "rife-state.json")
-    cuts, transition_count = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
-    if cuts is not None:
-        replaced = suppress_scene_cut_interpolation(
-            in_frames, out_frames, input_frame_count, target_count, cuts
-        )
-        print(f"Transitions: {transition_count} gradual interval(s), {len(cuts)} protected boundary/boundaries; "
-              f"{replaced} interpolated frame(s) replaced.")
-    return out_frames, fps, retimed_duration(duration, speed)
+    try:
+        return _execute(plan)
+    except WindowedExtractionError as exc:
+        # Correctness first: a chunk that can't be proved to line up with
+        # its neighbours is not something to ship. Redo the run with
+        # ordinary upfront extraction, which needs no seeking at all - it
+        # costs the disk this plan was trying to save, and it costs the RIFE
+        # work already done, but it cannot silently drop or duplicate a
+        # frame at a chunk boundary.
+        print(f"On-demand source extraction isn't reliable for this source ({exc}).")
+        print("Falling back to extracting every source frame upfront.")
+        shutil.rmtree(frames_root / "chunks", ignore_errors=True)
+        shutil.rmtree(frames_root / "segments", ignore_errors=True)
+        (frames_root / "rife-state.json").unlink(missing_ok=True)
+        return _execute(plan._replace(extraction="full"))
 
 
 def _finalize_primary_target(primary_target, output_file):
@@ -2079,7 +2646,7 @@ GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "v
                                   "resume", "keep_work", "scene_detection", "gradual_transition_detection",
                                   "container", "keep_subtitles", "keep_chapters", "keep_extra_audio_tracks",
                                   "keep_attachments", "keep_thumbnail", "keep_source_metadata", "space_check",
-                                  "stream_segment_chunks"}
+                                  "stream_segment_chunks", "pipeline_mode", "disk_budget_fraction", "extraction_mode"}
 
 def add_generic_config_overrides(parser):
     for key in DEFAULT_CONFIG:
@@ -2186,7 +2753,8 @@ def apply_run_overrides(args, config):
     # --no-resume/--keep-work/--space-check/--segment-chunks were all
     # parsed and silently discarded on every real run.
     for key in ("chunk_frames", "cooldown_seconds", "rife_gpu", "rife_threads",
-                "resume", "keep_work", "space_check", "stream_segment_chunks"):
+                "resume", "keep_work", "space_check", "stream_segment_chunks",
+                "pipeline_mode", "disk_budget_fraction", "extraction_mode"):
         value = getattr(args, key, None)
         if value is not None:
             config[key] = value
@@ -2226,7 +2794,15 @@ def add_processing_arguments(parser, include_trim=True):
     parser.add_argument("-c", "--chunk-frames", help="Source frames per resumable chunk; auto uses profile, 0 disables")
     parser.add_argument("--cooldown", "--cooldown-seconds", dest="cooldown_seconds", help="Seconds to rest between chunks")
     parser.add_argument("--segment-chunks", dest="stream_segment_chunks",
-                        help="RIFE chunks encoded together as one segment before their PNGs are freed (default: 8)")
+                        help="RIFE chunks encoded together as one segment before their PNGs are freed; auto sizes it from free disk")
+    parser.add_argument("--pipeline", dest="pipeline_mode", choices=["auto", "fast", "compact"],
+                        help="auto (default) runs the fastest pipeline whose peak temp disk still fits the budget; "
+                             "fast never bounds it; compact bounds it tightly")
+    parser.add_argument("--disk-budget", dest="disk_budget_fraction",
+                        help="Share of free disk the planner may spend on temporary frames (default: 0.70)")
+    parser.add_argument("--extraction", dest="extraction_mode", choices=["auto", "full", "windowed"],
+                        help="auto (default) extracts every source frame upfront unless that alone would crowd out "
+                             "the disk budget; windowed always decodes each chunk's window on demand")
     parser.add_argument("--container", choices=["mp4", "mkv"], help="Output container - overrides -o/the source's own extension")
     add_bool_flag(parser, "resume", "resume")
     add_bool_flag(parser, "keep_work", "keep-work", help_on="Keep completed intermediate frames for inspection")
