@@ -1119,5 +1119,296 @@ class FfrifeCmdSetupReinstallOfferTest(unittest.TestCase):
         install_mock.assert_not_called()
 
 
+class FfrifeApplyRunOverridesTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_previously_dropped_flags_now_apply_to_config(self) -> None:
+        # Regression: --chunk-frames/--cooldown/--rife-gpu/--rife-threads/
+        # --resume/--no-resume/--keep-work/--space-check/--segment-chunks
+        # were all parsed by argparse but never merged into the effective
+        # config anywhere, so they silently did nothing on a real run - see
+        # apply_run_overrides.
+        parser = self.ffrife.build_parser()
+        args = parser.parse_args([
+            "run", "in.mp4", "-o", "out.mp4",
+            "--chunk-frames", "500", "--cooldown", "7", "--rife-gpu", "1",
+            "--rife-threads", "1:2:2", "--no-resume", "--keep-work",
+            "--no-space-check", "--segment-chunks", "3",
+        ])
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        self.ffrife.apply_run_overrides(args, config)
+        self.assertEqual(config["chunk_frames"], "500")
+        self.assertEqual(config["cooldown_seconds"], "7")
+        self.assertEqual(config["rife_gpu"], "1")
+        self.assertEqual(config["rife_threads"], "1:2:2")
+        self.assertEqual(config["resume"], "false")
+        self.assertEqual(config["keep_work"], "true")
+        self.assertEqual(config["space_check"], "false")
+        self.assertEqual(config["stream_segment_chunks"], "3")
+
+
+class FfrifeStreamingEncodeTest(unittest.TestCase):
+    """Covers the "Streaming encode" mode of _render_rife_chunks - batching
+    completed RIFE chunks into bounded encode segments instead of keeping
+    every interpolated frame on disk until one final whole-clip encode - see
+    docs/ffrife.md and the AGENTS.md-referenced discussion this came from."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_suppress_scene_cut_range_matches_whole_clip_content_with_offset(self) -> None:
+        # 5 input frames -> 9 output frames is a 2x-ish ratio (scale=2.0),
+        # so cut=2 (zero-based) replaces exactly output_zero_index=3 with
+        # in_frames' post-cut frame (index 3, one-based). A chunk covering
+        # global range [2, 6) with index_offset=2 should replace the SAME
+        # source content, just at the chunk-local filename (3-2+1=2).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            in_frames = root / "in"; in_frames.mkdir()
+            for i in range(1, 6):
+                (in_frames / f"{i:08d}.png").write_bytes(f"src{i}".encode())
+
+            whole_out = root / "whole"; whole_out.mkdir()
+            for i in range(1, 10):
+                (whole_out / f"{i:08d}.png").write_bytes(b"interp")
+            whole_replaced = self.ffrife.suppress_scene_cut_interpolation(in_frames, whole_out, 5, 9, [2])
+            self.assertEqual(whole_replaced, 1)
+            self.assertEqual((whole_out / "00000004.png").read_bytes(), b"src3")
+
+            chunk_out = root / "chunk"; chunk_out.mkdir()
+            for i in range(1, 5):  # local frames covering global zero-indices 2..5
+                (chunk_out / f"{i:08d}.png").write_bytes(b"interp")
+            chunk_replaced = self.ffrife.suppress_scene_cut_interpolation_range(
+                in_frames, chunk_out, 5, 9, [2], range_start=2, range_end=6, index_offset=2,
+            )
+            self.assertEqual(chunk_replaced, 1)
+            self.assertEqual((chunk_out / "00000002.png").read_bytes(), b"src3")
+
+    def test_suppress_scene_cut_range_ignores_cuts_outside_its_window(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            in_frames = root / "in"; in_frames.mkdir()
+            for i in range(1, 6):
+                (in_frames / f"{i:08d}.png").write_bytes(f"src{i}".encode())
+            chunk_out = root / "chunk"; chunk_out.mkdir()
+            for i in range(1, 3):
+                (chunk_out / f"{i:08d}.png").write_bytes(b"interp")
+            # Same cut=2 as above, but this chunk only covers global range
+            # [6, 9) - well past output_zero_index=3 - so nothing replaces.
+            replaced = self.ffrife.suppress_scene_cut_interpolation_range(
+                in_frames, chunk_out, 5, 9, [2], range_start=6, range_end=9, index_offset=6,
+            )
+            self.assertEqual(replaced, 0)
+            self.assertEqual((chunk_out / "00000001.png").read_bytes(), b"interp")
+
+    def test_validate_media_file_checks_existence_size_and_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self.assertFalse(self.ffrife._validate_media_file(root / "missing.mkv"))
+
+            empty = root / "empty.mkv"; empty.write_bytes(b"")
+            self.assertFalse(self.ffrife._validate_media_file(empty))
+
+            good = root / "good.mkv"; good.write_bytes(b"data")
+            with patch.object(self.ffrife.subprocess, "run", return_value=MagicMock(returncode=0)):
+                self.assertTrue(self.ffrife._validate_media_file(good))
+
+            bad = root / "bad.mkv"; bad.write_bytes(b"data")
+            with patch.object(self.ffrife.subprocess, "run",
+                              side_effect=self.ffrife.subprocess.CalledProcessError(1, ["ffmpeg"])):
+                self.assertFalse(self.ffrife._validate_media_file(bad))
+
+    def test_concat_single_segment_moves_it_into_place_with_no_ffmpeg_call(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            seg = root / "seg.mkv"; seg.write_bytes(b"video")
+            target = root / "out.mkv"
+            with patch.object(self.ffrife, "run_ffmpeg", side_effect=AssertionError("should not run ffmpeg")):
+                self.ffrife._concat_video_segments([seg], target)
+            self.assertEqual(target.read_bytes(), b"video")
+            self.assertFalse(seg.exists())
+
+    def test_concat_multiple_segments_uses_ffmpeg_concat_demuxer(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            seg1, seg2 = root / "s1.mkv", root / "s2.mkv"
+            seg1.write_bytes(b"a"); seg2.write_bytes(b"b")
+            target = root / "out.mkv"
+            calls = []
+
+            def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+                calls.append(cmd)
+                Path(cmd[-1]).write_bytes(b"joined")
+
+            with patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg):
+                self.ffrife._concat_video_segments([seg1, seg2], target)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("concat", calls[0])
+            self.assertIn("-c", calls[0])
+            self.assertTrue(target.exists())
+            self.assertFalse(seg1.exists())
+            self.assertFalse(seg2.exists())
+
+    def test_finalize_primary_target_renames_when_containers_match(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "encoded.mkv"; src.write_bytes(b"data")
+            dest = root / "out.mkv"
+            with patch.object(self.ffrife.subprocess, "run", side_effect=AssertionError("should not remux")):
+                self.ffrife._finalize_primary_target(src, dest)
+            self.assertEqual(dest.read_bytes(), b"data")
+            self.assertFalse(src.exists())
+
+    def test_finalize_primary_target_remuxes_when_containers_differ(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "encoded.mkv"; src.write_bytes(b"data")
+            dest = root / "out.mp4"
+            calls = []
+
+            def fake_run(cmd, **_kwargs):
+                calls.append(cmd)
+                Path(cmd[-1]).write_bytes(b"remuxed")
+                return MagicMock(returncode=0)
+
+            with patch.object(self.ffrife.subprocess, "run", fake_run):
+                self.ffrife._finalize_primary_target(src, dest)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("-c", calls[0])
+            self.assertIn("copy", calls[0])
+            self.assertTrue(dest.exists())
+            self.assertFalse(src.exists())
+
+    def test_streaming_mode_batches_chunks_into_segments_and_frees_pngs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            in_frames = root / "in"; in_frames.mkdir()
+            for i in range(12):
+                (in_frames / f"{i:08d}.png").write_bytes(b"src")
+
+            def fake_run_rife(_binary, _input, output, target_count, **_kwargs):
+                for i in range(target_count):
+                    (Path(output) / f"{i:08d}.png").write_bytes(b"interp")
+
+            segment_calls = []
+
+            def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+                segment_calls.append(cmd)
+                flat_dir = Path(cmd[cmd.index("-i") + 1]).parent
+                frame_count = len(list(flat_dir.glob("*.png")))
+                Path(cmd[-1]).write_bytes(f"segment:{frame_count}".encode())
+
+            config = {"chunk_frames": "4", "cooldown_seconds": "0", "rife_threads": "auto", "rife_gpu": "auto"}
+            encode = {"segment_chunks": 2, "fps": 30, "output_vf": None, "encode_args": ["-c:v", "libsvtav1"]}
+            state_path = root / "state.json"
+            with patch.object(self.ffrife, "run_rife", fake_run_rife), \
+                 patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg):
+                segments = self.ffrife._render_rife_chunks(
+                    "rife", in_frames, root / "out", 24, "model", config, state_path,
+                    cuts=[], input_count=12, encode=encode,
+                )
+
+            self.assertEqual(len(segments), 2)  # 4 chunks / segment_chunks=2 -> 2 segments
+            self.assertEqual(len(segment_calls), 2)
+            self.assertIn("-c:v", segment_calls[0])
+            # Every chunk's PNGs are freed once its segment is finalized -
+            # nothing left under chunks/ after a clean run, unlike the
+            # non-streaming default (which keeps them all until one final
+            # whole-clip encode).
+            self.assertEqual(list((state_path.parent / "chunks").glob("*/out/*.png")), [])
+            state = self.ffrife.json.loads(state_path.read_text())
+            self.assertEqual(len(state["completed_chunks"]), 4)
+            self.assertEqual(len(state["segments"]), 2)
+
+    def test_streaming_resume_reuses_valid_segments_and_rebuilds_only_the_invalid_one(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            in_frames = root / "in"; in_frames.mkdir()
+            for i in range(8):
+                (in_frames / f"{i:08d}.png").write_bytes(b"src")
+
+            rife_calls = []
+
+            def fake_run_rife(_binary, _input, output, target_count, **_kwargs):
+                rife_calls.append(target_count)
+                for i in range(target_count):
+                    (Path(output) / f"{i:08d}.png").write_bytes(b"interp")
+
+            def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+                flat_dir = Path(cmd[cmd.index("-i") + 1]).parent
+                frame_count = len(list(flat_dir.glob("*.png")))
+                Path(cmd[-1]).write_bytes(f"segment:{frame_count}".encode())
+
+            config = {"chunk_frames": "4", "cooldown_seconds": "0", "rife_threads": "auto", "rife_gpu": "auto"}
+            encode = {"segment_chunks": 1, "fps": 30, "output_vf": None, "encode_args": ["-c:v", "libsvtav1"]}
+            state_path = root / "state.json"
+            # Trust plain non-empty fake byte content as "valid" - this test
+            # is about _render_rife_chunks' own resume/discard orchestration,
+            # not _validate_media_file's real ffmpeg decode check (covered
+            # separately above).
+            fake_validate = lambda p: Path(p).exists() and Path(p).stat().st_size > 0
+
+            with patch.object(self.ffrife, "run_rife", fake_run_rife), \
+                 patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+                 patch.object(self.ffrife, "_validate_media_file", fake_validate):
+                segments = self.ffrife._render_rife_chunks(
+                    "rife", in_frames, root / "out", 16, "model", config, state_path,
+                    cuts=[], input_count=8, encode=encode,
+                )
+            self.assertEqual(len(segments), 3)  # _chunk_ranges(8,4) -> 3 chunks, segment_chunks=1 -> 3 segments
+            self.assertEqual(len(rife_calls), 3)
+
+            # Simulate the LAST segment's file having been left corrupt/
+            # truncated by an interruption mid-write.
+            segments[-1].write_bytes(b"")
+
+            with patch.object(self.ffrife, "run_rife", fake_run_rife), \
+                 patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+                 patch.object(self.ffrife, "_validate_media_file", fake_validate):
+                resumed = self.ffrife._render_rife_chunks(
+                    "rife", in_frames, root / "out", 16, "model", config, state_path,
+                    cuts=[], input_count=8, encode=encode,
+                )
+            self.assertEqual(len(resumed), 3)
+            # Only the one chunk in the discarded segment needed rebuilding -
+            # the other, still-valid segments' chunks were never touched again.
+            self.assertEqual(len(rife_calls), 4)
+
+    def test_interpolate_streams_multiple_segments_and_delivers_output(self) -> None:
+        config = {"rife_binary_path": "/fake/rife", "chunk_frames": "3", "stream_segment_chunks": "1",
+                  "cooldown_seconds": "0", "scene_detection": "false"}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output = root / "out.mkv"
+
+            def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+                if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
+                    for i in range(6):
+                        (Path(cmd[-1]).parent / f"{i:08d}.png").write_bytes(b"\x89PNG")
+                    return
+                target = Path(cmd[-1])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"video")
+
+            def fake_run_rife(_binary, _input, output_dir, target_count, **_kwargs):
+                for i in range(target_count):
+                    (Path(output_dir) / f"{i:08d}.png").write_bytes(b"\x89PNG")
+
+            with patch.object(self.ffrife, "command_exists", return_value=True), \
+                 patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+                 patch.object(self.ffrife, "run_rife", fake_run_rife), \
+                 patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
+                 patch.object(self.ffrife, "probe_source_resolution", return_value=(640, 360)), \
+                 patch.object(self.ffrife.subprocess, "run", return_value=MagicMock(returncode=0, stdout="")):
+                ok = self.ffrife.interpolate("in.mp4", output, config, fps=60)
+
+            self.assertTrue(ok)
+            self.assertTrue(output.exists())
+            self.assertEqual(output.read_bytes(), b"video")
+
+
 if __name__ == "__main__":
     unittest.main()
