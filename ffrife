@@ -131,6 +131,9 @@ DEFAULT_CONFIG = {
                                  # the threshold at a proportionally lower source frame count
     "resume": "true",  # keep and reuse durable per-output work state
     "keep_work": "false",  # retain completed work state for inspection
+    "space_check": "true",  # estimate temp space needed before running RIFE and abort if short
+    "space_check_margin": "1.15",  # required-vs-free safety multiplier for the space check
+    "stream_segment_chunks": "8",  # RIFE chunks per encode segment before their PNGs are freed; see docs/ffrife.md's "Streaming encode" section
     "scene_detection": "true",  # do not synthesize hybrid frames across hard cuts
     "scene_threshold": "3.0",  # spike multiplier over recent motion; lower is more sensitive
     "scene_floor": "0.05",  # absolute pixel-change floor below which nothing can be a hard cut
@@ -170,6 +173,9 @@ CONFIG_HELP = {
     "long_run_frames": "Source frame count (at reference resolution/fps-ratio) above which rife_profile=auto picks balanced instead of performance",
     "resume": "Keep and reuse durable per-output work state so an interrupted run can pick back up",
     "keep_work": "Retain completed work state (extracted/interpolated frames) after a successful run, for inspection",
+    "space_check": "Estimate temp disk space needed for extracted+interpolated frames before running RIFE and abort if short",
+    "space_check_margin": "Required-vs-free safety multiplier for the space check (1.15 = require 15% headroom over the estimate)",
+    "stream_segment_chunks": "RIFE chunks encoded together as one segment before their PNGs are freed - lower uses less peak disk but resets the encoder's lookahead more often",
     "scene_detection": "Detect hard cuts and replace RIFE's hybrid frames there instead of interpolating across them",
     "scene_threshold": "Spike multiplier over recent motion needed to flag a hard cut; lower is more sensitive",
     "scene_floor": "Absolute pixel-change floor below which nothing can be flagged as a hard cut",
@@ -1019,6 +1025,57 @@ def resolve_target_fps(fps_spec, source_fps):
     return float(s)
 
 # --- Core: single-pass interpolation ---
+def _sample_avg_frame_bytes(frame_dir, sample_size=20):
+    """Average on-disk size of already-extracted frames, sampled evenly
+    across the sequence rather than just the first N - PNG size varies a
+    lot with per-frame detail/motion, and the goal is a number the *rest*
+    of this specific clip can be projected from, not a generic constant."""
+    frames = sorted(Path(frame_dir).glob("*.png"))
+    if not frames:
+        return None
+    step = max(1, len(frames) // sample_size)
+    sampled = frames[::step][:sample_size]
+    return sum(f.stat().st_size for f in sampled) / len(sampled)
+
+def _check_disk_space(frames_root, in_frames, target_count, config, peak_frames=None):
+    """Estimate the temp bytes RIFE's interpolated output is about to add
+    and abort before it starts if free space on frames_root's filesystem
+    looks short. Source extraction has already completed by the time this
+    runs, so its frames are a sunk cost, not part of what's still needed -
+    but they're exactly the calibration data used to estimate the
+    (typically ~2x larger) output set, since PNG size tracks content detail
+    as much as resolution and a fixed constant would be a guess where this
+    clip's own frames are real data.
+
+    `peak_frames` is how many interpolated frames can be resident at once,
+    defaulting to `target_count` (every frame, kept until one final encode -
+    see render_rife_frames' default path). interpolate()'s own streaming-
+    encode branch passes a much smaller bound instead: chunks are encoded
+    and their PNGs freed in bounded batches (see _render_rife_chunks'
+    "Streaming encode" mode), so only about one batch's worth is ever on
+    disk at the same time, not the whole clip."""
+    if not config_bool(config, "space_check", True):
+        return
+    avg_bytes = _sample_avg_frame_bytes(in_frames)
+    if not avg_bytes:
+        return  # nothing extracted to calibrate from - skip rather than guess
+    peak_frames = target_count if peak_frames is None else peak_frames
+    needed = peak_frames * avg_bytes
+    margin = config_float(config, "space_check_margin", 1.15)
+    free = shutil.disk_usage(frames_root).free
+    if needed * margin > free:
+        raise RuntimeError(
+            f"Disk space check failed: RIFE still needs an estimated "
+            f"{needed / 1e9:.1f}GB for {peak_frames} interpolated frames "
+            f"(~{avg_bytes / 1e3:.0f}KB/frame, sampled from this clip's own extracted "
+            f"source frames), which with a {margin:g}x safety margin is "
+            f"{needed * margin / 1e9:.1f}GB - but only {free / 1e9:.1f}GB is free on "
+            f"{frames_root}'s filesystem. Free up space, or pass --no-space-check to "
+            f"skip this check and proceed anyway."
+        )
+    print(f"Disk space check: ~{needed / 1e9:.1f}GB estimated for RIFE's output frames, "
+          f"{free / 1e9:.1f}GB free - OK.")
+
 def _link_or_copy(source, destination):
     try:
         os.link(source, destination)
@@ -1030,8 +1087,21 @@ def _write_json_atomic(path, payload):
     temp.write_text(json.dumps(payload, indent=2, sort_keys=True))
     temp.replace(path)
 
-def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_count, cuts):
-    """Replace output samples strictly between each cut's real endpoints."""
+def suppress_scene_cut_interpolation_range(in_frames, out_frames, input_count, target_count, cuts,
+                                            range_start=0, range_end=None, index_offset=0):
+    """Replace output samples strictly between each cut's real endpoints,
+    restricted to the global output-index window [range_start, range_end).
+
+    `out_frames` is written using LOCAL 1-based filenames, offset from the
+    global zero-based output index by `index_offset` (pass range_start for
+    a chunk directory that only holds that chunk's own frames). The default
+    arguments (range_end=None -> target_count, index_offset=0) cover the
+    whole clip in one call, identical to this function's prior whole-clip-
+    only behavior - see _render_rife_chunks for the per-chunk caller, which
+    narrows the window instead so each chunk can be encoded and freed
+    without waiting for the rest of the clip."""
+    if range_end is None:
+        range_end = target_count
     if input_count < 2 or target_count < 2:
         return 0
     scale = (target_count - 1) / (input_count - 1)
@@ -1044,12 +1114,16 @@ def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_
         # `cut` is the zero-based index of the shot's first frame; frame
         # files are one-based, so the post-cut source is at `cut + 1`.
         source = Path(in_frames) / f"{cut + 1:08d}.png"
-        for output_zero_index in range(first, last + 1):
-            destination = Path(out_frames) / f"{output_zero_index + 1:08d}.png"
+        for output_zero_index in range(max(first, range_start), min(last, range_end - 1) + 1):
+            destination = Path(out_frames) / f"{output_zero_index - index_offset + 1:08d}.png"
             if destination.exists():
                 shutil.copy2(source, destination)
                 replaced += 1
     return replaced
+
+def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_count, cuts):
+    """Whole-clip convenience wrapper - see suppress_scene_cut_interpolation_range."""
+    return suppress_scene_cut_interpolation_range(in_frames, out_frames, input_count, target_count, cuts)
 
 def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.05,
                         revert_fraction=0.5, min_duration=0.25,
@@ -1231,32 +1305,233 @@ def _chunk_ranges(frame_count, chunk_frames):
         start = end - 1  # overlap one endpoint so RIFE sees the seam
     return ranges
 
-def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, config, state_path):
+def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config):
+    """Returns (cuts, transition_count): cuts is a sorted, deduped list of
+    global zero-based hard-cut frame indices (explicit --transition-ranges
+    plus anything scene_detection found), or (None, 0) if scene_detection is
+    off. Split out of render_rife_frames because the streaming-encode branch
+    below needs this resolved *before* RIFE runs (so each chunk can suppress
+    its own cut-adjacent frames as it's generated), while the plain branch
+    keeps doing it after, exactly as before - see _render_rife_chunks'
+    ``encode`` parameter."""
+    if not (config_bool(config, "scene_detection", True) and input_frame_count > 1):
+        return None, 0
+    scene_threshold = config_float(config, "scene_threshold", 3.0)
+    if scene_threshold <= 0:
+        raise ValueError("scene_threshold must be greater than 0")
+    explicit_transitions = parse_transition_ranges(config.get("transition_ranges", ""), source_fps, input_frame_count)
+    print(f"Detecting scene cuts and transitions (sensitivity={scene_threshold:g})...")
+    cuts, transitions = detect_transitions(
+        in_frames, source_fps,
+        cut_sensitivity=scene_threshold,
+        cut_floor=config_float(config, "scene_floor", 0.05),
+        revert_fraction=config_float(config, "scene_revert_fraction", 0.5),
+        min_duration=config_float(config, "transition_min_duration", 0.25),
+        sensitivity=config_float(config, "transition_sensitivity", 1.35),
+        alignment=config_float(config, "transition_alignment", 0.80),
+        detect_gradual=config_bool(config, "gradual_transition_detection", True),
+    )
+    transitions = list(explicit_transitions) + transitions
+    for start_frame, end_frame in transitions:
+        cuts.extend(range(start_frame + 1, end_frame + 1))
+    return sorted(set(cuts)), len(transitions)
+
+def _validate_media_file(path):
+    """Cheap corruption/truncation check: does `path` decode cleanly start
+    to finish? Used only to decide whether a segment file left over from an
+    interrupted streaming-encode run (see _render_rife_chunks) is safe to
+    trust as-is, rather than as the primary crash-safety mechanism - state.json
+    is only ever updated (via _write_json_atomic's atomic rename) *after*
+    ffmpeg has already returned success for a segment, so this is belt-and-
+    suspenders against filesystem-level corruption, not the thing that makes
+    resume correct."""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        subprocess.run([FFMPEG_BIN, "-v", "error", "-i", str(path), "-f", "null", "-"],
+                       capture_output=True, check=True, timeout=120)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return False
+
+def _concat_video_segments(segment_paths, output_path):
+    """Losslessly join already-encoded video segments (see the ``encode``
+    streaming mode of _render_rife_chunks) into one file - a stream copy via
+    ffmpeg's concat demuxer, not a re-encode. A single segment (the common
+    case: nothing ever interrupted this run) just gets moved into place."""
+    segment_paths = [Path(p) for p in segment_paths]
+    if len(segment_paths) == 1:
+        shutil.move(str(segment_paths[0]), str(output_path))
+        return
+    list_path = Path(tempfile.mktemp(suffix=".txt"))
+    try:
+        lines = "\n".join(f"file '{p.resolve().as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
+                          for p in segment_paths)
+        list_path.write_text(lines + "\n")
+        run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(list_path), "-c", "copy", str(output_path)],
+                   label="Joining segments")
+    finally:
+        list_path.unlink(missing_ok=True)
+    for p in segment_paths:
+        p.unlink(missing_ok=True)
+
+def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, config, state_path,
+                         cuts=None, input_count=None, encode=None):
+    """Run RIFE over `in_frames` in resumable chunks (see docs/ffrife.md).
+
+    With ``encode=None`` (the default, used by every caller except
+    interpolate()'s own RIFE branch below): unchanged prior behavior -
+    every chunk's interpolated PNGs are kept under `state_path`'s "chunks"
+    directory until every chunk is done, then hardlinked into a single flat
+    `out_frames` sequence for the caller's own single final encode. This is
+    what render_rife_frames' public frames-directory contract (used
+    directly by slverse's encode_rife_frame_sections, which concatenates
+    multiple sections before one shared encode) depends on, so it can't
+    change here.
+
+    With ``encode`` given - a dict of {"segment_chunks", "fps", "output_vf",
+    "encode_args"} - "Streaming encode" mode instead: `cuts` (from
+    _resolve_scene_cuts) and `input_count` let each chunk suppress its own
+    cut-adjacent frames as soon as RIFE produces it (suppress_scene_cut_
+    interpolation_range, scoped to that chunk's own output window - the
+    whole-clip pass can no longer wait for every chunk to exist at once).
+    Every `encode["segment_chunks"]` completed chunks are hardlinked into a
+    flat temp directory and encoded directly to their own small AV1 segment
+    via a plain ffmpeg call (same shape as the non-streaming path's own
+    final encode, just scoped to a batch of chunks) - only THEN are those
+    chunks marked complete in `state_path` and their PNGs freed, bounding
+    peak disk to about one segment's worth of interpolated frames instead
+    of the whole clip. A segment is trusted only once ffmpeg has actually
+    returned success for it (`state_path` is written afterward, via the
+    same atomic-rename `_write_json_atomic` already uses elsewhere), so an
+    interruption can only cost the batch that was still in progress, not
+    the whole run - see docs/ffrife.md's "Streaming encode" section.
+    `out_frames`/`target_count`'s frame-file contract is unused in this
+    mode; the return value is the finalized segment video paths instead."""
     inputs = sorted(Path(in_frames).glob("*.png"))
     ranges = _chunk_ranges(len(inputs), config_int(config, "chunk_frames", 0))
-    completed = set()
+    state = {}
     if state_path.exists():
         try:
-            completed = set(json.loads(state_path.read_text()).get("completed_chunks", []))
+            state = json.loads(state_path.read_text())
         except (OSError, ValueError):
-            completed = set()
-    chunks_root = state_path.parent / "chunks"
-    chunks_root.mkdir(parents=True, exist_ok=True)
+            state = {}
+    completed = set(state.get("completed_chunks", []))
     total_intervals = max(1, len(inputs) - 1)
     target_intervals = max(0, target_count - 1)
+
+    if encode is None:
+        chunks_root = state_path.parent / "chunks"
+        chunks_root.mkdir(parents=True, exist_ok=True)
+        for index, (start, end) in enumerate(ranges):
+            chunk_key = str(index)
+            chunk_out = chunks_root / f"{index:06d}" / "out"
+            marker = chunk_out.parent / "complete.json"
+            if chunk_key in completed and marker.exists():
+                try:
+                    expected = int(json.loads(marker.read_text())["target_count"])
+                except (OSError, ValueError, KeyError, TypeError):
+                    expected = -1
+                if len(list(chunk_out.glob("*.png"))) == expected:
+                    print(f"Resuming: chunk {index + 1}/{len(ranges)} already complete.")
+                    continue
+                print(f"Resume data for chunk {index + 1} is incomplete; rebuilding it.")
+            chunk_in = chunks_root / f"{index:06d}" / "in"
+            shutil.rmtree(chunk_in, ignore_errors=True)
+            shutil.rmtree(chunk_out, ignore_errors=True)
+            chunk_in.mkdir(parents=True); chunk_out.mkdir(parents=True)
+            for local_index, source_frame in enumerate(inputs[start:end], 1):
+                _link_or_copy(source_frame, chunk_in / f"{local_index:08d}.png")
+            first_interval = round(start * target_intervals / total_intervals)
+            last_interval = round((end - 1) * target_intervals / total_intervals)
+            chunk_target = max(2, last_interval - first_interval + 1)
+            print(f"RIFE chunk {index + 1}/{len(ranges)} ({end - start} source frames)...")
+            run_rife(rife_path, chunk_in, chunk_out, chunk_target, model_path=model_path,
+                     threads=config.get("rife_threads"), gpu=config.get("rife_gpu"))
+            _write_json_atomic(marker, {"target_count": chunk_target})
+            completed.add(chunk_key)
+            _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int)})
+            shutil.rmtree(chunk_in, ignore_errors=True)
+            cooldown = config_float(config, "cooldown_seconds", 0)
+            if cooldown and index + 1 < len(ranges):
+                print(f"Cooling down for {cooldown}s before the next chunk (Ctrl-C is safe; resume later)...")
+                time.sleep(cooldown)
+        shutil.rmtree(out_frames, ignore_errors=True)
+        Path(out_frames).mkdir(parents=True)
+        output_index = 1
+        for index in range(len(ranges)):
+            frames = sorted((chunks_root / f"{index:06d}" / "out").glob("*.png"))
+            if index:
+                frames = frames[1:]  # overlapped endpoint was emitted by prior chunk
+            for frame in frames:
+                _link_or_copy(frame, Path(out_frames) / f"{output_index:08d}.png")
+                output_index += 1
+        if output_index - 1 != target_count:
+            raise RuntimeError(f"chunk assembly produced {output_index - 1} frames; expected {target_count}")
+        return None
+
+    # --- Streaming encode mode ---
+    chunks_root = state_path.parent / "chunks"
+    chunks_root.mkdir(parents=True, exist_ok=True)
+    segments_dir = state_path.parent / "segments"
+    segments_dir.mkdir(parents=True, exist_ok=True)
+    segments = state.get("segments", [])
+    # Never trust a trailing segment state.json doesn't already have a
+    # successful ffmpeg return code for (see the docstring above) - discard
+    # it and let its chunks rebuild below like any other incomplete chunk.
+    while segments:
+        last = segments[-1]
+        if _validate_media_file(segments_dir / last["file"]):
+            break
+        print(f"Resume data for segment {last['file']} is incomplete; discarding it.")
+        (segments_dir / last["file"]).unlink(missing_ok=True)
+        completed -= set(last["chunks"])
+        segments = segments[:-1]
+    _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int), "segments": segments})
+
+    segment_chunks = max(1, int(encode["segment_chunks"]))
+    replaced_total = 0
+    pending_batch = []
+
+    def _finalize_segment():
+        if not pending_batch:
+            return
+        segment_index = len(segments)
+        segment_file = f"segment-{segment_index:04d}.mkv"
+        flat = segments_dir / f"flat-{segment_index:04d}"
+        shutil.rmtree(flat, ignore_errors=True)
+        flat.mkdir(parents=True)
+        output_index = 1
+        for chunk_index in pending_batch:
+            frames = sorted((chunks_root / f"{chunk_index:06d}" / "out").glob("*.png"))
+            if chunk_index:
+                frames = frames[1:]  # overlapped endpoint was emitted by the prior chunk
+            for frame in frames:
+                _link_or_copy(frame, flat / f"{output_index:08d}.png")
+                output_index += 1
+        cmd = ["-r", str(encode["fps"]), "-i", f"{flat}/%08d.png"]
+        if encode.get("output_vf"):
+            cmd += ["-vf", encode["output_vf"]]
+        cmd += encode["encode_args"] + [str(segments_dir / segment_file)]
+        run_ffmpeg(cmd, label=f"Encoding segment {segment_index + 1}")
+        # Stored as strings, matching completed_chunks - a JSON round trip
+        # through state_path turns a plain list of ints back into ints, and
+        # the discard loop above (completed -= set(last["chunks"])) would
+        # silently match nothing against completed's own string keys.
+        segments.append({"file": segment_file, "chunks": [str(c) for c in pending_batch]})
+        completed.update(str(c) for c in pending_batch)
+        _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int), "segments": segments})
+        for chunk_index in pending_batch:
+            shutil.rmtree(chunks_root / f"{chunk_index:06d}", ignore_errors=True)
+        shutil.rmtree(flat, ignore_errors=True)
+        pending_batch.clear()
+
     for index, (start, end) in enumerate(ranges):
         chunk_key = str(index)
+        if chunk_key in completed:
+            continue  # only ever set once that chunk's segment was finalized - see above
         chunk_out = chunks_root / f"{index:06d}" / "out"
-        marker = chunk_out.parent / "complete.json"
-        if chunk_key in completed and marker.exists():
-            try:
-                expected = int(json.loads(marker.read_text())["target_count"])
-            except (OSError, ValueError, KeyError, TypeError):
-                expected = -1
-            if len(list(chunk_out.glob("*.png"))) == expected:
-                print(f"Resuming: chunk {index + 1}/{len(ranges)} already complete.")
-                continue
-            print(f"Resume data for chunk {index + 1} is incomplete; rebuilding it.")
         chunk_in = chunks_root / f"{index:06d}" / "in"
         shutil.rmtree(chunk_in, ignore_errors=True)
         shutil.rmtree(chunk_out, ignore_errors=True)
@@ -1269,28 +1544,28 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         print(f"RIFE chunk {index + 1}/{len(ranges)} ({end - start} source frames)...")
         run_rife(rife_path, chunk_in, chunk_out, chunk_target, model_path=model_path,
                  threads=config.get("rife_threads"), gpu=config.get("rife_gpu"))
-        _write_json_atomic(marker, {"target_count": chunk_target})
-        completed.add(chunk_key)
-        _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int)})
         shutil.rmtree(chunk_in, ignore_errors=True)
+        if cuts:
+            replaced_total += suppress_scene_cut_interpolation_range(
+                in_frames, chunk_out, input_count, target_count, cuts,
+                range_start=first_interval, range_end=last_interval + 1, index_offset=first_interval,
+            )
+        pending_batch.append(index)
+        if len(pending_batch) >= segment_chunks or index + 1 == len(ranges):
+            _finalize_segment()
         cooldown = config_float(config, "cooldown_seconds", 0)
         if cooldown and index + 1 < len(ranges):
             print(f"Cooling down for {cooldown}s before the next chunk (Ctrl-C is safe; resume later)...")
             time.sleep(cooldown)
-    shutil.rmtree(out_frames, ignore_errors=True)
-    Path(out_frames).mkdir(parents=True)
-    output_index = 1
-    for index in range(len(ranges)):
-        frames = sorted((chunks_root / f"{index:06d}" / "out").glob("*.png"))
-        if index:
-            frames = frames[1:]  # overlapped endpoint was emitted by prior chunk
-        for frame in frames:
-            _link_or_copy(frame, Path(out_frames) / f"{output_index:08d}.png")
-            output_index += 1
-    if output_index - 1 != target_count:
-        raise RuntimeError(f"chunk assembly produced {output_index - 1} frames; expected {target_count}")
 
-def render_rife_frames(source, frames_root, config, start=None, end=None, vf=None, fps=60, speed=None, source_fps=None):
+    if len(completed) != len(ranges):
+        raise RuntimeError(f"chunk assembly produced {len(completed)} completed chunks; expected {len(ranges)}")
+    if replaced_total or cuts:
+        print(f"Transitions: {replaced_total} interpolated frame(s) replaced across cut/transition boundaries.")
+    return [segments_dir / seg["file"] for seg in segments]
+
+def render_rife_frames(source, frames_root, config, start=None, end=None, vf=None, fps=60, speed=None, source_fps=None,
+                        output_vf=None, stream_encode=False):
     """Decode a source window, synthesize its final retimed RIFE frame
     sequence, and return ``(out_frames, resolved_fps, duration)``.
 
@@ -1298,6 +1573,15 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     editors concatenate multiple lossless RIFE sequences and encode only once.
     Returns ``None`` when RIFE is unavailable; callers can then apply their
     configured ffmpeg fallback without creating an intermediate video.
+
+    ``stream_encode=True`` (used only by interpolate()'s own RIFE branch,
+    never by the sectioned/library callers above) switches the chunked path
+    to _render_rife_chunks' "Streaming encode" mode instead: ``out_frames``
+    in the return tuple is then a single finished, video-only .mkv file
+    (chunks encoded and freed in bounded batches, then losslessly joined),
+    not a directory of PNGs - see docs/ffrife.md. ``output_vf`` is only
+    meaningful in that mode, applied per-segment since there's no later
+    separate merge step for video to apply it in.
     """
     if str(fps).strip().lower().endswith(("x", "%")):
         fps = resolve_target_fps(fps, probe_source_fps(source))
@@ -1350,54 +1634,82 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     # twice the normal target count, avoiding setpts-driven frame duplication.
     speed_factor = speed if speed and speed != 1 else 1.0
     target_count = round(input_frame_count * fps / source_fps / speed_factor)
-    scene_threshold = None
-    explicit_transitions = []
-    if config_bool(config, "scene_detection", True) and input_frame_count > 1:
-        scene_threshold = config_float(config, "scene_threshold", 3.0)
-        if scene_threshold <= 0:
-            raise ValueError("scene_threshold must be greater than 0")
-        explicit_transitions = parse_transition_ranges(
-            config.get("transition_ranges", ""), source_fps, input_frame_count
-        )
     model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
-    # Library callers historically pass only the settings they own. Keep that
-    # API compatible; the full ffrife config enables resumable chunking.
+    # Library callers historically pass only the settings they own - keep
+    # that API compatible. No chunk_frames means no chunking, which means
+    # no disk-spike concern to address, so stream_encode has no effect
+    # here either: same single run_rife() call and flat out_frames
+    # directory as always, regardless of which mode the caller asked for.
     if "chunk_frames" not in config:
+        _check_disk_space(frames_root, in_frames, target_count, config)
         run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
-    else:
-        width, height = probe_source_resolution(source)
-        pixel_scale = (width * height) / REFERENCE_PIXELS if width and height else 1.0
-        fps_scale = (target_count / input_frame_count) / REFERENCE_FPS_RATIO
-        effective = resolve_rife_policy(config, input_frame_count, workload_scale=pixel_scale * fps_scale)
-        print(f"RIFE profile: {effective['resolved_rife_profile']} "
-              f"(threads={effective['rife_threads']}, chunks={effective['chunk_frames']}, "
-              f"cooldown={effective['cooldown_seconds']}s)")
-        _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, effective,
-                            frames_root / "rife-state.json")
-    if scene_threshold is not None:
-        detect_gradual = config_bool(config, "gradual_transition_detection", True)
-        print(f"Detecting scene cuts and transitions (sensitivity={scene_threshold:g})...")
-        cuts, transitions = detect_transitions(
-            in_frames, source_fps,
-            cut_sensitivity=scene_threshold,
-            cut_floor=config_float(config, "scene_floor", 0.05),
-            revert_fraction=config_float(config, "scene_revert_fraction", 0.5),
-            min_duration=config_float(config, "transition_min_duration", 0.25),
-            sensitivity=config_float(config, "transition_sensitivity", 1.35),
-            alignment=config_float(config, "transition_alignment", 0.80),
-            detect_gradual=detect_gradual,
-        )
-        transitions = list(explicit_transitions) + transitions
-        for start_frame, end_frame in transitions:
-            cuts.extend(range(start_frame + 1, end_frame + 1))
-        cuts = sorted(set(cuts))
+        cuts, transition_count = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
+        if cuts is not None:
+            replaced = suppress_scene_cut_interpolation(in_frames, out_frames, input_frame_count, target_count, cuts)
+            print(f"Transitions: {transition_count} gradual interval(s), {len(cuts)} protected boundary/boundaries; "
+                  f"{replaced} interpolated frame(s) replaced.")
+        return out_frames, fps, retimed_duration(duration, speed)
+
+    width, height = probe_source_resolution(source)
+    pixel_scale = (width * height) / REFERENCE_PIXELS if width and height else 1.0
+    fps_scale = (target_count / input_frame_count) / REFERENCE_FPS_RATIO
+    effective = resolve_rife_policy(config, input_frame_count, workload_scale=pixel_scale * fps_scale)
+    print(f"RIFE profile: {effective['resolved_rife_profile']} "
+          f"(threads={effective['rife_threads']}, chunks={effective['chunk_frames']}, "
+          f"cooldown={effective['cooldown_seconds']}s)")
+
+    if stream_encode:
+        # Cuts must be known before any chunk runs, not after every chunk
+        # exists, so each one can suppress its own cut-adjacent frames as
+        # soon as it's generated - see _render_rife_chunks' "Streaming
+        # encode" mode and _resolve_scene_cuts.
+        cuts, transition_count = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
+        segment_chunks = config_int(config, "stream_segment_chunks", 8, minimum=1)
+        ranges = _chunk_ranges(input_frame_count, config_int(effective, "chunk_frames", 0))
+        peak_frames = round(target_count * min(1.0, segment_chunks / max(1, len(ranges))))
+        _check_disk_space(frames_root, in_frames, target_count, config, peak_frames=peak_frames)
+        encode = {
+            "segment_chunks": segment_chunks,
+            "fps": fps, "output_vf": output_vf, "encode_args": build_encode_args(config),
+        }
+        segments = _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, effective,
+                                       frames_root / "rife-state.json",
+                                       cuts=cuts, input_count=input_frame_count, encode=encode)
+        video_path = frames_root / "video.mkv"
+        _concat_video_segments(segments, video_path)
+        return video_path, fps, retimed_duration(duration, speed)
+
+    _check_disk_space(frames_root, in_frames, target_count, config)
+    _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, effective,
+                        frames_root / "rife-state.json")
+    cuts, transition_count = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
+    if cuts is not None:
         replaced = suppress_scene_cut_interpolation(
             in_frames, out_frames, input_frame_count, target_count, cuts
         )
-        print(f"Transitions: {len(transitions)} gradual interval(s), {len(cuts)} protected boundary/boundaries; "
+        print(f"Transitions: {transition_count} gradual interval(s), {len(cuts)} protected boundary/boundaries; "
               f"{replaced} interpolated frame(s) replaced.")
     return out_frames, fps, retimed_duration(duration, speed)
 
+
+def _finalize_primary_target(primary_target, output_file):
+    """Deliver `primary_target` (always .mkv coming out of interpolate()'s
+    RIFE branch - see its own comment) as `output_file`, in whatever
+    container that actually is. A lossless -c copy remux for a different
+    one (e.g. mp4, for players that don't support mkv - see docs/ffrife.md's
+    "Streaming encode" section), a plain rename when they already match.
+    carry_over_source_extras already does the equivalent conversion itself
+    when there IS extra metadata to carry over; this covers the plainer
+    case where interpolate() skips that pass entirely."""
+    primary_target = Path(primary_target)
+    output_file = Path(output_file)
+    if primary_target.suffix.lower() == output_file.suffix.lower():
+        shutil.move(str(primary_target), str(output_file))
+        return
+    subprocess.run([FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y",
+                    "-i", str(primary_target), "-map", "0", "-c", "copy", str(output_file)],
+                   check=True)
+    primary_target.unlink(missing_ok=True)
 
 def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=60, speed=None, metadata_args=None, output_vf=None):
     """Interpolate `source` (local path or remote URL) to `fps`, optionally
@@ -1513,12 +1825,19 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
     work_path.mkdir(parents=True, exist_ok=True)
     try:
         temp_dir_path = work_path
-        rendered = render_rife_frames(source, temp_dir_path, config, start=start, end=end, vf=vf, fps=fps, speed=speed)
+        rendered = render_rife_frames(source, temp_dir_path, config, start=start, end=end, vf=vf, fps=fps, speed=speed,
+                                      output_vf=output_vf, stream_encode=True)
         if not rendered:
             if not durable:
                 shutil.rmtree(work_path, ignore_errors=True)
             return False
-        out_frames, fps, _ = rendered
+        video_path, fps, _ = rendered
+        # render_rife_frames only actually streams when chunking is active
+        # (see its own "chunk_frames not in config" early-return) - a
+        # minimal library-style config falls back to the original flat
+        # frames-directory contract even though stream_encode=True was
+        # requested here, so this still has to be able to take that shape.
+        frames_dir = video_path if Path(video_path).is_dir() else None
 
         # .mka (Matroska), not a bare .aac elementary stream - a plain .aac
         # file has no room for per-stream tags at all, silently dropping the
@@ -1550,21 +1869,41 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         # a failure between here and the carryover pass below is cleaned up
         # (or kept for resume) by the existing work_path handling at the
         # bottom of this function, same as everything else RIFE produces.
-        primary_target = (temp_dir_path / f"encoded{Path(output_file).suffix}") if extras else output_file
-
-        merge_cmd = ["-r", str(fps), "-i", f"{out_frames}/%08d.png"]
         has_audio = audio_path.exists() and audio_path.stat().st_size > 0
-        if has_audio:
-            merge_cmd += ["-i", str(audio_path)]
-        # RIFE already generated the retimed video frame count above.
-        if output_vf:
-            merge_cmd += ["-vf", output_vf]
-        if has_audio:
-            merge_cmd += ["-c:a", "copy"]
-        merge_cmd += build_encode_args(config) + (metadata_args or []) + [str(primary_target)]
-        run_ffmpeg(merge_cmd, duration=retimed_duration(duration, speed))
+        if frames_dir is not None:
+            # Legacy non-chunked path: exactly the original single combined
+            # encode (video from raw frames + audio + build_encode_args in
+            # one pass) - there's no streaming-encode machinery to mux
+            # against here, see the frames_dir comment above.
+            primary_target = (temp_dir_path / f"encoded{Path(output_file).suffix}") if extras else output_file
+            merge_cmd = ["-r", str(fps), "-i", f"{frames_dir}/%08d.png"]
+            if has_audio:
+                merge_cmd += ["-i", str(audio_path)]
+            if output_vf:
+                merge_cmd += ["-vf", output_vf]
+            if has_audio:
+                merge_cmd += ["-c:a", "copy"]
+            merge_cmd += build_encode_args(config) + (metadata_args or []) + [str(primary_target)]
+            run_ffmpeg(merge_cmd, duration=retimed_duration(duration, speed))
+        else:
+            # Always .mkv regardless of output_file's own container -
+            # video_path is already a finished, fully-encoded .mkv (see
+            # render_rife_frames' stream_encode mode, needed for truncation-
+            # safe crash recovery mid-run), so this mux step is a plain
+            # stream copy, not a re-encode. Delivering a non-mkv target (the
+            # common case) is a second, equally lossless -c copy remux
+            # below - see _finalize_primary_target and
+            # carry_over_source_extras, both container-agnostic already.
+            primary_target = temp_dir_path / "encoded.mkv"
+            mux_cmd = ["-i", str(video_path)]
+            if has_audio:
+                mux_cmd += ["-i", str(audio_path), "-map", "0:v", "-map", "1:a"]
+            mux_cmd += ["-c", "copy"] + (metadata_args or []) + [str(primary_target)]
+            run_ffmpeg(mux_cmd, label="Muxing audio")
         if extras:
             carry_over_source_extras(source, primary_target, output_file, config, extras, start=start, end=end, speed=speed)
+        elif frames_dir is None:
+            _finalize_primary_target(primary_target, output_file)
     except BaseException:
         if durable:
             print(f"Work saved for resume: {work_path}")
@@ -1739,7 +2078,8 @@ GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "v
                                   "rife_profile", "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds",
                                   "resume", "keep_work", "scene_detection", "gradual_transition_detection",
                                   "container", "keep_subtitles", "keep_chapters", "keep_extra_audio_tracks",
-                                  "keep_attachments", "keep_thumbnail", "keep_source_metadata"}
+                                  "keep_attachments", "keep_thumbnail", "keep_source_metadata", "space_check",
+                                  "stream_segment_chunks"}
 
 def add_generic_config_overrides(parser):
     for key in DEFAULT_CONFIG:
@@ -1839,6 +2179,17 @@ def apply_run_overrides(args, config):
         value = getattr(args, key, None)
         if value is not None:
             config[key] = value
+    # These flags' argparse dest already matches its DEFAULT_CONFIG key
+    # (chunk_frames, cooldown_seconds, ...), same as EXTRAS_OVERRIDE_KEYS
+    # above - but they'd been left out of this pass-through, so
+    # --chunk-frames/--cooldown/--rife-gpu/--rife-threads/--resume/
+    # --no-resume/--keep-work/--space-check/--segment-chunks were all
+    # parsed and silently discarded on every real run.
+    for key in ("chunk_frames", "cooldown_seconds", "rife_gpu", "rife_threads",
+                "resume", "keep_work", "space_check", "stream_segment_chunks"):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
 
 def add_bool_flag(parser, dest, flag_stem, help_on=None, help_off=None):
     """Mutually-exclusive --flag-stem/--no-flag-stem pair overriding a
@@ -1874,9 +2225,14 @@ def add_processing_arguments(parser, include_trim=True):
     parser.add_argument("-j", "--rife-threads", help="RIFE load:process:save threads; auto lets the profile choose")
     parser.add_argument("-c", "--chunk-frames", help="Source frames per resumable chunk; auto uses profile, 0 disables")
     parser.add_argument("--cooldown", "--cooldown-seconds", dest="cooldown_seconds", help="Seconds to rest between chunks")
+    parser.add_argument("--segment-chunks", dest="stream_segment_chunks",
+                        help="RIFE chunks encoded together as one segment before their PNGs are freed (default: 8)")
     parser.add_argument("--container", choices=["mp4", "mkv"], help="Output container - overrides -o/the source's own extension")
     add_bool_flag(parser, "resume", "resume")
     add_bool_flag(parser, "keep_work", "keep-work", help_on="Keep completed intermediate frames for inspection")
+    add_bool_flag(parser, "space_check", "space-check",
+                 help_on="Estimate temp disk space before running RIFE and abort if short (default)",
+                 help_off="Skip the disk-space preflight check")
     add_bool_flag(parser, "scene_detection", "scene-detection",
                  help_on="Detect hard cuts and replace RIFE hybrids (default)",
                  help_off="Skip scene-cut detection and postprocessing")
