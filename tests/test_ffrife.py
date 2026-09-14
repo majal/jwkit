@@ -769,7 +769,7 @@ class FfrifeLongRunTest(unittest.TestCase):
         process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
         process.wait.return_value = 0
         with patch.object(self.ffrife.subprocess, "Popen", return_value=process) as popen:
-            cuts, transitions = self.ffrife.detect_transitions("frames", source_fps=24)
+            cuts, transitions, _ = self.ffrife.detect_transitions("frames", source_fps=24)
         self.assertEqual(cuts, [6])
         self.assertEqual(transitions, [])
         command = popen.call_args.args[0]
@@ -792,11 +792,11 @@ class FfrifeLongRunTest(unittest.TestCase):
             with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
                 return self.ffrife.detect_transitions("frames", source_fps=24, **kwargs)
 
-        cuts_default, _ = run()
+        cuts_default, _, _ = run()
         self.assertEqual(cuts_default, [])
-        cuts_low_floor, _ = run(cut_floor=0.01)
+        cuts_low_floor, _, _ = run(cut_floor=0.01)
         self.assertEqual(cuts_low_floor, [6])
-        cuts_no_revert, _ = run(cut_floor=0.01, revert_fraction=0)
+        cuts_no_revert, _, _ = run(cut_floor=0.01, revert_fraction=0)
         self.assertEqual(cuts_no_revert, [])
 
     def test_transition_detector_does_not_flag_a_sustained_burst_as_a_cut(self) -> None:
@@ -812,7 +812,7 @@ class FfrifeLongRunTest(unittest.TestCase):
         process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
         process.wait.return_value = 0
         with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
-            cuts, transitions = self.ffrife.detect_transitions("frames", source_fps=24)
+            cuts, transitions, _ = self.ffrife.detect_transitions("frames", source_fps=24)
         self.assertEqual(cuts, [])
 
     def test_scene_cut_replacement_maps_arbitrary_target_rate(self) -> None:
@@ -851,7 +851,7 @@ class FfrifeLongRunTest(unittest.TestCase):
         process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
         process.wait.return_value = 0
         with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
-            cuts, transitions = self.ffrife.detect_transitions(
+            cuts, transitions, _ = self.ffrife.detect_transitions(
                 "frames", source_fps=10, min_duration=0.3, sensitivity=1.2, alignment=0.8
             )
         self.assertEqual(transitions, [(5, 11)])
@@ -869,7 +869,7 @@ class FfrifeLongRunTest(unittest.TestCase):
         process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
         process.wait.return_value = 0
         with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
-            cuts, transitions = self.ffrife.detect_transitions(
+            cuts, transitions, _ = self.ffrife.detect_transitions(
                 "frames", source_fps=24, min_duration=0.25, sensitivity=1.2, alignment=0.8
             )
         self.assertNotEqual(transitions, [])
@@ -1117,6 +1117,226 @@ class FfrifeCmdSetupReinstallOfferTest(unittest.TestCase):
              patch("builtins.input", side_effect=AssertionError("should not prompt")):
             self.ffrife.cmd_setup(config)
         install_mock.assert_not_called()
+
+
+class FfrifePipelinePlannerTest(unittest.TestCase):
+    """plan_pipeline picks the fastest extraction/encode pipeline whose peak
+    temporary disk still fits the budget - see ffrife's own "Pipeline
+    planning" block. The fast end of both axes is strictly better wherever
+    it fits, so these assert that it is actually chosen when it fits, and
+    only given up in the order that costs the least."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def plan(self, *, frames=1000, target=2000, avg=1_000_000, free=10 ** 12, chunk_frames=100, **config):
+        return self.ffrife.plan_pipeline(
+            dict({"pipeline_mode": "auto", "disk_budget_fraction": "0.70",
+                  "extraction_mode": "auto", "stream_segment_chunks": "auto"}, **config),
+            input_frame_count=frames, target_count=target, avg_bytes=avg,
+            free_bytes=free, chunk_frames=chunk_frames)
+
+    def test_small_job_on_a_big_disk_keeps_the_single_whole_clip_encode(self) -> None:
+        # The point of the planner: a clip that fits should pay none of
+        # streaming's per-segment startup cost or lookahead resets.
+        plan = self.plan()
+        self.assertEqual(plan.extraction, "full")
+        self.assertFalse(plan.stream)
+
+    def test_job_too_big_for_the_budget_streams_in_segments(self) -> None:
+        plan = self.plan(free=4 * 10 ** 9)
+        self.assertTrue(plan.stream)
+        self.assertEqual(plan.extraction, "full")
+        self.assertLess(plan.peak_bytes, plan.free_bytes)
+
+    def test_segment_size_grows_with_available_disk(self) -> None:
+        # Bigger segments mean fewer encoder restarts, so the planner should
+        # spend spare disk on speed rather than bank it.
+        tight = self.plan(free=4 * 10 ** 9)
+        roomy = self.plan(free=8 * 10 ** 9)
+        self.assertGreater(roomy.segment_chunks, tight.segment_chunks)
+
+    def test_source_frames_dominating_the_budget_switches_to_windowed(self) -> None:
+        # Source frames alone are a hard floor under full extraction, paid
+        # before RIFE even starts - windowing is the only thing that bounds
+        # them.
+        plan = self.plan(free=2 * 10 ** 9)
+        self.assertEqual(plan.extraction, "windowed")
+        self.assertTrue(plan.stream)
+        self.assertLess(plan.peak_bytes, plan.free_bytes)
+
+    def test_peak_falls_as_the_pipeline_gets_more_bounded(self) -> None:
+        fast = self.plan(pipeline_mode="fast")
+        streamed = self.plan(free=4 * 10 ** 9)
+        windowed = self.plan(free=2 * 10 ** 9)
+        self.assertGreater(fast.peak_bytes, streamed.peak_bytes)
+        self.assertGreater(streamed.peak_bytes, windowed.peak_bytes)
+
+    def test_fast_mode_never_bounds_even_on_a_tiny_disk(self) -> None:
+        plan = self.plan(pipeline_mode="fast", free=10 ** 8)
+        self.assertFalse(plan.stream)
+        self.assertEqual(plan.extraction, "full")
+
+    def test_compact_mode_bounds_even_on_a_huge_disk(self) -> None:
+        plan = self.plan(pipeline_mode="compact")
+        self.assertTrue(plan.stream)
+
+    def test_extraction_mode_full_never_windows(self) -> None:
+        plan = self.plan(free=2 * 10 ** 9, extraction_mode="full")
+        self.assertEqual(plan.extraction, "full")
+
+    def test_extraction_mode_windowed_wins_over_a_job_that_would_fit(self) -> None:
+        plan = self.plan(extraction_mode="windowed")
+        self.assertEqual(plan.extraction, "windowed")
+        self.assertTrue(plan.stream)
+
+    def test_explicit_segment_chunks_pins_the_planner_choice(self) -> None:
+        plan = self.plan(free=4 * 10 ** 9, stream_segment_chunks="3")
+        self.assertEqual(plan.segment_chunks, 3)
+
+    def test_chunking_is_forced_on_when_bounding_needs_it(self) -> None:
+        # An unchunked profile (chunk_frames=0) is one chunk covering the
+        # whole clip, so nothing can be encoded and freed early.
+        plan = self.plan(free=2 * 10 ** 9, chunk_frames=0)
+        self.assertGreaterEqual(plan.chunk_frames, 2)
+        self.assertGreater(plan.chunk_count, 1)
+
+    def test_rejects_unknown_modes(self) -> None:
+        with self.assertRaises(ValueError):
+            self.plan(pipeline_mode="turbo")
+        with self.assertRaises(ValueError):
+            self.plan(extraction_mode="sideways")
+
+
+class FfrifeFrameProviderTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_full_provider_materializes_the_requested_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "in"; src.mkdir()
+            for i in range(1, 11):
+                (src / f"{i:08d}.png").write_bytes(f"frame{i}".encode())
+            chunk = root / "chunk"; chunk.mkdir()
+            provider = self.ffrife.FullFrameProvider(src)
+            self.assertEqual(provider.count, 10)
+            frames_dir, offset = provider.materialize(3, 6, chunk)
+            self.assertEqual((frames_dir, offset), (src, 0))
+            self.assertEqual([p.name for p in sorted(chunk.glob("*.png"))],
+                             ["00000001.png", "00000002.png", "00000003.png"])
+            self.assertEqual((chunk / "00000001.png").read_bytes(), b"frame4")
+
+    def test_windowed_provider_rejects_a_short_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chunk = root / "chunk"; chunk.mkdir()
+            provider = self.ffrife.WindowedFrameProvider("src.mp4", 100, 30.0)
+            with patch.object(self.ffrife, "run_ffmpeg", lambda *a, **k: None), \
+                 patch.object(self.ffrife, "passthrough_fps_args", lambda: []):
+                with self.assertRaises(self.ffrife.WindowedExtractionError):
+                    provider.materialize(0, 5, chunk)  # run_ffmpeg wrote nothing
+
+    def test_windowed_provider_rejects_a_seam_that_does_not_line_up(self) -> None:
+        # _chunk_ranges overlaps one source frame between neighbours, so a
+        # chunk's first frame must be byte-identical to the previous
+        # chunk's last. That overlap is what makes a misaligned seek
+        # detectable rather than a silent one-frame shift in the output.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            provider = self.ffrife.WindowedFrameProvider("src.mp4", 100, 30.0)
+            written = {}
+
+            def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+                target = Path(cmd[-1]).parent
+                for i in range(1, written["count"] + 1):
+                    (target / f"{i:08d}.png").write_bytes(written["content"](i))
+
+            with patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+                 patch.object(self.ffrife, "passthrough_fps_args", lambda: []):
+                first = root / "c0"; first.mkdir()
+                written.update(count=5, content=lambda i: f"global{i - 1}".encode())
+                provider.materialize(0, 5, first)  # last frame is "global4"
+
+                aligned = root / "c1"; aligned.mkdir()
+                written.update(count=5, content=lambda i: f"global{i + 3}".encode())
+                provider.materialize(4, 9, aligned)  # first frame is "global4" - continuous
+
+                shifted = root / "c2"; shifted.mkdir()
+                written.update(count=5, content=lambda i: f"global{i + 99}".encode())
+                with self.assertRaises(self.ffrife.WindowedExtractionError):
+                    provider.materialize(8, 13, shifted)
+
+    def test_windowed_provider_seeks_half_a_frame_early_with_passthrough(self) -> None:
+        # Both details are load-bearing: accurate seek keeps frames at or
+        # after the seek time (so aim early), and without passthrough ffmpeg
+        # conforms to a CFR grid starting at the seek point and duplicates a
+        # frame to fill the gap, shifting the whole chunk by one.
+        with tempfile.TemporaryDirectory() as td:
+            chunk = Path(td) / "chunk"; chunk.mkdir()
+            provider = self.ffrife.WindowedFrameProvider("src.mp4", 100, 30.0, window_start=2.0)
+            seen = []
+
+            def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+                seen.append(cmd)
+                for i in range(1, 4):
+                    (Path(cmd[-1]).parent / f"{i:08d}.png").write_bytes(b"x")
+
+            with patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+                 patch.object(self.ffrife, "passthrough_fps_args", lambda: ["-fps_mode", "passthrough"]):
+                provider.materialize(60, 63, chunk)
+            cmd = seen[0]
+            self.assertIn("-fps_mode", cmd)
+            self.assertAlmostEqual(float(cmd[cmd.index("-ss") + 1]), 2.0 + 59.5 / 30.0, places=5)
+            self.assertEqual(cmd[cmd.index("-frames:v") + 1], "3")
+
+    def test_suppression_rebases_source_frames_for_a_windowed_chunk(self) -> None:
+        # Under windowed extraction in_frames holds only this chunk's own
+        # source frames, numbered from 1, so a cut's global source index has
+        # to be rebased the same way the output index already is.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chunk_in = root / "in"; chunk_in.mkdir()
+            # Local file N holds global zero-based frame N + 1 here
+            # (source_offset=2), and the whole-clip convention names global
+            # frame g's content "src{g+1}" - so local 1 is "src3".
+            for local in range(1, 5):  # global zero-based 2..5
+                (chunk_in / f"{local:08d}.png").write_bytes(f"src{local + 2}".encode())
+            chunk_out = root / "out"; chunk_out.mkdir()
+            for i in range(1, 5):
+                (chunk_out / f"{i:08d}.png").write_bytes(b"interp")
+            replaced = self.ffrife.suppress_scene_cut_interpolation_range(
+                chunk_in, chunk_out, 5, 9, [2], range_start=2, range_end=6,
+                index_offset=2, source_offset=2,
+            )
+            self.assertEqual(replaced, 1)
+            self.assertEqual((chunk_out / "00000002.png").read_bytes(), b"src3")
+
+
+class FfrifeDetectionInputTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_downscale_always_converts_to_rgb_first(self) -> None:
+        # Without the explicit format=rgb24, ffmpeg scales a video source in
+        # its native yuv420p (averaging already-subsampled chroma) while a
+        # PNG sequence is scaled in full RGB - and detection then finds
+        # different gradual transitions for the same clip depending only on
+        # which input it read.
+        cmd = self.ffrife._tiny_frame_stream(["-i", "src.mp4"], None, 32, 18)
+        self.assertEqual(cmd[cmd.index("-vf") + 1], "format=rgb24,scale=32:18")
+
+    def test_run_filter_chain_is_applied_before_the_downscale(self) -> None:
+        cmd = self.ffrife._tiny_frame_stream(["-i", "src.mp4"], "crop=10:10:0:0", 32, 18)
+        self.assertEqual(cmd[cmd.index("-vf") + 1], "crop=10:10:0:0,format=rgb24,scale=32:18")
+
+    def test_frames_input_reads_the_extracted_sequence(self) -> None:
+        args = self.ffrife.frames_input_args("/tmp/in", 24.0)
+        self.assertEqual(args[:2], ["-framerate", "24"])
+        self.assertTrue(args[-1].endswith("%08d.png"))
 
 
 class FfrifeApplyRunOverridesTest(unittest.TestCase):
