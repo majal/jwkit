@@ -1312,8 +1312,11 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     frames_root = Path(frames_root)
     in_frames = frames_root / "in"
     out_frames = frames_root / "out"
-    in_frames.mkdir(parents=True)
-    out_frames.mkdir(parents=True)
+    # A durable resume directory already contains both of these.  Creating
+    # them without exist_ok made the default resume path fail before it could
+    # inspect either checkpoint.
+    in_frames.mkdir(parents=True, exist_ok=True)
+    out_frames.mkdir(parents=True, exist_ok=True)
     trim_args = source_window_args(start, end)
     duration = (end - start) if (start is not None and end is not None) else None
     extract_cmd = trim_args + ["-i", str(source)]
@@ -1321,9 +1324,18 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         extract_cmd += ["-vf", vf]
     extract_cmd += [f"{in_frames}/%08d.png"]
     extract_marker = frames_root / "extract-complete.json"
-    if extract_marker.exists() and any(in_frames.glob("*.png")):
-        print("Resuming: extracted source frames already complete.")
+    extracted_count = len(list(in_frames.glob("*.png")))
+    expected_extracted_count = None
+    if extract_marker.exists():
+        try:
+            expected_extracted_count = int(json.loads(extract_marker.read_text())["frame_count"])
+        except (OSError, ValueError, KeyError, TypeError):
+            expected_extracted_count = None
+    if expected_extracted_count and extracted_count == expected_extracted_count:
+        print(f"Resuming: {extracted_count} extracted source frames already complete.")
     else:
+        if extract_marker.exists() or extracted_count:
+            print("Extracted-frame resume data is incomplete; rebuilding it.")
         shutil.rmtree(in_frames, ignore_errors=True)
         in_frames.mkdir(parents=True)
         run_ffmpeg(extract_cmd, duration=duration, label="Extracting")

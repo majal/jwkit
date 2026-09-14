@@ -622,6 +622,59 @@ class FfrifeLongRunTest(unittest.TestCase):
                 self.ffrife._render_rife_chunks("rife", incoming, outgoing, 25, "model", config, root / "state.json")
             self.assertEqual(calls, first_calls)
 
+    def test_render_rife_frames_reuses_complete_extraction_on_resume(self) -> None:
+        config = {"rife_binary_path": "/fake/rife", "chunk_frames": "0",
+                  "scene_detection": "false"}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            incoming = root / "in"
+            incoming.mkdir()
+            for index in range(2):
+                (incoming / f"{index:08d}.png").write_bytes(b"png")
+            self.ffrife._write_json_atomic(root / "extract-complete.json", {"frame_count": 2})
+
+            def fake_render(_binary, _input, output, target_count, **_kwargs):
+                for index in range(target_count):
+                    (Path(output) / f"{index:08d}.png").write_bytes(b"png")
+
+            with patch.object(self.ffrife, "command_exists", return_value=True), \
+                 patch.object(self.ffrife, "run_ffmpeg") as extract, \
+                 patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
+                 patch.object(self.ffrife, "probe_source_resolution", return_value=(1280, 720)), \
+                 patch.object(self.ffrife, "run_rife", fake_render):
+                self.ffrife.render_rife_frames("in.mp4", root, config, fps=60)
+
+            extract.assert_not_called()
+
+    def test_render_rife_frames_reextracts_incomplete_checkpoint(self) -> None:
+        config = {"rife_binary_path": "/fake/rife", "chunk_frames": "0",
+                  "scene_detection": "false"}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            incoming = root / "in"
+            incoming.mkdir()
+            (incoming / "00000000.png").write_bytes(b"partial")
+            self.ffrife._write_json_atomic(root / "extract-complete.json", {"frame_count": 2})
+
+            def fake_extract(cmd, **_kwargs):
+                output_dir = Path(cmd[-1]).parent
+                for index in range(2):
+                    (output_dir / f"{index:08d}.png").write_bytes(b"png")
+
+            def fake_render(_binary, _input, output, target_count, **_kwargs):
+                for index in range(target_count):
+                    (Path(output) / f"{index:08d}.png").write_bytes(b"png")
+
+            with patch.object(self.ffrife, "command_exists", return_value=True), \
+                 patch.object(self.ffrife, "run_ffmpeg", side_effect=fake_extract) as extract, \
+                 patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
+                 patch.object(self.ffrife, "probe_source_resolution", return_value=(1280, 720)), \
+                 patch.object(self.ffrife, "run_rife", fake_render):
+                self.ffrife.render_rife_frames("in.mp4", root, config, fps=60)
+
+            extract.assert_called_once()
+            self.assertEqual(len(list(incoming.glob("*.png"))), 2)
+
     def test_render_rife_frames_scales_threshold_by_source_resolution(self) -> None:
         # render_rife_frames' chunked path probes the source's actual
         # resolution and turns it into resolve_rife_policy's workload_scale -
