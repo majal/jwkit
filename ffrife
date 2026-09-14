@@ -1663,6 +1663,14 @@ def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config, input_
         cuts.extend(range(start_frame + 1, end_frame + 1))
     return sorted(set(cuts)), len(transitions), frame_count
 
+# Floor for the decode-check timeout, plus the deliberately pessimistic
+# decode rate the rest of it is scaled from. A timeout here is read as
+# "corrupt", so it must never be reachable by a file merely being large:
+# 1MB/s is far below what any of these codecs actually decode at, which
+# makes the budget generous rather than tight.
+VALIDATE_TIMEOUT_FLOOR = 120
+VALIDATE_BYTES_PER_SECOND = 1e6
+
 def _validate_media_file(path):
     """Cheap corruption/truncation check: does `path` decode cleanly start
     to finish? Used only to decide whether a segment file left over from an
@@ -1671,13 +1679,22 @@ def _validate_media_file(path):
     is only ever updated (via _write_json_atomic's atomic rename) *after*
     ffmpeg has already returned success for a segment, so this is belt-and-
     suspenders against filesystem-level corruption, not the thing that makes
-    resume correct."""
+    resume correct.
+
+    The timeout scales with the file, because a fixed one is actively
+    harmful here: a timeout is indistinguishable from corruption to the
+    caller, so a large-but-perfectly-good segment (or a whole-clip
+    video.mkv from a long run, which is the single most expensive thing
+    resume can reuse) would be discarded and its RIFE work redone purely
+    for taking a while to decode - and long runs are exactly the ones
+    that produce big files and most need resume to work."""
     path = Path(path)
     if not path.exists() or path.stat().st_size == 0:
         return False
+    timeout = max(VALIDATE_TIMEOUT_FLOOR, path.stat().st_size / VALIDATE_BYTES_PER_SECOND)
     try:
         subprocess.run([FFMPEG_BIN, "-v", "error", "-i", str(path), "-f", "null", "-"],
-                       capture_output=True, check=True, timeout=120)
+                       capture_output=True, check=True, timeout=timeout)
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return False
