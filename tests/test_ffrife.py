@@ -51,6 +51,26 @@ class FfrifeConfigTest(unittest.TestCase):
         ])
         self.assertEqual((args.encoder, args.codec, args.crf, args.preset), ("nvenc", "hevc", "24", "fast"))
 
+    def test_resumable_work_defaults_outside_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "synced" / "movie.mp4"
+            with patch.object(self.ffrife.tempfile, "gettempdir", return_value=str(Path(td) / "local-temp")):
+                work = self.ffrife._work_dir_for(output, "abc123", self.ffrife.DEFAULT_CONFIG)
+            self.assertEqual(work, Path(td) / "local-temp" / "jwkit" / "ffrife" / "abc123")
+            self.assertNotEqual(work.parent, output.parent)
+
+    def test_resumable_work_dir_is_configurable_and_cli_overridable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            configured = Path(td) / "scratch"
+            work = self.ffrife._work_dir_for("movie.mp4", "abc123", {"work_dir": str(configured)})
+            self.assertEqual(work, configured / "abc123")
+            args = self.ffrife.build_parser().parse_args([
+                "run", "input.mp4", "-o", "output.mp4", "--work-dir", str(configured),
+            ])
+            config = dict(self.ffrife.DEFAULT_CONFIG)
+            self.ffrife.apply_generic_config_overrides(args, config)
+            self.assertEqual(config["work_dir"], str(configured))
+
 
 class FfrifeEncodeArgsTest(unittest.TestCase):
     @classmethod
