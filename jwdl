@@ -44,7 +44,7 @@ def _apply_overwrite_overrides(args):
 def _add_overwrite_args(parser):
     parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
-    parser.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
+    parser.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds, help="Time to wait for an 'ask' answer before falling back")
 
 
 DEFAULT_BASE_DIR = Path.home() / "Music" / "Watchtower Music"

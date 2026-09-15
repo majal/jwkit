@@ -110,7 +110,8 @@ Persistent mux preferences live in `~/.config/jwkit/jwvideo-mux/config.toml`. Us
 - `--variant-min-seconds` (default `1.5`) sets how long a similarity drop must
   hold before it counts as a candidate. Sub-second dips are almost always
   ordinary encoding jitter (a fast pan, a busy texture), not real localized
-  content, so the default deliberately sits well above single-frame noise.
+  content, so the default deliberately sits well above single-frame noise. It
+  accepts `SS.sss`, `MM:SS.sss`, or `HH:MM:SS.sss`.
 - `--dedupe-identical-video` keeps one video stream from each byte-identical
   group while retaining every requested audio and subtitle track. It is opt-in
   and uses an elementary-stream SHA-256 test, not a visual similarity guess.

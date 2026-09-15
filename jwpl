@@ -188,7 +188,7 @@ INSERT INTO PlaylistItemAccuracy VALUES(2,'NeedsUserVerification');
 
 def _duration_ticks(path: Path, settings: dict[str, Any]) -> int:
     if path.suffix.lower() in IMAGE_EXTENSIONS:
-        return round(float(settings["image_duration_seconds"]) * 10_000_000)
+        return round(_jwkit_common.parse_time_seconds(settings["image_duration_seconds"]) * 10_000_000)
     result = subprocess.run(
         [str(settings["ffprobe"]), "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
         check=True, capture_output=True, text=True,
@@ -445,7 +445,7 @@ def _add_setting_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--include", action="append", help="glob to include; repeatable")
     parser.add_argument("--exclude", action="append", help="glob to exclude; repeatable")
     parser.add_argument("--end-action", type=int, choices=range(4))
-    parser.add_argument("--image-duration-seconds", type=float)
+    parser.add_argument("--image-duration-seconds", type=_jwkit_common.parse_time_seconds)
     parser.add_argument("--thumbnail-size", type=int)
     parser.add_argument("--device-name")
     parser.add_argument("--video-title-source", choices=("filename", "metadata"))
@@ -483,7 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--dry-run", action="store_true", help="show selected media without writing")
     create.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     create.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
-    create.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
+    create.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds, help="Time to wait for an 'ask' answer before falling back")
     _add_setting_flags(create)
     inspect = sub.add_parser("inspect", help="print archive structure and ordered items")
     inspect.add_argument("playlist", type=Path)
@@ -505,7 +505,8 @@ def _parse_config_value(key: str, raw: str) -> Any:
     if isinstance(current, int):
         return int(raw)
     if isinstance(current, float):
-        return float(raw)
+        return (_jwkit_common.parse_time_seconds(raw)
+                if key == "image_duration_seconds" else float(raw))
     if isinstance(current, list):
         return [part.strip() for part in raw.split(",") if part.strip()]
     return raw
@@ -580,7 +581,8 @@ def main(argv: list[str] | None = None) -> int:
             _write_toml(CONFIG_FILE, {key: value for key, value in current.items() if value != DEFAULTS[key]})
         def validate(key, value):
             if key == "end_action" and int(value) not in range(4): return "must be 0, 1, 2, or 3"
-            if key in {"image_duration_seconds", "thumbnail_size"} and float(value) <= 0: return "must be positive"
+            if key == "image_duration_seconds" and _jwkit_common.parse_time_seconds(value) <= 0: return "must be positive"
+            if key == "thumbnail_size" and float(value) <= 0: return "must be positive"
             if key == "video_title_source" and value not in {"filename", "metadata"}: return "must be filename or metadata"
             return None
         return _jwkit_common.run_config_command(

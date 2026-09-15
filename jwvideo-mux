@@ -74,7 +74,9 @@ def load_config():
             default = config[key]
             if isinstance(default, bool): config[key] = raw.lower() == "true"
             elif isinstance(default, int): config[key] = int(raw)
-            elif isinstance(default, float): config[key] = float(raw)
+            elif isinstance(default, float):
+                config[key] = (_jwkit_common.parse_time_seconds(raw)
+                               if key == "variant_min_seconds" else float(raw))
             else: config[key] = raw
     return config
 
@@ -98,10 +100,14 @@ def run_config(argv):
         if key == "variant_min_seconds" and float(value) < 0:
             return "must be non-negative"
         return None
+    def parse_value(key, raw):
+        if key == "variant_min_seconds":
+            return _jwkit_common.parse_time_seconds(raw)
+        return _jwkit_common.parse_config_value(DEFAULT_CONFIG[key], raw)
     return _jwkit_common.run_config_command(
         tool="jwvideo-mux", args=args, config=config, defaults=DEFAULT_CONFIG,
         config_file=CONFIG_FILE, save_config=save_config,
-        descriptions=CONFIG_HELP, validate=validate,
+        descriptions=CONFIG_HELP, parse_value=parse_value, validate=validate,
     )
 
 
@@ -1559,7 +1565,7 @@ def main():
     parser.add_argument("-f", "--force", action="store_true", help="Force overwrite if output file exists without asking (equivalent to --on-exists overwrite for this run)")
     parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
-    parser.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
+    parser.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds, help="Time to wait for an 'ask' answer before falling back")
     default_subs = parser.add_mutually_exclusive_group()
     default_subs.add_argument("--no-default-subs", dest="no_default_subs", action="store_true", default=None, help="Do not set a subtitle track as default")
     default_subs.add_argument("--default-subs", dest="no_default_subs", action="store_false", help="Set the selected subtitle track as default")
@@ -1567,7 +1573,7 @@ def main():
     parser.add_argument("--default-audio", help="Language code to set as default audio track")
     parser.add_argument("--default-sub", help="Language code to set as default subtitle track")
     parser.add_argument("--analyze-video-variants", action="store_true", help="Report exact video reuse and reviewed localized-difference candidates; does not mux or delete media")
-    parser.add_argument("--variant-min-seconds", type=float, help="Minimum sustained localized-difference duration")
+    parser.add_argument("--variant-min-seconds", type=_jwkit_common.parse_time_seconds, help="Minimum sustained localized-difference duration")
     parser.add_argument("--scan-small-regions", action=argparse.BooleanOptionalAction, default=None, help="Compare horizontal frame bands too")
     parser.add_argument("--region-count", type=int, help="Horizontal bands used by --scan-small-regions")
     parser.add_argument("--manual-overrides", type=Path, help="TOML file (ground-truth.toml schema: talks -> videos -> differences, with an optional fallback_ok flag per difference) of human-confirmed evidence for local-file-mode SCE-layout input; always wins over automatic detection for the languages/windows it covers. Matched by exact talk-folder-name + anchor-filename, so reuse one file across a whole library.")
