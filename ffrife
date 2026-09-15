@@ -132,6 +132,7 @@ DEFAULT_CONFIG = {
                                  # the threshold at a proportionally lower source frame count
     "resume": "true",  # keep and reuse durable per-output work state
     "keep_work": "false",  # retain completed work state for inspection
+    "work_dir": "auto",  # parent for resumable/temp frame trees; auto uses the OS temp area so sync apps never see them
     "space_check": "true",  # estimate temp space needed before running RIFE and abort if short
     "space_check_margin": "1.15",  # required-vs-free safety multiplier for the space check
     "stream_segment_chunks": "auto",  # RIFE chunks per encode segment before their PNGs are freed; auto lets plan_pipeline size it from whatever disk is actually free
@@ -177,6 +178,7 @@ CONFIG_HELP = {
     "long_run_frames": "Source frame count (at reference resolution/fps-ratio) above which rife_profile=auto picks balanced instead of performance",
     "resume": "Keep and reuse durable per-output work state so an interrupted run can pick back up",
     "keep_work": "Retain completed work state (extracted/interpolated frames) after a successful run, for inspection",
+    "work_dir": "Parent directory for resumable frame data; auto uses an OS-local temp directory outside the output folder",
     "space_check": "Estimate temp disk space needed for extracted+interpolated frames before running RIFE and abort if short",
     "space_check_margin": "Required-vs-free safety multiplier for the space check (1.15 = require 15% headroom over the estimate)",
     "stream_segment_chunks": "RIFE chunks encoded together as one segment before their PNGs are freed; auto sizes it from free disk (lower uses less peak disk but resets the encoder's lookahead more often)",
@@ -1619,9 +1621,20 @@ def _job_signature(source, output_file, options):
     raw = json.dumps([source_identity, str(Path(output_file).resolve()), options], sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-def _work_dir_for(output_file, signature):
-    output = Path(output_file)
-    return output.parent / f".{output.name}.ffrife-{signature}"
+def _work_dir_for(output_file, signature, config=None):
+    """Return a stable, local-only work path for a resumable job.
+
+    Work used to live beside the output. That made hundreds of gigabytes of
+    short-lived PNGs visible to folder-sync tools whenever the output folder
+    was synced. The system temp area is machine-local by definition while a
+    signature still makes the path stable enough for crash resume.
+    """
+    configured = str((config or {}).get("work_dir", "auto")).strip()
+    if not configured or configured.lower() == "auto":
+        root = Path(tempfile.gettempdir()) / "jwkit" / "ffrife"
+    else:
+        root = Path(configured).expanduser()
+    return root / signature
 
 def _chunk_ranges(frame_count, chunk_frames):
     if chunk_frames == 1:
@@ -2419,7 +2432,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
                "transition_ranges": config.get("transition_ranges")}
     signature = _job_signature(source, output_file, options)
     durable = config_bool(config, "resume", False)
-    work_path = _work_dir_for(output_file, signature) if durable else Path(tempfile.mkdtemp(prefix="ffrife-"))
+    work_path = _work_dir_for(output_file, signature, config) if durable else Path(tempfile.mkdtemp(prefix="ffrife-"))
     work_path.mkdir(parents=True, exist_ok=True)
     try:
         temp_dir_path = work_path
