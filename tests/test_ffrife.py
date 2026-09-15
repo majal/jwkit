@@ -186,6 +186,39 @@ class FfrifeParseSpeedTest(unittest.TestCase):
         self.assertEqual(self.ffrife.parse_speed("150%"), 1.5)
 
 
+class FfrifeTrimWindowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_window_parses_as_start_and_end(self) -> None:
+        args = self.ffrife.build_parser().parse_args([
+            "run", "input.mp4", "--window", "3.567:10.003",
+        ])
+        self.assertEqual(self.ffrife.resolve_processing_window(args), (3.567, 10.003))
+
+    def test_window_requires_increasing_nonnegative_bounds(self) -> None:
+        for value in ("not-a-window", "-1:2", "2:2", "3:2", "nan:8", "2:inf"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                with patch("sys.stderr", io.StringIO()):
+                    self.ffrife.build_parser().parse_args(["run", "input.mp4", "--window", value])
+
+    def test_window_cannot_be_combined_with_separate_bounds(self) -> None:
+        for extra in (("--start", "1"), ("--end", "9")):
+            with self.subTest(extra=extra):
+                args = self.ffrife.build_parser().parse_args([
+                    "run", "input.mp4", "--window", "2:8", *extra,
+                ])
+                with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                    self.ffrife.resolve_processing_window(args)
+
+    def test_separate_bounds_still_work(self) -> None:
+        args = self.ffrife.build_parser().parse_args([
+            "run", "input.mp4", "--start", "2", "--end", "8",
+        ])
+        self.assertEqual(self.ffrife.resolve_processing_window(args), (2.0, 8.0))
+
+
 class FfrifeAtempoChainTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

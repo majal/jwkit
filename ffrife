@@ -15,7 +15,8 @@ other tools (e.g. `ffslow`'s --rife flag) can shell out to this CLI directly.
                                          <input>_rife<ext> alongside it)
 
 Options:
-  --start SS --end SS   trim window (seconds); omit to process the whole input
+  --window A:B           trim to A..B seconds (shorthand for --start A --end B)
+  --start SS --end SS    trim either boundary separately; omit both for whole input
   --fps N                target frame rate: a plain number (60) or
                           source-relative (2x, 2.5x, 150%) (default 60)
   --speed N               retime the output (0.5 = half-speed slow-motion,
@@ -610,6 +611,32 @@ def parse_speed(value):
         num, den = s.split("/", 1)
         return float(num) / float(den)
     return float(s)
+
+def parse_trim_window(value):
+    """Parse the compact ``--window START:END`` CLI form."""
+    try:
+        start_text, end_text = value.split(":", 1)
+        start, end = float(start_text), float(end_text)
+    except (AttributeError, ValueError):
+        raise argparse.ArgumentTypeError("must be START:END seconds")
+    if not math.isfinite(start) or not math.isfinite(end):
+        raise argparse.ArgumentTypeError("START and END must be finite")
+    if start < 0 or end < 0:
+        raise argparse.ArgumentTypeError("START and END must be non-negative")
+    if end <= start:
+        raise argparse.ArgumentTypeError("END must be greater than START")
+    return start, end
+
+def resolve_processing_window(args):
+    """Return the effective CLI trim bounds, rejecting ambiguous forms."""
+    window = getattr(args, "window", None)
+    start = getattr(args, "start", None)
+    end = getattr(args, "end", None)
+    if window is not None:
+        if start is not None or end is not None:
+            raise ValueError("--window cannot be combined with --start or --end")
+        return window
+    return start, end
 
 def atempo_chain(speed):
     """ffmpeg's atempo filter only accepts a single factor in [0.5, 2.0];
@@ -2793,6 +2820,8 @@ def add_bool_flag(parser, dest, flag_stem, help_on=None, help_off=None):
 
 def add_processing_arguments(parser, include_trim=True):
     if include_trim:
+        parser.add_argument("--window", type=parse_trim_window, metavar="START:END",
+                            help="Trim to one source interval, e.g. --window 10:20 (shorthand for --start 10 --end 20)")
         parser.add_argument("--start", type=float, help="Trim start (seconds)")
         parser.add_argument("--end", type=float, help="Trim end (seconds)")
     parser.add_argument("--fps", default="60", help="Target frame rate: a plain number (60) or source-relative (2x, 2.5x, 150%%) (default: 60)")
@@ -2931,6 +2960,10 @@ def main():
         cmd_benchmark(args, config)
     elif args.command == "run":
         apply_run_overrides(args, config)
+        try:
+            start, end = resolve_processing_window(args)
+        except ValueError as exc:
+            build_parser().error(str(exc))
         jwkit_config = _jwkit_common.load_jwkit_config()
         for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
             value = getattr(args, arg_name, None)
@@ -2941,7 +2974,7 @@ def main():
         if output is None:
             sys.exit(1)
 
-        ok = interpolate(args.input, output, config, start=args.start, end=args.end, vf=args.vf, fps=args.fps, speed=args.speed)
+        ok = interpolate(args.input, output, config, start=start, end=end, vf=args.vf, fps=args.fps, speed=args.speed)
         sys.exit(0 if ok else 1)
     elif args.command in ("batch", "bulk"):
         apply_run_overrides(args, config)
