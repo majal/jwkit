@@ -31,6 +31,11 @@ Each tool below has its own section covering what it does, what it needs, and th
 
 One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `ffv`, `jwdl`, `jwpl`, `ffinpaint`, `ffrife`, `jwvideo-mux`, and `register-jwplay-launcher` just work. No manual downloads, no separate setup steps.
 
+Every configurable tool uses TOML under `~/.config/jwkit/<tool>/config.toml`
+and the same management commands: `config list|get|set|path|edit|reset|diff|check`.
+Use `config path` when you forget where a file lives, `config diff` to see only
+your custom values, and `config check` for a safe validation pass.
+
 **macOS or Linux** (Terminal):
 
 ```bash
@@ -97,7 +102,7 @@ Full docs: [docs/ffrife.md](docs/ffrife.md)
 
 ### [`ffv`](./ffv)
 
-`ffv` preserves the original command name and compact `ffv <language> <reference>` muscle memory while delegating all lookup, playback, and encoding to `slverse`. It also keeps the familiar `any` and `all` selection modes without maintaining a second video engine.
+`ffv` is the compact launcher for `slverse`: `ffv <language> <reference>` and its `any`/`all` modes delegate lookup, playback, encoding, and configuration to the single `slverse` implementation. `ffv config ...` exposes the same config commands directly.
 
 Full docs: [docs/ffv.md](docs/ffv.md)
 

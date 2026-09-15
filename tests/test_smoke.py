@@ -71,6 +71,18 @@ class SmokeTest(unittest.TestCase):
         with mock.patch.object(ffv.shutil, "which", return_value="/other/install/slverse"):
             self.assertEqual(Path(ffv.slverse_path()).resolve(), sibling)
 
+    def test_every_configurable_tool_exposes_canonical_config_path(self) -> None:
+        for tool in ("ffinpaint", "ffrife", "jwdl", "jwpl", "jwvideo-mux", "slverse"):
+            with self.subTest(tool=tool):
+                result = self.run_script(tool, "config", "path")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.strip().endswith(f"/jwkit/{tool}/config.toml"), result.stdout)
+
+    def test_ffv_delegates_config_management_to_slverse(self) -> None:
+        result = self.run_script("ffv", "config", "path")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.strip().endswith("/jwkit/slverse/config.toml"), result.stdout)
+
     def test_jwpl_help(self) -> None:
         result = self.run_script("jwpl", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)

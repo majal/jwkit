@@ -3,8 +3,8 @@
 way slverse already loads ffrife (SourceFileLoader, not a real import,
 since these are standalone shebang scripts rather than a package).
 
-Currently just the on-run auto-update check. Not jw.org-specific and not
-tied to any one tool, so new shared cross-tool concerns belong here too.
+This is the canonical home for cross-tool configuration, update, output,
+encoding, and progress behavior. It is not tied to any one tool.
 """
 import datetime
 import json
@@ -12,6 +12,7 @@ import os
 import platform
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,132 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+
+CONFIG_ACTIONS = ("list", "get", "set", "path", "edit", "reset", "diff", "check")
+
+
+def add_config_arguments(parser):
+    """Give every jwkit tool the same config-management command surface."""
+    parser.add_argument("action", choices=CONFIG_ACTIONS, nargs="?", default="list")
+    parser.add_argument("key", nargs="?")
+    parser.add_argument("value", nargs="?")
+
+
+def parse_config_value(default, raw):
+    if isinstance(default, bool):
+        if str(raw).casefold() not in {"true", "false"}:
+            raise ValueError("boolean value must be true or false")
+        return str(raw).casefold() == "true"
+    if isinstance(default, int):
+        return int(raw)
+    if isinstance(default, float):
+        return float(raw)
+    if isinstance(default, list):
+        return [part.strip() for part in str(raw).split(",") if part.strip()]
+    return str(raw)
+
+
+def format_config_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value)
+    if isinstance(value, dict):
+        return ",".join(f"{key}={item}" for key, item in sorted(value.items()))
+    return str(value)
+
+
+def run_config_command(
+    *, tool, args, config, defaults, config_file, save_config,
+    descriptions=None, parse_value=None, validate=None, check_extra=None,
+):
+    """Run the shared list/get/set/path/edit/reset/diff/check interface.
+
+    Returns a process-style status code. Tool-specific parsers and validators
+    remain injectable so sharing the operator interface does not erase useful
+    type or domain validation.
+    """
+    descriptions = descriptions or {}
+    parse_value = parse_value or (lambda key, raw: parse_config_value(defaults[key], raw))
+    action, key, raw = args.action, args.key, args.value
+
+    if action == "path":
+        print(config_file)
+        return 0
+    if action == "edit":
+        config_file = Path(config_file)
+        if not config_file.exists():
+            save_config(config)
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        if not editor:
+            print(f"{tool}: set $VISUAL or $EDITOR to use 'config edit'", file=sys.stderr)
+            return 2
+        return subprocess.call([*shlex.split(editor), str(config_file)])
+    if action in {"get", "set", "reset"}:
+        if not key:
+            print(f"{tool} config {action} requires KEY" + (" VALUE" if action == "set" else ""), file=sys.stderr)
+            return 2
+        if key not in defaults:
+            print(f"{tool}: unknown config key: {key}", file=sys.stderr)
+            return 2
+    if action == "set":
+        if raw is None:
+            print(f"{tool} config set requires KEY VALUE", file=sys.stderr)
+            return 2
+        try:
+            value = parse_value(key, raw)
+        except (TypeError, ValueError) as exc:
+            print(f"{tool}: invalid {key}: {exc}", file=sys.stderr)
+            return 2
+        if validate:
+            error = validate(key, value)
+            if error:
+                print(f"{tool}: invalid {key}: {error}", file=sys.stderr)
+                return 2
+        config[key] = value
+        save_config(config)
+        print(f"Set {key} = {format_config_value(value)}")
+        return 0
+    if action == "reset":
+        config[key] = defaults[key]
+        save_config(config)
+        print(f"Reset {key} = {format_config_value(defaults[key])}")
+        return 0
+    if action == "get":
+        print(f"{key} = {format_config_value(config[key])}")
+        if descriptions.get(key):
+            print(f"  {descriptions[key]}")
+        return 0
+    if action == "diff":
+        changed = [(key, config[key]) for key in defaults if config.get(key) != defaults[key]]
+        if not changed:
+            print("All settings use their defaults.")
+        else:
+            for changed_key, value in changed:
+                print(f"{changed_key} = {format_config_value(value)}")
+        return 0
+    if action == "check":
+        issues = []
+        for unknown_key in sorted(set(config) - set(defaults)):
+            issues.append(f"unknown config key: {unknown_key}")
+        for check_key in defaults:
+            if validate:
+                error = validate(check_key, config.get(check_key))
+                if error:
+                    issues.append(f"{check_key}: {error}")
+        if check_extra:
+            issues.extend(check_extra(config))
+        if issues:
+            for issue in issues:
+                print(f"ERROR: {issue}")
+            return 2
+        print(f"Configuration is valid: {config_file}")
+        return 0
+    for list_key in defaults:
+        suffix = f"  # {descriptions[list_key]}" if descriptions.get(list_key) else ""
+        print(f"{list_key} = {format_config_value(config[list_key])}{suffix}")
+    return 0
 
 JWKIT_CONFIG_DIR = Path.home() / ".config" / "jwkit"
 JWKIT_CONFIG_FILE = JWKIT_CONFIG_DIR / "config.toml"

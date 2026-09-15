@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from argparse import Namespace
+from contextlib import redirect_stderr, redirect_stdout
+import io
 from pathlib import Path
+import tempfile
 from unittest import mock
 
 from tests.support import load_script_module
@@ -44,6 +48,75 @@ class JwkitCommonConfigTest(unittest.TestCase):
              mock.patch("pathlib.Path.read_text", return_value=text):
             config = self.common.load_jwkit_config()
         self.assertEqual(config["color_output"], "never")
+
+
+class JwkitCommonConfigCommandTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def setUp(self) -> None:
+        self.defaults = {"name": "default", "count": 2, "enabled": False, "items": []}
+        self.config = dict(self.defaults)
+        self.saved = []
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config_file = Path(self.tmp.name) / "config.toml"
+
+    def run_config(self, action, key=None, value=None, **kwargs):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = self.common.run_config_command(
+                tool="demo", args=Namespace(action=action, key=key, value=value),
+                config=self.config, defaults=self.defaults, config_file=self.config_file,
+                save_config=lambda config: self.saved.append(dict(config)), **kwargs,
+            )
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_path_is_machine_readable(self) -> None:
+        status, stdout, _ = self.run_config("path")
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.strip(), str(self.config_file))
+
+    def test_set_parses_default_type_and_persists(self) -> None:
+        status, _, _ = self.run_config("set", "count", "7")
+        self.assertEqual(status, 0)
+        self.assertEqual(self.config["count"], 7)
+        self.assertEqual(self.saved[-1]["count"], 7)
+
+    def test_reset_restores_default_and_persists(self) -> None:
+        self.config["name"] = "changed"
+        status, _, _ = self.run_config("reset", "name")
+        self.assertEqual(status, 0)
+        self.assertEqual(self.config["name"], "default")
+
+    def test_diff_only_prints_nondefault_values(self) -> None:
+        self.config["enabled"] = True
+        status, stdout, _ = self.run_config("diff")
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.strip(), "enabled = true")
+
+    def test_unknown_key_is_rejected_without_saving(self) -> None:
+        status, _, stderr = self.run_config("set", "removed_key", "x")
+        self.assertEqual(status, 2)
+        self.assertIn("unknown config key", stderr)
+        self.assertFalse(self.saved)
+
+    def test_check_combines_domain_and_environment_validation(self) -> None:
+        status, stdout, _ = self.run_config(
+            "check", validate=lambda key, value: "must be positive" if key == "count" and value < 1 else None,
+            check_extra=lambda config: ["missing helper"] if config["name"] == "default" else [],
+        )
+        self.assertEqual(status, 2)
+        self.assertIn("ERROR: missing helper", stdout)
+
+    def test_edit_prefers_visual_and_opens_canonical_file(self) -> None:
+        self.config_file.write_text("name = default\n")
+        with mock.patch.object(self.common.os, "environ", {"VISUAL": "code --wait", "EDITOR": "vi"}), \
+             mock.patch.object(self.common.subprocess, "call", return_value=0) as call:
+            status, _, _ = self.run_config("edit")
+        self.assertEqual(status, 0)
+        call.assert_called_once_with(["code", "--wait", str(self.config_file)])
 
 
 class JwkitCommonColorTest(unittest.TestCase):

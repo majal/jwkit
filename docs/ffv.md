@@ -4,7 +4,7 @@
 
 ## What It Does
 
-`ffv` is a thin compatibility launcher for the original command name. It translates the old compact invocation into `slverse extract` or `slverse find`; all media and configuration logic remains in `slverse`.
+`ffv` is the compact launcher for `slverse`. It translates the concise invocation into `slverse extract` or `slverse find`; all media and configuration logic remains in `slverse`.
 
 ## Supported Platforms
 
@@ -35,7 +35,8 @@ Options are passed through unchanged, so newly added `slverse extract` flags wor
 
 - `ffv <lang> ...` delegates to `slverse extract <lang> ...`.
 - `ffv any ...` tries `slverse`'s configured `languages` in order and stops at the first available verse.
-- `ffv all ...` delegates to `slverse find`; `-p` and `-m` are accepted as aliases for `--play`.
+- `ffv all ...` delegates to `slverse find`; use `-p`/`--play` to open matching previews.
+- `ffv config ...` delegates to `slverse config ...`, including `path`, `edit`, `reset`, `diff`, and `check`.
 - Configuration belongs to `slverse`, so the launcher cannot drift into a second set of defaults.
 
 ## Notes / Caveats

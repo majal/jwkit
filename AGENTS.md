@@ -24,9 +24,23 @@ Tools here don't carry a `jw` prefix by default — the repo name already scopes
 
 ## Configuration
 
-All tools share one config namespace, `~/.config/jwkit/<tool>/` (e.g. `~/.config/jwkit/slverse/`, `~/.config/jwkit/jwdl/`, `~/.config/jwkit/ffrife/`). Each tool auto-migrates its config on first run from wherever it used to live (pre-jwkit `~/.config/maj-scripts/<tool>/`, or `slverse`'s brief standalone `~/.config/slverse/` waypoint) — nothing is lost across a rename or the unification, including `ffrife`'s downloaded RIFE binary and `slverse`'s synced verse-marker index. New tools should follow this same `~/.config/jwkit/<tool>/` layout from the start rather than inventing their own.
+All tools share one config namespace, `~/.config/jwkit/<tool>/` (e.g. `~/.config/jwkit/slverse/`, `~/.config/jwkit/jwdl/`, `~/.config/jwkit/ffrife/`). This is the only supported layout; retired pre-jwkit paths are not read at runtime. New tools must follow this layout from the start rather than inventing their own.
 
 Design tools config-first whenever behavior is reasonably user-customizable. Every persisted config setting must have a corresponding long CLI flag for a one-run override, and the most common flags should also have short aliases. Keep config, CLI help, docs, and tests in sync; do not hardcode one operator's language order, player layout, paths, or workflow preferences as universal behavior. Positional identifiers and intrinsically one-shot actions do not need persisted config merely for symmetry.
+
+Configuration management is part of the design of every new configurable
+script and every substantial edit to an existing one. Follow the repository's
+canonical interface: `config list|get|set|path|edit|reset|diff|check`. Store
+tool-local configuration as TOML under the XDG-style
+`~/.config/jwkit/<tool>/config.toml`; reserve `~/.config/jwkit/config.toml` for
+settings that genuinely apply to every tool. Use Unix-style text output and
+exit statuses, honor `$VISUAL` then `$EDITOR` for `config edit`, reject unknown
+keys and invalid values, and make `config check` safe and non-mutating. Reuse
+the helpers in `_jwkit_common.py` instead of cloning config-command logic.
+Keep every persisted setting paired with a long per-run flag, add short flags
+only for frequent operations, and update help, documentation, and tests in the
+same change. When retiring a key or path, migrate active installations first,
+then remove the compatibility branch rather than carrying it indefinitely.
 
 ## Push cadence
 

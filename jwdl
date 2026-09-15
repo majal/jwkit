@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from datetime import date
@@ -18,8 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _jwkit_common
 
 CONFIG_DIR = Path.home() / ".config" / "jwkit" / "jwdl"
-_LEGACY_CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "jwdl"
-CONFIG_FILE = CONFIG_DIR / "config.json"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
 
 # Resolved once at startup by main() -> _jwkit_common.resolve_color_enabled.
 COLOR = _jwkit_common.Colorizer(False)
@@ -46,15 +46,6 @@ def _add_overwrite_args(parser):
     parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
     parser.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
 
-
-def migrate_legacy_config_dir():
-    """One-time move from the pre-unification ~/.config/maj-scripts/jwdl
-    location to ~/.config/jwkit/jwdl now that all jwkit tools share one
-    config namespace."""
-    if _LEGACY_CONFIG_DIR.exists() and not CONFIG_DIR.exists():
-        CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(_LEGACY_CONFIG_DIR), str(CONFIG_DIR))
-        print(f"Moved your existing settings from {_LEGACY_CONFIG_DIR} to {CONFIG_DIR}.")
 
 DEFAULT_BASE_DIR = Path.home() / "Music" / "Watchtower Music"
 DEFAULT_PERIODICALS_BASE_DIR = Path.home() / "Documents" / "JW Periodicals"
@@ -113,44 +104,79 @@ def echo_r(msg):
     print(COLOR.red(msg))
 
 
+DEFAULT_CONFIG = {
+    "base_dir": str(DEFAULT_BASE_DIR), "periodicals_base_dir": str(DEFAULT_PERIODICALS_BASE_DIR),
+    "video_base_dir": str(DEFAULT_VIDEO_BASE_DIR), "workers": 4, "pubs": {},
+    "include_audio_descriptions": False, "periodical_months": 5,
+    "include_large_print": False, "video_resolution": DEFAULT_VIDEO_RESOLUTION,
+}
+CONFIG_HELP = {
+    "base_dir": "Base directory for music collections",
+    "periodicals_base_dir": "Base directory for downloaded periodicals",
+    "video_base_dir": "Base directory for downloaded videos",
+    "workers": "Parallel downloads per music publication",
+    "pubs": "Additional music publication mappings as CODE=FOLDER entries",
+    "include_audio_descriptions": "Include audio-description music variants",
+    "periodical_months": "Number of periodical issue months to check",
+    "include_large_print": "Include large-print periodical editions",
+    "video_resolution": "Preferred video resolution",
+}
+
 def load_config():
-    config = {
-        "base_dir": str(DEFAULT_BASE_DIR), "periodicals_base_dir": str(DEFAULT_PERIODICALS_BASE_DIR),
-        "video_base_dir": str(DEFAULT_VIDEO_BASE_DIR), "workers": 4, "pubs": {},
-        "include_audio_descriptions": False, "periodical_months": 5,
-        "include_large_print": False, "video_resolution": DEFAULT_VIDEO_RESOLUTION,
-    }
+    config = dict(DEFAULT_CONFIG)
+    config["pubs"] = {}
     if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE) as f:
-                user_config = json.load(f)
+            with open(CONFIG_FILE, "rb") as f:
+                user_config = tomllib.load(f)
             config.update({k: v for k, v in user_config.items() if k != "pubs"})
             config["pubs"] = user_config.get("pubs", {})
-        except (json.JSONDecodeError, OSError) as e:
+        except (tomllib.TOMLDecodeError, OSError) as e:
             echo_r(f"Warning: could not read {CONFIG_FILE}: {e}")
     return config
 
 def save_config(config):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+    lines = []
+    for key in DEFAULT_CONFIG:
+        if key == "pubs":
+            continue
+        value = config[key]
+        if isinstance(value, bool): rendered = "true" if value else "false"
+        elif isinstance(value, (int, float)): rendered = str(value)
+        else: rendered = json.dumps(str(value), ensure_ascii=False)
+        lines.append(f"{key} = {rendered}\n")
+    lines.append("\n[pubs]\n")
+    for code, folder in sorted(config.get("pubs", {}).items()):
+        lines.append(f"{json.dumps(str(code))} = {json.dumps(str(folder), ensure_ascii=False)}\n")
+    CONFIG_FILE.write_text("".join(lines))
+
+def parse_config_value(key, raw):
+    if key == "pubs":
+        result = {}
+        for item in str(raw).split(","):
+            if "=" not in item:
+                raise ValueError("expected CODE=FOLDER entries separated by commas")
+            code, folder = item.split("=", 1)
+            result[code.strip()] = folder.strip()
+        return result
+    return _jwkit_common.parse_config_value(DEFAULT_CONFIG[key], raw)
+
+def validate_config(key, value):
+    if key in {"workers", "periodical_months"} and int(value) < 1:
+        return "must be at least 1"
+    return None
 
 def run_config(argv, config):
     parser = argparse.ArgumentParser(prog="jwdl config", description="Show or edit saved jwdl defaults")
-    parser.add_argument("action", choices=("list", "get", "set"), nargs="?", default="list")
-    parser.add_argument("key", nargs="?"); parser.add_argument("value", nargs="?")
+    _jwkit_common.add_config_arguments(parser)
     args = parser.parse_args(argv)
-    if args.action == "list": print(json.dumps(config, indent=2, sort_keys=True)); return 0
-    if not args.key or args.key not in config: raise SystemExit(f"Unknown config key: {args.key}")
-    if args.action == "get": print(json.dumps(config[args.key])); return 0
-    if args.value is None: raise SystemExit("jwdl config set requires KEY VALUE")
-    old = config[args.key]
-    if isinstance(old, bool):
-        if args.value.lower() not in ("true", "false"): raise SystemExit("Boolean values must be true or false")
-        value = args.value.lower() == "true"
-    elif isinstance(old, int): value = int(args.value)
-    elif isinstance(old, dict): raise SystemExit("Edit structured pubs directly in config.json")
-    else: value = args.value
-    config[args.key] = value; save_config(config); print(f"Set {args.key} = {value}"); return 0
+    return _jwkit_common.run_config_command(
+        tool="jwdl", args=args, config=config, defaults=DEFAULT_CONFIG,
+        config_file=CONFIG_FILE, save_config=save_config,
+        descriptions=CONFIG_HELP, parse_value=parse_config_value,
+        validate=validate_config,
+    )
 
 
 def resolve_pubs(config):
@@ -651,7 +677,6 @@ def main():
         color_override = True
     COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=color_override))
 
-    migrate_legacy_config_dir()
     config = load_config()
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         return run_config(sys.argv[2:], config)

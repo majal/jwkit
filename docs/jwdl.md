@@ -89,7 +89,7 @@ Download at a smaller resolution than the default:
 
 ## Important Behavior / Defaults
 
-Persistent download preferences live in `~/.config/jwkit/jwdl/config.json`. Use `jwdl config list|get|set`; matching per-run flags override them. Boolean preferences use paired flags such as `--include-audio-descriptions`/`--no-include-audio-descriptions` and `--include-large-print`/`--no-include-large-print`. Positional publication/category/language identifiers and one-shot `--dry-run` remain CLI-only. Existing `jwdl <pub> [lang]`, `jwdl all`, and `jwdl list` behavior is unchanged.
+Persistent download preferences live in `~/.config/jwkit/jwdl/config.toml`. Use `jwdl config list|get|set|path|edit|reset|diff|check`; matching per-run flags override them. Boolean preferences use paired flags such as `--include-audio-descriptions`/`--no-include-audio-descriptions` and `--include-large-print`/`--no-include-large-print`. Positional publication/category/language identifiers and one-shot `--dry-run` remain CLI-only.
 
 - Default destination is `~/Music/Watchtower Music/<collection>`; override it for every collection with `--base-dir`, or for a single pub with `--dir`. Periodicals default to `~/Documents/JW Periodicals/<publication>` and take the same `--base-dir`/`--dir` overrides.
 - Default language is `E` (English); pass a language code as the second positional argument (e.g. `./jwdl osg S`, `./jwdl periodicals w S`).
@@ -98,7 +98,7 @@ Persistent download preferences live in `~/.config/jwkit/jwdl/config.json`. Use 
 - `jwdl video` defaults to `720p`; if a specific video doesn't have that exact rendition, it picks the closest one at or below your target, or the smallest available if even that's too big. Videos default to `~/Videos/JW Videos/<category name>`.
 - `jwdl video` with no category (or any category that's just a folder of subcategories, like `VideoOnDemand`) lists what's inside instead of trying to download nothing — keep going deeper (`jwdl video VODBible`, etc.) until you reach one that lists actual videos.
 - `jwdl all` (music), `jwdl periodicals all`, and `jwdl video` are entirely separate commands — `all` never implicitly includes periodicals or video, so anything already scripting `jwdl all` keeps its exact original behavior.
-- A config file at `~/.config/jwkit/jwdl/config.json` can add music pub codes jw.org releases later without touching the script (`{"pubs": {"newcode": "Folder Name"}}`), override `base_dir`/`workers`, or set `periodicals_base_dir`/`video_base_dir`. `workers` (parallel downloads per pub, default 4) can also be overridden for a single run with `--workers N`, without touching the config file.
+- A config file at `~/.config/jwkit/jwdl/config.toml` can add future music pub codes under `[pubs]` (for example, `newcode = "Folder Name"`), override `base_dir`/`workers`, or set `periodicals_base_dir`/`video_base_dir`. `workers` (parallel downloads per pub, default 4) can also be overridden for a single run with `--workers N`.
 - Downloads are written to a `.part` file and only renamed into place once the checksum matches, so an interrupted run never leaves a broken file sitting in the library.
 
 ## Notes / Caveats

@@ -117,6 +117,8 @@ jwpl config get end_action
 jwpl config set end_action 2
 ```
 
+The complete management interface is `jwpl config list|get|set|path|edit|reset|diff|check`.
+
 Precedence is built-in defaults, global config, directory config, then CLI.
 Every setting has a matching `create` flag:
 

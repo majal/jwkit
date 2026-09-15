@@ -36,32 +36,11 @@ import _jwkit_common
 
 # Paths
 CONFIG_DIR = Path.home() / ".config" / "jwkit" / "slverse"
-# Checked oldest-first: pre-rename (jwsl, in maj-scripts) and the brief
-# ~/.config/slverse waypoint from before jwkit tools shared one config
-# namespace under ~/.config/jwkit/.
-_LEGACY_CONFIG_DIRS = [
-    Path.home() / ".config" / "maj-scripts" / "jwsl",
-    Path.home() / ".config" / "slverse",
-]
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 STATE_FILE = CONFIG_DIR / "state.json"
 INDEX_DIR = CONFIG_DIR / "index"  # one JSON file per synced language, kept out of state.json
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "slverse"
 JWLANGS_FILE = Path(__file__).resolve().parent / "jwlangs.json"
-
-def migrate_legacy_config_dir():
-    """One-time move from wherever this tool's config used to live (jwsl in
-    maj-scripts, or the brief standalone ~/.config/slverse) to its current
-    home, ~/.config/jwkit/slverse. Keeps an existing sync index/cache-size
-    config from silently resetting across the rename/moves."""
-    if CONFIG_DIR.exists():
-        return
-    for legacy_dir in _LEGACY_CONFIG_DIRS:
-        if legacy_dir.exists():
-            CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(legacy_dir), str(CONFIG_DIR))
-            print(f"Moved your existing settings from {legacy_dir} to {CONFIG_DIR}.")
-            return
 
 # Resolved once at startup by main() from download_max_attempts/download_retry_backoff config.
 MAX_ATTEMPTS = 3
@@ -129,7 +108,7 @@ DEFAULT_CONFIG = {
     "video_crf": "auto",  # codec-specific balanced quality: h264=20, hevc=23, av1=30
     "video_preset": "slow",
     "interpolate": "false",  # independent on/off preference; --interpolate/--no-interpolate override it for one run
-    "interpolation_engine": "rife",  # minterpolate, rife, framerate; legacy "none" remains accepted as an off alias
+    "interpolation_engine": "rife",  # minterpolate, rife, or framerate; enable separately with interpolate
     "interpolation_target_fps": "60",  # flat target frame rate for all three interpolation engines - with rife, ffrife's interpolate() computes the exact frame count to hit this at the source's original duration (no speed change, any ratio), not just a source-fps multiple
     "rife_scene_detection": "false",  # verse clips are continuous; standalone ffrife defaults this on for arbitrary videos
     "smooth_slow_motion": "true",  # synthesize extra frames in --slow sections even when whole-clip interpolation is off
@@ -142,8 +121,8 @@ DEFAULT_CONFIG = {
     "auto_sync_interval_hours": "24",
     "auto_sync_background": "true",  # run the once-a-day refresh as a detached subprocess so it never blocks the current command; false restores the old blocking-in-foreground behavior
     "preview_source": "segment",  # extract's preview mode (no --write) and find --play: 'segment' fetches and caches just the verse window being previewed - fast, no repeat bandwidth for the same window, but never pulls a whole chapter just to preview a few seconds of it; 'cache' instead downloads the WHOLE chapter once and reuses that, worth it only if you'll preview several different verses from the same chapter; 'remote' always streams straight from the URL and never touches disk
-    "preview_window_size": "65%",  # multi-language preview windows (slverse find --play, or 'ffv all <ref> -p'), as an mpv --autofit percentage of screen size - ignored for a single-language preview, which still autoplays fullscreen
-    "preview_max_parallel": "4",  # concurrent segment downloads for find --play / ffv all -p; each completed language window opens while the remaining downloads continue
+    "preview_window_size": "65%",  # multi-language preview windows (slverse find --play), as an mpv --autofit percentage of screen size - ignored for a single-language preview, which still autoplays fullscreen
+    "preview_max_parallel": "4",  # concurrent segment downloads for find --play; each completed language window opens while the remaining downloads continue
     "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
     "font_family": "noto-sans-display",  # noto-sans-display, inter, google-sans-flex - see FONT_FAMILIES
     "api_language": "E",  # Priority-ordered language codes for book names (e.g. "VT,E" for Vietnamese then English)
@@ -185,7 +164,7 @@ CONFIG_CHOICES = {
     "cache_policy": ("keep_all", "lru", "delete_after_use"),
     "hardware_encoder": ("cpu", "videotoolbox", "nvenc", "qsv"),
     "video_codec": ("h264", "hevc", "av1"),
-    "interpolation_engine": ("none", "minterpolate", "rife", "framerate"),
+    "interpolation_engine": ("minterpolate", "rife", "framerate"),
     "delogo_engine": ("blur", "auto", "inpaint"),
     "delogo_inpaint_fallback": ("blur", "error"),
     "font_family": ("noto-sans-display", "inter", "google-sans-flex"),
@@ -235,7 +214,7 @@ CONFIG_HELP = {
     "video_crf": "Encode quality (lower = higher quality/larger file)",
     "video_preset": "ffmpeg encoder preset (e.g. slow, medium, fast)",
     "interpolate": "Whether saved output is interpolated by default (true/false)",
-    "interpolation_engine": "rife, minterpolate, or framerate; legacy none disables interpolation",
+    "interpolation_engine": "rife, minterpolate, or framerate; use interpolate to enable or disable it",
     "interpolation_target_fps": "Flat target frame rate for interpolation (default 60)",
     "rife_scene_detection": "Detect hard cuts before RIFE (off by default for continuous verse clips)",
     "smooth_slow_motion": "Synthesize extra frames in --slow sections even when whole-clip interpolation is off",
@@ -249,7 +228,7 @@ CONFIG_HELP = {
     "auto_sync_background": "Run the automatic refresh as a detached background process instead of blocking",
     "preview_source": "segment (default, cache just the verse window), cache (download the whole chapter once, reuse), or remote (always stream) - for preview (extract without --write) and find --play",
     "preview_window_size": "mpv --autofit percentage for 'find --play' multi-language preview windows",
-    "preview_max_parallel": "Concurrent segment downloads for find --play / ffv all -p (default 4)",
+    "preview_max_parallel": "Concurrent segment downloads for find --play (default 4)",
     "font_path": "Manual font file override (skips font_family)",
     "font_family": "noto-sans-display, inter, or google-sans-flex",
     "font_weight_main": "Google Fonts weight for the drawn verse-reference label",
@@ -284,7 +263,6 @@ def load_config():
     config = DEFAULT_CONFIG.copy()
     if not CONFIG_FILE.exists():
         return config
-    file_keys = set()
     try:
         with open(CONFIG_FILE, "r") as f:
             for line in f:
@@ -294,34 +272,21 @@ def load_config():
                 if "=" in line:
                     k, v = line.split("=", 1)
                     k = k.strip()
-                    v = v.strip().strip("'").strip('"')
+                    v = v.strip()
+                    if v.startswith('"'):
+                        v = json.loads(v)
+                    elif v.startswith("'") and v.endswith("'"):
+                        v = v[1:-1]
                     config[k] = v
-                    file_keys.add(k)
     except Exception as e:
         print(f"Warning: could not parse config: {e}")
-    if CONFIG_FILE.exists() and "interpolate" not in file_keys:
-        # The old engine key also acted as the on/off switch. Preserve that
-        # behavior for existing installations; new users get false+rife.
-        config["interpolate"] = "false" if config.get("interpolation_engine") == "none" else "true"
-        save_config(config)
-        print(f"Migrated interpolation preference to interpolate = {config['interpolate']} ({CONFIG_FILE})")
-    if "cache_max_gb" in file_keys:
-        # One-time migration: cache_max_gb's old semantics were binary GiB
-        # (see enforce_cache_budget's old `max_gb * 1024**3`), not decimal -
-        # 'Gi' here keeps the migrated value byte-for-byte equivalent to the
-        # old cap rather than silently shrinking it by ~7%.
-        old_value = config.pop("cache_max_gb")
-        if "cache_max_size" not in file_keys:
-            config["cache_max_size"] = f"{old_value}Gi"
-        save_config(config)
-        print(f"Migrated cache_max_gb to cache_max_size = {config['cache_max_size']} ({CONFIG_FILE})")
     return config
 
 def save_config(config):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         for k, v in config.items():
-            f.write(f'{k} = "{v}"\n')
+            f.write(f"{k} = {json.dumps(str(v), ensure_ascii=False)}\n")
 
 def get_state():
     """Small, fast-loading state: sync timestamps, cache-access bookkeeping,
@@ -335,16 +300,6 @@ def get_state():
             state = json.load(f)
     except Exception:
         return {}
-
-    legacy_langs = [k for k in state if not k.startswith("_")]
-    if legacy_langs:
-        print(f"One-time migration: moving {len(legacy_langs)} language index(es) out of state.json into {INDEX_DIR}/")
-        for lang in legacy_langs:
-            entries = state.pop(lang)
-            existing = load_index(lang)
-            existing.update(entries)
-            save_index(lang, existing)
-        save_state(state)
 
     return state
 
@@ -1141,15 +1096,13 @@ def describe_cut_edit(args):
     clip_window_val = getattr(args, "clip_window", None)
     trim_start_val = getattr(args, "trim_start", None)
     trim_end_val = getattr(args, "trim_end", None)
-    offset_start_val = abs(trim_start_val) if trim_start_val is not None else getattr(args, "offset_start", None)
-    offset_end_val = -abs(trim_end_val) if trim_end_val is not None else getattr(args, "offset_end", None)
     if clip_window_val:
         w_start, w_end = clip_window_val
         bits.append(f"cut {w_start:g}-{w_end:g}s")
-    elif offset_start_val or offset_end_val:
+    elif trim_start_val or trim_end_val:
         parts = []
-        if offset_start_val: parts.append(f"s{offset_start_val:+g}s")
-        if offset_end_val: parts.append(f"e{offset_end_val:+g}s")
+        if trim_start_val: parts.append(f"start {trim_start_val:g}s")
+        if trim_end_val: parts.append(f"end {trim_end_val:g}s")
         bits.append("cut " + " ".join(parts))
     if getattr(args, "keep_end_transition", False) or getattr(args, "trim_mid_transitions", False):
         bits.append("transition edit")
@@ -1167,15 +1120,14 @@ def default_extract_filename(book_name, chapter, verses, lang, args, config):
     """Build a glanceable default name without altering explicit -o paths."""
     suffixes = []
     if (getattr(args, "clip_window", None) or getattr(args, "trim_start", None) is not None
-            or getattr(args, "trim_end", None) is not None or getattr(args, "offset_start", None) is not None
-            or getattr(args, "offset_end", None) is not None or getattr(args, "trim_mid_transitions", False)):
+            or getattr(args, "trim_end", None) is not None or getattr(args, "trim_mid_transitions", False)):
         suffixes.append("cut")
     if getattr(args, "slow", None):
         suffixes.append("slow")
     elif getattr(args, "fast", None):
         suffixes.append("fast")
-    engine = str(config.get("interpolation_engine", "none")).strip().lower()
-    if engine != "none":
+    engine = effective_interpolation_engine(config)
+    if engine:
         suffixes.append(engine)
     edit_suffix = "".join(f"_{value}" for value in suffixes)
     return f"{book_name.replace(' ', '_')}_{chapter}_{verses}_{lang}{edit_suffix}.mp4"
@@ -1695,7 +1647,7 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     doesn't know about kept_segments."""
     detected_box = detect_caption_box(source, start_time, end_time, config) if wants_overlay(lang, config) else None
     overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
-    engine = config.get("interpolation_engine", "none")
+    engine = effective_interpolation_engine(config)
     duration = end_time - start_time
     segments = kept_segments or [(0.0, duration)]
 
@@ -1703,7 +1655,7 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     box = delogo_box_from_filter(overlay)
     occlusion_range = detect_delogo_occlusion(source, box, start_time, end_time) if box and delogo_engine in ("auto", "inpaint") else None
     wants_inpaint = box and (delogo_engine == "inpaint" or (delogo_engine == "auto" and occlusion_range))
-    if wants_inpaint and len(segments) == 1 and engine == "none":
+    if wants_inpaint and len(segments) == 1 and engine is None:
         ffinpaint = load_ffinpaint()
         # Only the detected occlusion sub-range (padded - see
         # detect_delogo_occlusion) goes to the AI backend, not the whole
@@ -2031,9 +1983,9 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
     it stays aligned with both ffmpeg- and RIFE-retimed video."""
     detected_box = detect_caption_box(source, start_time, end_time, config)
     overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, detected_caption_box=detected_box)
-    engine = config.get("interpolation_engine", "none")
+    engine = effective_interpolation_engine(config)
     smooth_slow = str(config.get("smooth_slow_motion", "true")).lower() in ("true", "1", "yes", "on")
-    slow_engine = config.get("_interpolation_engine_preference", engine) if smooth_slow else engine
+    slow_engine = config.get("interpolation_engine", DEFAULT_CONFIG["interpolation_engine"]) if smooth_slow else engine
     duration = end_time - start_time
 
     ffrife = None
@@ -2244,10 +2196,6 @@ def resolve_book(book_name, lang="E", state=None, config=None):
     return None, None
 
 
-def resolve_book_number(book_name, lang="E", state=None, config=None):
-    """Backward-compatible number-only wrapper."""
-    return resolve_book(book_name, lang, state, config)[0]
-
 def verse_markers(file):
     """GETPUBMEDIALINKS wraps the per-verse marker list in a dict alongside
     book/chapter metadata: file['markers'] = {..., 'markers': [...]}."""
@@ -2361,31 +2309,38 @@ def cmd_setup(args, config):
     print(COLOR.bold("\nAll set.") + " Run 'slverse config' anytime to see or change these settings.")
     print("If you use slverse on more than one computer, run 'slverse setup' on each one — settings are per-machine.")
 
+def check_config(config):
+    issues = []
+    unknown = sorted(set(config) - set(DEFAULT_CONFIG))
+    issues.extend(f"unknown key: {key}" for key in unknown)
+    try:
+        _jwkit_common.parse_size(config["cache_max_size"])
+    except (TypeError, ValueError) as exc:
+        issues.append(f"cache_max_size: {exc}")
+    try:
+        parse_mpv_options(config.get("mpv_options", ""))
+    except ValueError as exc:
+        issues.append(f"mpv_options: {exc}")
+    for key in ("ffmpeg_binary", "ffprobe_binary", "ffplay_binary"):
+        value = str(config.get(key, "")).strip()
+        if value and not (Path(value).is_file() or shutil.which(value)):
+            issues.append(f"{key}: executable not found: {value}")
+    for key in ("sign_lang_ref_language", "bible_book_path_overrides"):
+        value = str(config.get(key, "")).strip()
+        if value and any("=" not in item for item in value.split(",") if item.strip()):
+            issues.append(f"{key}: expected comma-separated KEY=VALUE entries")
+    return issues
+
+
 def cmd_config(args, config):
-    if args.key and args.key not in DEFAULT_CONFIG:
-        print(COLOR.red(f"Error: unknown config key {args.key!r}"))
-        return
-    if args.key and args.value:
-        error = validate_config_value(args.key, args.value)
-        if error:
-            print(COLOR.red(f"Error: {error}"))
-            return
-        config[args.key] = args.value
-        save_config(config)
-        print(COLOR.green(f"Set {args.key} = {args.value}"))
-    elif args.key:
-        print(f"{args.key} = {config.get(args.key)}")
-        help_text = CONFIG_HELP.get(args.key)
-        if help_text:
-            print(f"  {help_text}")
-    else:
-        # CONFIG_HELP covers every DEFAULT_CONFIG key, so this doubles as
-        # the full documented config surface - see also docs/slverse.md.
-        width = max((len(k) for k in config), default=0)
-        for k, v in config.items():
-            help_text = CONFIG_HELP.get(k, "")
-            suffix = f"  # {help_text}" if help_text else ""
-            print(f"{k:<{width}} = {v}{suffix}")
+    return _jwkit_common.run_config_command(
+        tool="slverse", args=args, config=config, defaults=DEFAULT_CONFIG,
+        config_file=CONFIG_FILE, save_config=save_config,
+        descriptions=CONFIG_HELP,
+        parse_value=lambda _key, raw: str(raw),
+        validate=validate_config_value,
+        check_extra=check_config,
+    )
 
 def find_or_generate_bench_sample(config, tmp_dir):
     """A short clip for 'slverse benchmark' to test encoders against.
@@ -2588,20 +2543,10 @@ def maybe_auto_sync(args, config):
     sync_languages(langs, config, state, quiet=True)
     save_state(state)
 
-def clamp_offset_window(natural_start, natural_end, offset_start, offset_end, lang="", min_duration=0.1):
-    """Apply --offset-start/--offset-end to (natural_start, natural_end) and
-    clamp the result to the verse's own natural window - a 12s verse only
-    has 12s to offset within (e.g. offset_start=3.567, offset_end=-1.997
-    asks for the 3.567s-10.003s slice, entirely inside those 12s: passes
-    through untouched). An offset that would push start before the verse's
-    own start, past its own end, or end before its own start (individually or combined)
-    is a real overshoot - JW's markers don't tell us anything reliable
-    about what comes before/after this verse's own window, so rather than
-    silently referencing whatever happens to be there, this clamps back to
-    the natural window's own edges (or the whole natural window, if the
-    combination collapsed to nothing) and prints what happened."""
-    start = natural_start + (offset_start or 0.0)
-    end = natural_end + (offset_end or 0.0)
+def clamp_trim_window(natural_start, natural_end, trim_start, trim_end, lang="", min_duration=0.1):
+    """Apply non-negative start/end trims within a verse's natural window."""
+    start = natural_start + (trim_start or 0.0)
+    end = natural_end - (trim_end or 0.0)
     natural_duration = natural_end - natural_start
 
     clamped = False
@@ -2623,10 +2568,10 @@ def clamp_offset_window(natural_start, natural_end, offset_start, offset_end, la
 
     if clamped:
         prefix = f"[{lang}] " if lang else ""
-        print(f"{prefix}--offset-start/--offset-end overshot this verse's own {natural_duration:.3f}s window - clamped to {start - natural_start:.3f}s..{end - natural_start:.3f}s (relative to its natural start).")
+        print(f"{prefix}--trim-start/--trim-end exceeded this verse's {natural_duration:.3f}s window; using {start - natural_start:.3f}s..{end - natural_start:.3f}s.")
     return start, end
 
-def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_transition=False, trim_mid_transitions=None, offset_start=0.0, offset_end=0.0, clip_window=None):
+def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_transition=False, trim_mid_transitions=None, trim_start=0.0, trim_end=0.0, clip_window=None):
     """Return (start, end, url, checksum, valid_verses, source_labels,
     kept_segments) for a verse range, using the saved per-language index
     when we have it and falling back to a live API call (which also
@@ -2643,14 +2588,8 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
     None, overrides that config key's default for this call instead of
     reading it.
 
-    offset_start/offset_end (from --offset-start/--offset-end, seconds,
-    either sign) are the old ffv -s/-e - added straight onto the verse
-    range's own computed start/end (after trim_end_transition, before
-    kept_segments), a manual nudge on top of the metadata-derived window
-    rather than a raw -ss/-to into the whole file: +5.302 on offset_start
-    plays from 5.302s into the verse through its natural end; a negative
-    offset_end ends that many seconds early. See clamp_offset_window for
-    what happens if they overshoot the verse's own natural boundaries."""
+    trim_start/trim_end remove non-negative seconds from the computed verse
+    range after the configured transition trim and before kept_segments."""
     key = f"{book_num}_{chapter}"
     index = load_index(lang)
     entry = index.get(key)
@@ -2679,19 +2618,20 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
 
     start = chapters_meta[valid_verses[0]]["start"]
     end = chapters_meta[valid_verses[-1]]["end"]
-    trim_end = str(config.get("trim_end_transition", DEFAULT_CONFIG["trim_end_transition"])).strip().lower() != "false"
+    should_trim_transition = str(config.get("trim_end_transition", DEFAULT_CONFIG["trim_end_transition"])).strip().lower() != "false"
     if keep_end_transition:
-        trim_end = False
-    if trim_end:
+        should_trim_transition = False
+    if should_trim_transition:
         end_transition = chapters_meta[valid_verses[-1]].get("end_transition", 0)
         if end_transition > 0 and end - end_transition > start:
             end -= end_transition
 
     if clip_window:
-        offset_start, clip_end = clip_window
-        offset_end = clip_end - (end - start)
-    if offset_start or offset_end:
-        start, end = clamp_offset_window(start, end, offset_start, offset_end, lang=lang)
+        window_start, window_end = clip_window
+        trim_start = window_start
+        trim_end = (end - start) - window_end
+    if trim_start or trim_end:
+        start, end = clamp_trim_window(start, end, trim_start, trim_end, lang=lang)
 
     trim_mid = str(config.get("trim_mid_transitions", DEFAULT_CONFIG["trim_mid_transitions"])).strip().lower() == "true"
     if trim_mid_transitions is not None:
@@ -2756,6 +2696,16 @@ def parse_clip_window(value):
         raise argparse.ArgumentTypeError("START and END must be non-negative")
     return start, end
 
+
+def parse_nonnegative_seconds(value):
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a number of seconds")
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return seconds
+
 # DEFAULT_CONFIG keys that already have their own differently-named/shaped
 # per-run flag (an inverse boolean, a shorter alias, a dedicated type) -
 # excluded from the generic --<key> override loop below so there's exactly
@@ -2809,36 +2759,31 @@ def apply_interpolation_overrides(args, config):
     """Resolve the independent enable toggle and engine selector once.
 
     Mutates only this invocation's in-memory config; saved config is never
-    changed by --interpolate/--no-interpolate. Legacy engine=none remains an
-    off alias. Returning the enabled state makes the contract directly
-    testable instead of inferring it from which encoding branch ran.
+    changed by --interpolate/--no-interpolate. Returning the enabled state
+    makes the contract directly testable.
     """
     selected = getattr(args, "interpolation_engine", None)
     if selected is not None:
         config["interpolation_engine"] = selected
-    config["_interpolation_engine_preference"] = config.get("interpolation_engine", "none")
     cli_enabled = getattr(args, "interpolate", None)
     enabled = str(config.get("interpolate", "false")).strip().lower() in ("true", "1", "yes", "on") if cli_enabled is None else cli_enabled
-    if config.get("interpolation_engine") == "none":
-        enabled = False
     config["interpolate"] = "true" if enabled else "false"
-    if not enabled:
-        config["interpolation_engine"] = "none"
     return enabled
+
+
+def effective_interpolation_engine(config):
+    enabled = str(config.get("interpolate", DEFAULT_CONFIG["interpolate"])).strip().lower() in ("true", "1", "yes", "on")
+    return str(config.get("interpolation_engine", DEFAULT_CONFIG["interpolation_engine"])).strip().lower() if enabled else None
 
 def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state, require_full_range=False):
     trim_start = getattr(args, "trim_start", None)
     trim_end = getattr(args, "trim_end", None)
-    # The documented form is unsigned, but abs() keeps old `-e -3` muscle
-    # memory working too: both spellings mean "trim three seconds".
-    offset_start = abs(trim_start) if trim_start is not None else getattr(args, "offset_start", None)
-    offset_end = -abs(trim_end) if trim_end is not None else getattr(args, "offset_end", None)
     window = resolve_verse_window(
         lang, book_num, chapter, verses, config,
         keep_end_transition=getattr(args, "keep_end_transition", False),
         trim_mid_transitions=True if getattr(args, "trim_mid_transitions", False) else None,
-        offset_start=offset_start or 0.0,
-        offset_end=offset_end or 0.0,
+        trim_start=trim_start or 0.0,
+        trim_end=trim_end or 0.0,
         clip_window=getattr(args, "clip_window", None),
     )
     if not window:
@@ -3127,7 +3072,7 @@ def cmd_find(args, config):
     the same syntax extract's reference string uses."""
     state = get_state()
     jwlangs = load_jwlangs()
-    book_num = resolve_book_number(args.book, config.get("api_language", "E"), state=state, config=config)
+    book_num = resolve_book(args.book, config.get("api_language", "E"), state=state, config=config)[0]
     save_state(state)  # persist any newly-cached book-name metadata even if nothing matches below
     if not book_num:
         print(f"Could not resolve book: {args.book}")
@@ -3325,8 +3270,8 @@ def bulk_one_lang(lang, books, args, config):
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[{lang}] processing {len(targets)} chapter(s) into {out_dir}...")
 
-    engine = config.get("interpolation_engine", "none")
-    bulk_config = dict(config, interpolation_engine=engine)
+    engine = effective_interpolation_engine(config)
+    bulk_config = dict(config)
 
     for book_num, chapter, entry in targets:
         out_file = out_dir / f"{lang}_{book_num:02d}_{chapter:02d}.mp4"
@@ -3341,7 +3286,7 @@ def bulk_one_lang(lang, books, args, config):
             if not download_file(entry["url"], tmp_download, expected_checksum=entry.get("checksum")):
                 print(f"[{lang}] {book_num}_{chapter}: download failed, skipping.")
                 continue
-            if engine == "none":
+            if engine is None:
                 shutil.copy(tmp_download, out_file)
             elif engine == "rife":
                 ffrife = load_ffrife()
@@ -3394,7 +3339,6 @@ def cmd_inspect(args):
 
 # --- Main ---
 def main():
-    migrate_legacy_config_dir()
     parser = argparse.ArgumentParser(
         description="slverse - JW Sign Language Video Tool",
         epilog="Nearly all behavior is configurable - see 'slverse config list' or docs/slverse.md.",
@@ -3408,9 +3352,7 @@ def main():
     p_setup.add_argument("--non-interactive", action="store_true", help="Only install dependencies, skip the Q&A")
 
     p_config = subparsers.add_parser("config", help="Manage configuration")
-    p_config.add_argument("action", choices=["set", "get", "list"], nargs="?", default="list")
-    p_config.add_argument("key", nargs="?")
-    p_config.add_argument("value", nargs="?")
+    _jwkit_common.add_config_arguments(p_config)
 
     p_langs = subparsers.add_parser("langs", help="Show configured languages and when each was last synced")
     p_langs.add_argument("--discover", action="store_true", help="Also list every sign language JW.org publishes NWT video in")
@@ -3431,7 +3373,7 @@ def main():
     source_mode.add_argument("--onthefly", action="store_true", help="Stream-extract from the source URL; never store anything on disk")
     source_mode.add_argument("-c", "--cache", action="store_true", help="Download and keep the whole chapter in the local cache")
     source_mode.add_argument("--segment", action="store_true", help="Download and cache just this verse window")
-    p_extract.add_argument("-I", "--interpolation-engine", choices=CONFIG_CHOICES["interpolation_engine"], help="Interpolation engine for this run; legacy 'none' disables interpolation")
+    p_extract.add_argument("-I", "--interpolation-engine", choices=CONFIG_CHOICES["interpolation_engine"], help="Interpolation engine for this run; use --interpolate/--no-interpolate to enable or disable it")
     sync_toggle = p_extract.add_mutually_exclusive_group()
     sync_toggle.add_argument("--auto-sync", dest="auto_sync_override", action="store_true", help="Enable automatic metadata refresh for this run")
     sync_toggle.add_argument("-n", "--no-auto-sync", dest="no_auto_sync", action="store_true", help="Skip automatic metadata refresh for this run")
@@ -3441,10 +3383,8 @@ def main():
     mid_transition = p_extract.add_mutually_exclusive_group()
     mid_transition.add_argument("--trim-mid-transitions", dest="trim_mid_transitions", action="store_true", default=None)
     mid_transition.add_argument("--keep-mid-transitions", dest="trim_mid_transitions", action="store_false")
-    p_extract.add_argument("-s", "--trim-start", dest="trim_start", type=float, metavar="SECONDS", help="Trim this many seconds from the start (positive number)")
-    p_extract.add_argument("-e", "--trim-end", dest="trim_end", type=float, metavar="SECONDS", help="Trim this many seconds from the end (positive number)")
-    p_extract.add_argument("--offset-start", type=float, metavar="SECONDS", help="Signed start offset (legacy/advanced form; prefer --trim-start)")
-    p_extract.add_argument("--offset-end", type=float, metavar="SECONDS", help="Signed end offset (legacy/advanced form; prefer --trim-end)")
+    p_extract.add_argument("-s", "--trim-start", dest="trim_start", type=parse_nonnegative_seconds, metavar="SECONDS", help="Trim this many seconds from the start")
+    p_extract.add_argument("-e", "--trim-end", dest="trim_end", type=parse_nonnegative_seconds, metavar="SECONDS", help="Trim this many seconds from the end")
     p_extract.add_argument("--window", dest="clip_window", type=parse_clip_window, metavar="START:END", help="Keep one relative slice of the natural verse window, e.g. --window 3.567:10.003")
     p_extract_retime = p_extract.add_mutually_exclusive_group()
     p_extract_retime.add_argument("--slow", nargs="+", metavar="TIME", help="Split the verse at TIME(s) (seconds or HH:MM:SS, relative to the verse's own start) into alternating normal/slow sections (2nd, 4th, ... retimed). Needs --write. Video-only output (matches the standalone ffslow tool).")
@@ -3488,7 +3428,7 @@ def main():
     p_bulk.add_argument("lang", help="Sign language code, comma list, or 'all' for your configured list")
     p_bulk.add_argument("--books", default="all", help="Book number range, e.g. '40-66' or '66' (default: all 66)")
     p_bulk.add_argument("-i", "--interpolate", action=argparse.BooleanOptionalAction, default=None, help="Force interpolation on or off for this run")
-    p_bulk.add_argument("-I", "--interpolation-engine", choices=CONFIG_CHOICES["interpolation_engine"], help="Interpolation engine for this run; legacy 'none' disables interpolation")
+    p_bulk.add_argument("-I", "--interpolation-engine", choices=CONFIG_CHOICES["interpolation_engine"], help="Interpolation engine for this run; use --interpolate/--no-interpolate to enable or disable it")
     p_bulk.add_argument("--out", "--output-dir", dest="out", help="Output directory (default: <cache_dir>/bulk/<lang>)")
     p_bulk.add_argument("--overwrite", action="store_true", help="Reprocess chapters even if the output file already exists")
     bulk_sync = p_bulk.add_mutually_exclusive_group()
@@ -3524,14 +3464,9 @@ def main():
     if args.command == "setup":
         cmd_setup(args, config)
     elif args.command == "config":
-        if args.action == "set" and args.key and args.value:
-            cmd_config(args, config)
-        elif args.action == "get" and args.key:
-            cmd_config(args, config)
-        elif args.action == "list":
-            cmd_config(argparse.Namespace(key=None, value=None), config)
-        else:
-            print("Usage: slverse config set <key> <value>, or 'slverse config get <key>'")
+        status = cmd_config(args, config)
+        if status:
+            raise SystemExit(status)
     elif args.command == "langs":
         cmd_langs(args, config)
     elif args.command == "sync":

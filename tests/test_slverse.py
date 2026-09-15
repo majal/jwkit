@@ -58,36 +58,30 @@ class SlverseTimeParsingTest(unittest.TestCase):
         self.assertAlmostEqual(times[1]["end_transition"], 0.0)
 
 
-class SlverseClampOffsetWindowTest(unittest.TestCase):
+class SlverseClampTrimWindowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.slverse = load_script_module("slverse")
 
-    def test_in_bounds_offsets_pass_through_unclamped(self) -> None:
+    def test_in_bounds_trims_pass_through_unclamped(self) -> None:
         with mock.patch("builtins.print") as p:
-            result = self.slverse.clamp_offset_window(100.0, 112.0, 3.567, -1.997)
+            result = self.slverse.clamp_trim_window(100.0, 112.0, 3.567, 1.997)
         self.assertAlmostEqual(result[0], 103.567)
         self.assertAlmostEqual(result[1], 110.003)
         p.assert_not_called()
 
     def test_start_overshoot_past_natural_end_clamps(self) -> None:
         with mock.patch("builtins.print") as p:
-            result = self.slverse.clamp_offset_window(100.0, 112.0, 20.0, 0.0)
+            result = self.slverse.clamp_trim_window(100.0, 112.0, 20.0, 0.0)
         self.assertEqual(result, (100.0, 112.0))
         p.assert_called_once()
 
     def test_end_undershoot_before_natural_start_clamps(self) -> None:
-        result = self.slverse.clamp_offset_window(100.0, 112.0, 0.0, -20.0)
+        result = self.slverse.clamp_trim_window(100.0, 112.0, 0.0, 20.0)
         self.assertEqual(result, (100.0, 112.0))
 
-    def test_start_clamps_to_natural_start_not_zero(self) -> None:
-        # natural_start=2.0 sits well inside a longer chapter file; an
-        # overshoot must not splice in footage before the verse's own start.
-        result = self.slverse.clamp_offset_window(2.0, 14.0, -10.0, 0.0)
-        self.assertEqual(result[0], 2.0)
-
     def test_combined_collapse_falls_back_to_natural_window(self) -> None:
-        result = self.slverse.clamp_offset_window(100.0, 112.0, 8.0, -8.0)
+        result = self.slverse.clamp_trim_window(100.0, 112.0, 8.0, 8.0)
         self.assertEqual(result, (100.0, 112.0))
 
 
@@ -137,43 +131,31 @@ class SlverseResolveVerseWindowTest(unittest.TestCase):
         )
         self.assertAlmostEqual(end, 149.415 + 33.800)
 
-    def test_offset_start_nudges_the_computed_start(self) -> None:
+    def test_trim_start_nudges_the_computed_start(self) -> None:
         self._stub_index([
             {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:11"},
         ])
         start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
-            "ASL", 19, 16, [11], self.config(), offset_start=5.302,
+            "ASL", 19, 16, [11], self.config(), trim_start=5.302,
         )
         self.assertAlmostEqual(start, 149.415 + 5.302)
         self.assertAlmostEqual(end, 149.415 + 33.800)
 
-    def test_offset_end_nudges_the_computed_end_negative_to_end_early(self) -> None:
+    def test_trim_end_nudges_the_computed_end(self) -> None:
         self._stub_index([
             {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:11"},
         ])
         start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
-            "ASL", 19, 16, [11], self.config(), offset_end=-3.0,
+            "ASL", 19, 16, [11], self.config(), trim_end=3.0,
         )
         self.assertAlmostEqual(end, 149.415 + 33.800 - 3.0)
 
-    def test_offset_start_clamps_to_verse_own_start(self) -> None:
-        # verse 1 starts 2.000s into the chapter file; an overshooting
-        # offset_start must clamp there, not to the file's absolute 0.0 -
-        # otherwise it would splice in whatever precedes this verse.
-        self._stub_index([
-            {"verseNumber": 1, "startTime": "00:00:02.000", "duration": "00:00:05.000", "endTransitionDuration": "00:00:00.000", "label": "Psalm 16:1"},
-        ])
-        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
-            "ASL", 19, 16, [1], self.config(), offset_start=-10.0,
-        )
-        self.assertEqual(start, 2.0)
-
-    def test_offsets_stack_with_end_transition_trim(self) -> None:
+    def test_trims_stack_with_end_transition_trim(self) -> None:
         self._stub_index([
             {"verseNumber": 11, "startTime": "00:02:29.415", "duration": "00:00:33.800", "endTransitionDuration": "00:00:06.940", "label": "Psalm 16:11"},
         ])
         start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
-            "ASL", 19, 16, [11], self.config(), offset_end=-1.0,
+            "ASL", 19, 16, [11], self.config(), trim_end=1.0,
         )
         self.assertAlmostEqual(end, 149.415 + 33.800 - 6.940 - 1.0)
 
@@ -262,14 +244,14 @@ class SlverseBookNameTest(unittest.TestCase):
 
     def test_vietnamese_lookup_ignores_case_and_tone_marks(self) -> None:
         state = {"_book_metadata": {"VT": self.metadata()}}
-        self.assertEqual(self.slverse.resolve_book_number("PHUC TRUYEN LUAT LE", "VT", state), 5)
+        self.assertEqual(self.slverse.resolve_book("PHUC TRUYEN LUAT LE", "VT", state=state)[0], 5)
 
     def test_book_language_priority_falls_back(self) -> None:
         state = {"_book_metadata": {
             "VT": self.metadata(),
             "E": self.metadata("Deuteronomy", "Deut."),
         }}
-        self.assertEqual(self.slverse.resolve_book_number("Deuteronomy", "VT,E", state), 5)
+        self.assertEqual(self.slverse.resolve_book("Deuteronomy", "VT,E", state=state)[0], 5)
 
     def test_plural_book_name_and_abbreviation_resolve(self) -> None:
         # Real JW.org study-bible metadata carries 9 name/abbreviation
@@ -288,9 +270,9 @@ class SlverseBookNameTest(unittest.TestCase):
             "officialSingularAbbreviation": "Ps",
             "officialPluralAbbreviation": "Pss",
         }}}}}}
-        self.assertEqual(self.slverse.resolve_book_number("Psalms", "E", state), 19)
-        self.assertEqual(self.slverse.resolve_book_number("Pss", "E", state), 19)
-        self.assertEqual(self.slverse.resolve_book_number("psalm", "E", state), 19)
+        self.assertEqual(self.slverse.resolve_book("Psalms", "E", state=state)[0], 19)
+        self.assertEqual(self.slverse.resolve_book("Pss", "E", state=state)[0], 19)
+        self.assertEqual(self.slverse.resolve_book("psalm", "E", state=state)[0], 19)
 
     def test_every_supported_alias_resolves_to_standard_name(self) -> None:
         book = {
@@ -1569,7 +1551,7 @@ class SlverseExtractVerseTrimMidTest(unittest.TestCase):
 
     def test_no_audio_stream_omits_audio_mapping(self) -> None:
         self.slverse.has_audio_stream = lambda source: False
-        config = {"interpolation_engine": "none"}
+        config = {"interpolate": "false", "interpolation_engine": "rife", "smooth_slow_motion": "false"}
         self.slverse.extract_verse(
             "http://example/vid.mp4", "out.mp4", 0.0, 18.0, "Psalm", 16, "8-9", "ASL", config,
             kept_segments=[(0.0, 8.0), (10.0, 18.0)],
@@ -1580,7 +1562,7 @@ class SlverseExtractVerseTrimMidTest(unittest.TestCase):
 
     def test_audio_stream_present_maps_audio(self) -> None:
         self.slverse.has_audio_stream = lambda source: True
-        config = {"interpolation_engine": "none"}
+        config = {"interpolate": "false", "interpolation_engine": "rife"}
         self.slverse.extract_verse(
             "http://example/vid.mp4", "out.mp4", 0.0, 18.0, "Psalm", 16, "8-9", "ASL", config,
             kept_segments=[(0.0, 8.0), (10.0, 18.0)],
@@ -1718,7 +1700,7 @@ class SlverseExtractVerseInpaintTest(unittest.TestCase):
         self.slverse.detect_delogo_occlusion = lambda source, box, start, end: None
 
     def config(self, **overrides):
-        cfg = {"interpolation_engine": "none", "delogo_engine": "inpaint", "delogo_inpaint_fallback": "blur",
+        cfg = {"interpolate": "false", "interpolation_engine": "rife", "delogo_engine": "inpaint", "delogo_inpaint_fallback": "blur",
                "delogo_width_pad": "10", "delogo_height_pad": "10"}
         cfg.update(overrides)
         return cfg
@@ -1872,7 +1854,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
     def test_fast_mode_uses_single_pass_filter_complex(self) -> None:
         calls = []
         self.slverse.run_ffmpeg = lambda cmd, duration=None: calls.append(cmd)
-        config = {"interpolation_engine": "none"}
+        config = {"interpolate": "false", "interpolation_engine": "rife"}
 
         self.slverse.extract_verse_sections(
             "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
@@ -1889,7 +1871,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
     def test_slow_mode_with_non_rife_engine_uses_single_pass_filter_complex(self) -> None:
         calls = []
         self.slverse.run_ffmpeg = lambda cmd, duration=None: calls.append(cmd)
-        config = {"interpolation_engine": "none"}
+        config = {"interpolate": "false", "interpolation_engine": "rife", "smooth_slow_motion": "false"}
 
         self.slverse.extract_verse_sections(
             "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
@@ -1904,7 +1886,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         calls = []
         self.slverse.run_ffmpeg = lambda cmd, duration=None: calls.append(cmd)
         self.slverse.has_audio_stream = lambda source: True
-        config = {"interpolation_engine": "none"}
+        config = {"interpolate": "false", "interpolation_engine": "rife"}
 
         self.slverse.extract_verse_sections(
             "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
@@ -1933,7 +1915,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         )
         self.slverse.load_ffrife = lambda: fake_ffrife
         self.slverse.run_ffmpeg = lambda cmd, duration=None: piece_ffmpeg_calls.append(cmd)
-        config = {"interpolation_engine": "rife", "default_target_lang": "FSL", "interpolation_target_fps": "60"}
+        config = {"interpolate": "true", "interpolation_engine": "rife", "default_target_lang": "FSL", "interpolation_target_fps": "60"}
 
         self.slverse.extract_verse_sections(
             "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
@@ -1969,7 +1951,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         )
         self.slverse.load_ffrife = lambda: fake_ffrife
         self.slverse.run_ffmpeg = lambda cmd, duration=None: ffmpeg_calls.append(cmd)
-        config = {"interpolation_engine": "none", "_interpolation_engine_preference": "rife", "smooth_slow_motion": "true"}
+        config = {"interpolate": "false", "interpolation_engine": "rife", "smooth_slow_motion": "true"}
 
         self.slverse.extract_verse_sections(
             "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
@@ -2055,7 +2037,7 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         # ffrife.interpolate() now probes the source's own fps itself and
         # computes the exact frame count to hit the flat configured target -
         # extract_verse just passes interpolation_target_fps straight through.
-        config = {"interpolation_engine": "rife", "default_target_lang": "FSL", "interpolation_target_fps": "50"}
+        config = {"interpolate": "true", "interpolation_engine": "rife", "default_target_lang": "FSL", "interpolation_target_fps": "50"}
 
         self.slverse.extract_verse("http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config, remote=True)
 
@@ -2076,7 +2058,7 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         self.slverse.ffrife_config_for = lambda config: {"rife_binary_path": "/fake/rife"}
         self.slverse.build_overlay_filter = lambda *a, **k: None
         self.slverse.encode_rife_frame_sections = lambda *a, **k: calls.append((a, k))
-        config = {"interpolation_engine": "rife", "interpolation_target_fps": "60"}
+        config = {"interpolate": "true", "interpolation_engine": "rife", "interpolation_target_fps": "60"}
 
         self.slverse.extract_verse(
             "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
@@ -2237,45 +2219,27 @@ class SlverseAddToPathProfileTest(unittest.TestCase):
             self.assertIn("PATH", profile.read_text())
 
 
-class SlverseCacheMaxSizeMigrationTest(unittest.TestCase):
+class SlverseRetiredConfigTest(unittest.TestCase):
     def setUp(self) -> None:
         self.slverse = load_script_module("slverse")
 
-    def test_migrates_old_gb_value_to_binary_gi(self) -> None:
-        # cache_max_gb's old semantics were binary GiB (max_gb * 1024**3),
-        # not decimal - the migrated value must stay byte-equivalent.
+    def test_retired_key_is_not_silently_migrated(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg_file = Path(td) / "config.toml"
             cfg_file.write_text('cache_max_gb = "10"\n')
             self.slverse.CONFIG_FILE = cfg_file
             config = self.slverse.load_config()
-        self.assertEqual(config["cache_max_size"], "10Gi")
-        self.assertNotIn("cache_max_gb", config)
-
-    def test_migration_persists_to_disk(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            cfg_file = Path(td) / "config.toml"
-            cfg_file.write_text('cache_max_gb = "5"\n')
-            self.slverse.CONFIG_FILE = cfg_file
-            self.slverse.load_config()
-            self.assertIn('cache_max_size = "5Gi"', cfg_file.read_text())
-            self.assertNotIn("cache_max_gb", cfg_file.read_text())
-
-    def test_explicit_cache_max_size_in_file_wins_over_migration(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            cfg_file = Path(td) / "config.toml"
-            cfg_file.write_text('cache_max_gb = "10"\ncache_max_size = "2G"\n')
-            self.slverse.CONFIG_FILE = cfg_file
-            config = self.slverse.load_config()
-        self.assertEqual(config["cache_max_size"], "2G")
-
-    def test_no_migration_when_no_legacy_key_present(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            cfg_file = Path(td) / "config.toml"
-            cfg_file.write_text('languages = "ASL,FSL"\n')
-            self.slverse.CONFIG_FILE = cfg_file
-            config = self.slverse.load_config()
         self.assertEqual(config["cache_max_size"], self.slverse.DEFAULT_CONFIG["cache_max_size"])
+        self.assertIn("unknown key: cache_max_gb", self.slverse.check_config(config))
+
+    def test_current_cache_size_loads_without_rewriting(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "config.toml"
+            cfg_file.write_text('cache_max_size = "5Gi"\n')
+            self.slverse.CONFIG_FILE = cfg_file
+            config = self.slverse.load_config()
+            self.assertEqual(config["cache_max_size"], "5Gi")
+            self.assertEqual(cfg_file.read_text(), 'cache_max_size = "5Gi"\n')
 
 
 class SlverseEnforceCacheBudgetSizeUnitsTest(unittest.TestCase):
@@ -2315,7 +2279,7 @@ class SlverseConfigCommandTest(unittest.TestCase):
         self.assertEqual(missing, set())
 
     def test_config_get_prints_value_and_help(self) -> None:
-        args = argparse.Namespace(key="cache_max_size", value=None)
+        args = argparse.Namespace(action="get", key="cache_max_size", value=None)
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.slverse.cmd_config(args, dict(self.slverse.DEFAULT_CONFIG))
         output = out.getvalue()
@@ -2323,7 +2287,7 @@ class SlverseConfigCommandTest(unittest.TestCase):
         self.assertIn("Cache size cap", output)
 
     def test_config_set_updates_and_saves(self) -> None:
-        args = argparse.Namespace(key="cache_max_size", value="10G")
+        args = argparse.Namespace(action="set", key="cache_max_size", value="10G")
         saved = {}
         self.slverse.save_config = lambda config: saved.update(config)
         config = dict(self.slverse.DEFAULT_CONFIG)
@@ -2336,18 +2300,18 @@ class SlverseConfigCommandTest(unittest.TestCase):
         # cache_policy is compared against exact strings elsewhere
         # (config.get("cache_policy") == "lru") - a typo used to be
         # accepted and saved silently, then just never matched anything.
-        args = argparse.Namespace(key="cache_policy", value="lur")
+        args = argparse.Namespace(action="set", key="cache_policy", value="lur")
         saved = {}
         self.slverse.save_config = lambda config: saved.update(config)
         config = dict(self.slverse.DEFAULT_CONFIG)
-        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as out:
             self.slverse.cmd_config(args, config)
         self.assertEqual(config["cache_policy"], "lru")  # unchanged
         self.assertEqual(saved, {})  # never persisted
         self.assertIn("must be one of", out.getvalue())
 
     def test_config_set_accepts_a_closed_set_value_case_insensitively(self) -> None:
-        args = argparse.Namespace(key="delogo_engine", value="INPAINT")
+        args = argparse.Namespace(action="set", key="delogo_engine", value="INPAINT")
         self.slverse.save_config = lambda config: None
         config = dict(self.slverse.DEFAULT_CONFIG)
         with mock.patch("sys.stdout", new_callable=io.StringIO):
@@ -2394,7 +2358,7 @@ class SlverseEditDescriptionTest(unittest.TestCase):
         cls.slverse = load_script_module("slverse")
 
     def args(self, **overrides):
-        base = dict(clip_window=None, offset_start=None, offset_end=None, keep_end_transition=False, trim_mid_transitions=False)
+        base = dict(clip_window=None, trim_start=None, trim_end=None, keep_end_transition=False, trim_mid_transitions=False)
         base.update(overrides)
         return argparse.Namespace(**base)
 
@@ -2408,17 +2372,17 @@ class SlverseEditDescriptionTest(unittest.TestCase):
         self.assertEqual(a, ["cut 3.567-10.003s"])
         self.assertEqual(b, ["cut 2-8s"])
 
-    def test_different_offsets_produce_different_bits(self) -> None:
-        a = self.slverse.describe_cut_edit(self.args(offset_start=5.302))
-        b = self.slverse.describe_cut_edit(self.args(offset_start=-2))
-        c = self.slverse.describe_cut_edit(self.args(offset_end=-3))
+    def test_different_trims_produce_different_bits(self) -> None:
+        a = self.slverse.describe_cut_edit(self.args(trim_start=5.302))
+        b = self.slverse.describe_cut_edit(self.args(trim_start=2))
+        c = self.slverse.describe_cut_edit(self.args(trim_end=3))
         self.assertNotEqual(a, b)
         self.assertNotEqual(a, c)
-        self.assertEqual(a, ["cut s+5.302s"])
-        self.assertEqual(c, ["cut e-3s"])
+        self.assertEqual(a, ["cut start 5.302s"])
+        self.assertEqual(c, ["cut end 3s"])
 
-    def test_window_takes_precedence_over_offsets_if_both_present(self) -> None:
-        bits = self.slverse.describe_cut_edit(self.args(clip_window=(3.0, 9.0), offset_start=99))
+    def test_window_takes_precedence_over_trims_if_both_present(self) -> None:
+        bits = self.slverse.describe_cut_edit(self.args(clip_window=(3.0, 9.0), trim_start=99))
         self.assertEqual(bits, ["cut 3-9s"])
 
     def test_transition_edit_bit_still_present_for_the_editing_metadata_field(self) -> None:
@@ -2436,21 +2400,21 @@ class SlverseEditDescriptionTest(unittest.TestCase):
 
     def test_default_filename_has_no_suffix_for_an_unedited_clip(self) -> None:
         self.assertEqual(
-            self.slverse.default_extract_filename("Revelation", 13, "1-3", "ASL", self.args(), {"interpolation_engine": "none"}),
+            self.slverse.default_extract_filename("Revelation", 13, "1-3", "ASL", self.args(), {"interpolate": "false", "interpolation_engine": "rife"}),
             "Revelation_13_1-3_ASL.mp4",
         )
 
     def test_default_filename_combines_cut_speed_and_interpolation_edits(self) -> None:
         args = self.args(clip_window=(3.0, 9.0), slow=["3", "5"])
         self.assertEqual(
-            self.slverse.default_extract_filename("Revelation", 13, "1-3", "ASL", args, {"interpolation_engine": "rife"}),
+            self.slverse.default_extract_filename("Revelation", 13, "1-3", "ASL", args, {"interpolate": "true", "interpolation_engine": "rife"}),
             "Revelation_13_1-3_ASL_cut_slow_rife.mp4",
         )
 
     def test_default_filename_marks_fast_and_each_interpolation_engine(self) -> None:
         args = self.args(fast=["3", "5"])
         self.assertEqual(
-            self.slverse.default_extract_filename("Psalm", 16, "11", "FSL", args, {"interpolation_engine": "minterpolate"}),
+            self.slverse.default_extract_filename("Psalm", 16, "11", "FSL", args, {"interpolate": "true", "interpolation_engine": "minterpolate"}),
             "Psalm_16_11_FSL_fast_minterpolate.mp4",
         )
 
@@ -2524,8 +2488,8 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
         return captured
 
     def test_short_I_flag_sets_interpolation_engine(self) -> None:
-        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-I", "none"])
-        self.assertEqual(args["interpolation_engine"], "none")
+        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-I", "framerate"])
+        self.assertEqual(args["interpolation_engine"], "framerate")
         self.assertIsNone(args["interpolate"])  # use saved preference
 
     def test_long_interpolation_engine_flag_still_works(self) -> None:
@@ -2546,9 +2510,9 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
         self.assertEqual(args["trim_start"], 2.5)
         self.assertEqual(args["trim_end"], 8.909)
 
-    def test_old_negative_short_end_trim_still_parses(self) -> None:
-        args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-e", "-8.909"])
-        self.assertEqual(args["trim_end"], -8.909)
+    def test_negative_trim_is_rejected(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.parse_extract_args(["asl", "1", "Timothy", "1:11", "-e", "-8.909"])
 
     def test_smooth_slow_motion_has_per_run_boolean_override(self) -> None:
         args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--no-smooth-slow-motion"])
@@ -2568,7 +2532,8 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
             argparse.Namespace(interpolate=None, interpolation_engine=None), config,
         )
         self.assertFalse(enabled)
-        self.assertEqual(config["interpolation_engine"], "none")
+        self.assertEqual(config["interpolation_engine"], "rife")
+        self.assertIsNone(self.slverse.effective_interpolation_engine(config))
 
     def test_cli_interpolate_enables_saved_rife(self) -> None:
         config = {"interpolate": "false", "interpolation_engine": "rife"}
@@ -2578,7 +2543,7 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
         self.assertTrue(enabled)
         self.assertEqual(config["interpolation_engine"], "rife")
 
-    def test_main_passes_none_engine_to_extract_when_saved_toggle_is_false(self) -> None:
+    def test_main_keeps_engine_preference_when_saved_toggle_is_false(self) -> None:
         effective = {}
         config = dict(self.slverse.DEFAULT_CONFIG, interpolate="false", interpolation_engine="rife")
         original_argv = sys.argv
@@ -2589,7 +2554,8 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
              mock.patch.object(self.slverse, "cmd_extract", side_effect=lambda args, cfg: effective.update(cfg)):
             self.slverse.main()
         self.assertEqual(effective["interpolate"], "false")
-        self.assertEqual(effective["interpolation_engine"], "none")
+        self.assertEqual(effective["interpolation_engine"], "rife")
+        self.assertIsNone(self.slverse.effective_interpolation_engine(effective))
 
     def test_segment_flag_is_parsed(self) -> None:
         args = self.parse_extract_args(["asl", "1", "Timothy", "1:11", "--segment"])

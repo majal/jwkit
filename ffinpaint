@@ -26,6 +26,14 @@ DEFAULT_CONFIG = {
     "ffmpeg_binary": "",
     "ffprobe_binary": "",
 }
+CONFIG_HELP = {
+    "backend": "Inpainting backend (currently e2fgvi-hq)",
+    "e2fgvi_root": "Path to the E2FGVI-HQ checkout",
+    "e2fgvi_checkpoint": "Path to the E2FGVI-HQ model checkpoint",
+    "fallback": "Fallback behavior when inpainting is unavailable (blur or error)",
+    "ffmpeg_binary": "Override ffmpeg executable detection",
+    "ffprobe_binary": "Override ffprobe executable detection",
+}
 # Resolved once at startup by main() -> _jwkit_common.resolve_ffmpeg_binary/resolve_ffprobe_binary.
 FFMPEG_BIN = "ffmpeg"
 FFPROBE_BIN = "ffprobe"
@@ -45,6 +53,24 @@ def load_config():
 def save_config(config):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text("".join(f'{key} = "{value}"\n' for key, value in config.items()))
+
+def validate_config(key, value):
+    choices = {"backend": {"e2fgvi-hq"}, "fallback": {"blur", "error"}}
+    if key in choices and value not in choices[key]:
+        return f"must be one of {', '.join(sorted(choices[key]))}"
+    return None
+
+def check_config(config):
+    issues = []
+    for key in ("e2fgvi_root", "e2fgvi_checkpoint"):
+        value = str(config.get(key, "")).strip()
+        if value and not Path(value).exists():
+            issues.append(f"{key}: path not found: {value}")
+    for key in ("ffmpeg_binary", "ffprobe_binary"):
+        value = str(config.get(key, "")).strip()
+        if value and not (Path(value).is_file() or shutil.which(value)):
+            issues.append(f"{key}: executable not found: {value}")
+    return issues
 
 def add_config_flags(parser):
     for key in DEFAULT_CONFIG:
@@ -125,8 +151,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     setup = sub.add_parser("setup"); setup.add_argument("--root"); setup.add_argument("--checkpoint")
     config_parser = sub.add_parser("config", help="show or edit saved defaults")
-    config_parser.add_argument("action", choices=("list", "get", "set"), nargs="?", default="list")
-    config_parser.add_argument("key", nargs="?"); config_parser.add_argument("value", nargs="?")
+    _jwkit_common.add_config_arguments(config_parser)
     run = sub.add_parser("run"); run.add_argument("input"); run.add_argument("-o", "--output", required=True); run.add_argument("--box", required=True); run.add_argument("--start", type=float); run.add_argument("--end", type=float)
     run.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     run.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
@@ -143,15 +168,12 @@ def main(argv=None):
     config = load_config()
     apply_config_flags(args, config)
     if args.command == "config":
-        if args.action == "list":
-            for key, value in config.items(): print(f"{key} = {value}")
-        elif args.action == "get" and args.key in DEFAULT_CONFIG:
-            print(f"{args.key} = {config[args.key]}")
-        elif args.action == "set" and args.key in DEFAULT_CONFIG and args.value is not None:
-            config[args.key] = args.value; save_config(config); print(f"Set {args.key} = {args.value}")
-        else:
-            raise SystemExit(f"Use: ffinpaint config {args.action} <{'key value' if args.action == 'set' else 'key'}>")
-        return
+        return _jwkit_common.run_config_command(
+            tool="ffinpaint", args=args, config=config, defaults=DEFAULT_CONFIG,
+            config_file=CONFIG_FILE, save_config=save_config,
+            descriptions=CONFIG_HELP, validate=validate_config,
+            check_extra=check_config,
+        )
     global FFMPEG_BIN, FFPROBE_BIN
     FFMPEG_BIN = _jwkit_common.resolve_ffmpeg_binary(config)
     FFPROBE_BIN = _jwkit_common.resolve_ffprobe_binary(config)
