@@ -662,9 +662,23 @@ def probe_source_fps(source):
     -n target frame count so the requested `fps` is hit exactly regardless
     of the source's real frame rate, instead of relying on RIFE's own
     implicit 2x-doubling default."""
-    cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(source)]
+    cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries",
+           "stream=r_frame_rate,avg_frame_rate", "-of", "json", str(source)]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return float(Fraction(result.stdout.strip()))
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except (json.JSONDecodeError, AttributeError):
+        streams = []
+    for stream in streams:
+        for key in ("r_frame_rate", "avg_frame_rate"):
+            value = stream.get(key)
+            try:
+                fps = float(Fraction(value))
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            if math.isfinite(fps) and fps > 0:
+                return fps
+    raise ValueError(f"No usable video frame rate found in {source}; the source may contain no video stream.")
 
 def probe_source_resolution(source):
     """Width/height of the source's first video stream. Used to scale

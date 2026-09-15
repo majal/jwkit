@@ -33,6 +33,17 @@ class FfrifeConfigTest(unittest.TestCase):
             config = self.ffrife.load_config()
             self.assertEqual(config, self.ffrife.DEFAULT_CONFIG)
 
+    def test_probe_source_fps_rejects_a_source_without_video_clearly(self) -> None:
+        result = MagicMock(stdout='{"streams": []}')
+        with patch.object(self.ffrife.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(ValueError, "No usable video frame rate.*no video stream"):
+                self.ffrife.probe_source_fps("subtitle-only.mp4")
+
+    def test_probe_source_fps_falls_back_to_average_rate(self) -> None:
+        result = MagicMock(stdout='{"streams": [{"r_frame_rate": "0/0", "avg_frame_rate": "30000/1001"}]}')
+        with patch.object(self.ffrife.subprocess, "run", return_value=result):
+            self.assertAlmostEqual(self.ffrife.probe_source_fps("variable.mp4"), 30000 / 1001)
+
     def test_run_encoder_overrides_parse(self) -> None:
         args = self.ffrife.build_parser().parse_args([
             "run", "input.mp4", "-o", "output.mp4", "--encoder", "nvenc",
