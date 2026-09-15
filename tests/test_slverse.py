@@ -2111,6 +2111,88 @@ class SlversePreviewGroupingTest(unittest.TestCase):
             self.assertEqual(config["preview_max_parallel"], expected)
 
 
+class SlverseFindPlayCacheTest(unittest.TestCase):
+    """'ffv all <ref> -p' -> 'slverse find ... --play'. Regression coverage
+    for the gap where find --play ignored preview_source entirely and
+    always went through resolve_segment_source: a different verse range
+    from the same chapter (e.g. 2:21-23 then 2:23) was an exact-window
+    cache miss and re-hit the network even with preview_source=cache
+    configured, which promises a whole-chapter download reused across any
+    verse window in that chapter."""
+
+    def setUp(self) -> None:
+        # Fresh module + isolated state/config paths per test, so this never
+        # touches the real ~/.config/jwkit/slverse.
+        self.slverse = load_script_module("slverse")
+        self._tmp = tempfile.TemporaryDirectory()
+        tmp_dir = Path(self._tmp.name)
+        self.slverse.CONFIG_DIR = tmp_dir
+        self.slverse.STATE_FILE = tmp_dir / "state.json"
+        self.slverse.INDEX_DIR = tmp_dir / "index"
+        self.cache_dir = tmp_dir / "cache"
+
+        markers = [
+            {"verseNumber": 21, "startTime": "00:00:10.000", "duration": "00:00:05.000"},
+            {"verseNumber": 22, "startTime": "00:00:15.000", "duration": "00:00:05.000"},
+            {"verseNumber": 23, "startTime": "00:00:20.000", "duration": "00:00:05.000"},
+        ]
+        index_entry = {"5_2": {"url": "http://example/chapter.mp4", "checksum": "abc123", "markers": markers}}
+        self.slverse.synced_languages = lambda: ["ASL"]
+        self.slverse.load_index = lambda lang: index_entry
+        self.slverse.resolve_book = lambda *a, **k: (5, "1 Peter")
+        self.slverse.command_exists = lambda cmd: True
+        self.slverse.launch_mpv = lambda *a, **k: None
+
+        self.download_calls: list = []
+
+        def fake_download_file(url, path, expected_checksum=None):
+            self.download_calls.append(url)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(b"fake video")
+            return True
+
+        self.slverse.download_file = fake_download_file
+
+        self.segment_download_calls: list = []
+
+        def fake_download_segment(url, path, start_time, end_time):
+            self.segment_download_calls.append((start_time, end_time))
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(b"fake segment")
+            return True
+
+        self.slverse.download_segment = fake_download_segment
+        self.slverse.segment_has_video = lambda path: True
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def find_args(self, verse):
+        return argparse.Namespace(book="1 Peter", chapter=2, verse=verse, play=True, verbose=False, json=False)
+
+    def config(self, **overrides):
+        cfg = dict(self.slverse.DEFAULT_CONFIG)
+        cfg["cache_dir"] = str(self.cache_dir)
+        cfg.update(overrides)
+        return cfg
+
+    def test_segment_mode_re_fetches_for_a_different_verse_range_in_the_same_chapter(self) -> None:
+        config = self.config(preview_source="segment")
+        self.slverse.cmd_find(self.find_args("21-23"), config)
+        self.slverse.cmd_find(self.find_args("23"), config)
+
+        self.assertEqual(self.download_calls, [])
+        self.assertEqual(len(self.segment_download_calls), 2)  # distinct windows - the reported cache miss
+
+    def test_cache_mode_reuses_the_whole_chapter_for_a_different_verse_range(self) -> None:
+        config = self.config(preview_source="cache")
+        self.slverse.cmd_find(self.find_args("21-23"), config)
+        self.slverse.cmd_find(self.find_args("23"), config)
+
+        self.assertEqual(self.segment_download_calls, [])
+        self.assertEqual(len(self.download_calls), 1)  # whole chapter fetched once, reused for verse 23 alone
+
+
 class SlverseLaunchMpvTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
