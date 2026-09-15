@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Muscle-memory compatibility launcher for slverse.
+"""Compact launcher for slverse.
 
-All verse lookup, playback, and encoding stays in slverse.  This command only
-preserves the older ``ffv <lang|any|all> <reference>`` spelling.
+All verse lookup, playback, encoding, and configuration stays in slverse.
 """
 from __future__ import annotations
 
@@ -24,9 +23,11 @@ Examples:
   ffv any 1 Sa-mu-en 2:12-17
   ffv all Ge 10:2 -p
 
-This is a compatibility launcher. Run 'slverse extract --help' and
+Run 'slverse extract --help' and
 'slverse find --help' for the complete option set.
 """
+
+PASSTHROUGH_COMMANDS = {"setup", "config", "langs", "sync", "extract", "find", "cache", "inspect", "benchmark", "bulk"}
 
 
 def slverse_path() -> str:
@@ -44,13 +45,10 @@ def split_all_reference(tokens: list[str]) -> tuple[list[str], list[str]]:
 
     This deliberately does not maintain a second copy of slverse's option
     schema: options may take values now or in the future, and ffv must not
-    mistake those values for words in the Bible reference. Put compatibility
-    options after the reference, as shown in the usage examples.
+    mistake those values for words in the Bible reference.
     """
     split = next((i for i, token in enumerate(tokens) if token.startswith("-") and token != "-"), len(tokens))
     words, flags = tokens[:split], tokens[split:]
-    aliases = {"-p": "--play", "-m": "--play"}
-    flags = [aliases.get(token, token) for token in flags]
     match = re.fullmatch(r"(.+?)\s+(\d+):(.+)", " ".join(words).strip())
     if not match:
         raise SystemExit("ffv all: use a reference such as 'Ge 10:2' or '1 Sa-mu-en 2:12-17'")
@@ -62,6 +60,8 @@ def main(argv: list[str]) -> None:
     if not argv or argv[0] in {"-h", "--help"}:
         print(USAGE)
         return
+    if argv[0] in PASSTHROUGH_COMMANDS:
+        raise SystemExit(subprocess.call([sys.executable, slverse_path(), *argv]))
     if argv[0].casefold() == "all":
         reference, flags = split_all_reference(argv[1:])
         raise SystemExit(subprocess.call([sys.executable, slverse_path(), "find", *reference, *flags]))

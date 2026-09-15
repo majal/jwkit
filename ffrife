@@ -68,26 +68,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _jwkit_common
 
 CONFIG_DIR = Path.home() / ".config" / "jwkit" / "ffrife"
-_LEGACY_CONFIG_DIR = Path.home() / ".config" / "maj-scripts" / "ffrife"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 BIN_DIR = CONFIG_DIR / "bin"
-
-def migrate_legacy_config_dir():
-    """One-time move from the pre-unification ~/.config/maj-scripts/ffrife
-    location to ~/.config/jwkit/ffrife now that all jwkit tools share one
-    config namespace (also carries over the downloaded RIFE binary in
-    bin/, so it doesn't need re-downloading)."""
-    if _LEGACY_CONFIG_DIR.exists() and not CONFIG_DIR.exists():
-        CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(_LEGACY_CONFIG_DIR), str(CONFIG_DIR))
-        # config.toml's rife_binary_path is an absolute string, so a plain
-        # directory move leaves it pointing at the old location - rewrite it
-        # rather than making the user re-download RIFE.
-        config_file = CONFIG_DIR / "config.toml"
-        if config_file.exists():
-            text = config_file.read_text()
-            config_file.write_text(text.replace(str(_LEGACY_CONFIG_DIR), str(CONFIG_DIR)))
-        print(f"Moved your existing settings from {_LEGACY_CONFIG_DIR} to {CONFIG_DIR}.")
 
 FFMPEG_FULL_KEG_PATHS = [
     "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg-full",
@@ -2664,23 +2646,18 @@ def cmd_benchmark(args, config):
     return best
 
 def cmd_config(args, config):
-    if args.action == "set" and args.key and args.value:
-        config[args.key] = args.value
-        save_config(config)
-        print(f"Set {args.key} = {args.value}")
-    elif args.action == "get" and args.key:
-        print(f"{args.key} = {config.get(args.key)}")
-        help_text = CONFIG_HELP.get(args.key)
-        if help_text:
-            print(f"  {help_text}")
-    else:
-        # CONFIG_HELP covers every DEFAULT_CONFIG key, so this doubles as
-        # the full documented config surface - see also docs/ffrife.md.
-        width = max((len(k) for k in config), default=0)
-        for k, v in config.items():
-            help_text = CONFIG_HELP.get(k, "")
-            suffix = f"  # {help_text}" if help_text else ""
-            print(f"{k:<{width}} = {v}{suffix}")
+    def check_extra(current):
+        issues = []
+        for key in ("rife_binary_path", "ffmpeg_binary", "ffprobe_binary"):
+            value = str(current.get(key, "")).strip()
+            if value and not (Path(value).is_file() or shutil.which(value)):
+                issues.append(f"{key}: executable not found: {value}")
+        return issues
+    return _jwkit_common.run_config_command(
+        tool="ffrife", args=args, config=config, defaults=DEFAULT_CONFIG,
+        config_file=CONFIG_FILE, save_config=save_config,
+        descriptions=CONFIG_HELP, check_extra=check_extra,
+    )
 
 # DEFAULT_CONFIG keys with their own dedicated per-run flag already -
 # excluded from the generic --<key> override loop (see slverse's own
@@ -2886,9 +2863,7 @@ def build_parser():
     subparsers.add_parser("setup", help="Interactive: download/configure the rife-ncnn-vulkan binary")
 
     p_config = subparsers.add_parser("config", help="Manage configuration")
-    p_config.add_argument("action", choices=["set", "get", "list"], nargs="?", default="list")
-    p_config.add_argument("key", nargs="?")
-    p_config.add_argument("value", nargs="?")
+    _jwkit_common.add_config_arguments(p_config)
 
     p_benchmark = subparsers.add_parser("benchmark", help="Time this machine's video encoders for speed/size/quality and suggest the best default")
     p_benchmark.add_argument("--sample", help="Real clip to benchmark against (default: a synthetic test clip)")
@@ -2931,7 +2906,6 @@ def normalize_argv(argv):
     return argv
 
 def main():
-    migrate_legacy_config_dir()
     args = build_parser().parse_args(normalize_argv(sys.argv[1:]))
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     config = load_config()
@@ -2950,7 +2924,9 @@ def main():
     if args.command == "setup":
         cmd_setup(config)
     elif args.command == "config":
-        cmd_config(args, config)
+        status = cmd_config(args, config)
+        if status:
+            raise SystemExit(status)
     elif args.command == "benchmark":
         cmd_benchmark(args, config)
     elif args.command == "run":

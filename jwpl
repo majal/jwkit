@@ -38,7 +38,6 @@ sys.path.insert(0, str(JWKIT_ROOT))
 import _jwkit_common
 
 CONFIG_DIR = Path.home() / ".config" / "jwkit" / "jwpl"
-LEGACY_CONFIG_DIR = Path.home() / ".config" / "theoskratos" / "jwlplaylist"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 DIRECTORY_CONFIG = "jwlplaylist.toml"
 SUPPORTED_EXTENSIONS = {
@@ -82,14 +81,6 @@ DEFAULT_THUMBNAIL = base64.b64decode(
 )
 
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".webp"}
-
-
-def migrate_legacy_config_dir() -> None:
-    """Move the private-prototype config into jwkit's standard namespace."""
-    if LEGACY_CONFIG_DIR.exists() and not CONFIG_DIR.exists():
-        CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(LEGACY_CONFIG_DIR), str(CONFIG_DIR))
-        print(f"Moved your existing settings from {LEGACY_CONFIG_DIR} to {CONFIG_DIR}.")
 
 
 def _natural_key(path: Path) -> list[Any]:
@@ -498,13 +489,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("playlist", type=Path)
     inspect.add_argument("--json", action="store_true")
     config = sub.add_parser("config", help="show or edit global defaults")
-    config_sub = config.add_subparsers(dest="config_command", required=True)
-    config_sub.add_parser("list")
-    get = config_sub.add_parser("get")
-    get.add_argument("key", choices=sorted(DEFAULTS))
-    set_parser = config_sub.add_parser("set")
-    set_parser.add_argument("key", choices=sorted(DEFAULTS))
-    set_parser.add_argument("value")
+    _jwkit_common.add_config_arguments(config)
     init = sub.add_parser("init", help=f"write a starter {DIRECTORY_CONFIG} in a directory")
     init.add_argument("directory", type=Path, nargs="?", default=Path.cwd())
     init.add_argument("--force", action="store_true")
@@ -529,7 +514,6 @@ def _parse_config_value(key: str, raw: str) -> Any:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _jwkit_common.maybe_auto_update(JWKIT_ROOT)
-    migrate_legacy_config_dir()
     color = _jwkit_common.Colorizer(
         _jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color)
     )
@@ -592,18 +576,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         saved = _read_toml(CONFIG_FILE)
         resolved = {**DEFAULTS, **saved}
-        if args.config_command == "list":
-            print(f"Global config: {CONFIG_FILE}")
-            for key, value in resolved.items():
-                print(f"{key} = {_toml_value(value)}\n    {DESCRIPTIONS[key]}")
-        elif args.config_command == "get":
-            print(_toml_value(resolved[args.key]))
-            print(DESCRIPTIONS[args.key])
-        else:
-            saved[args.key] = _parse_config_value(args.key, args.value)
-            _write_toml(CONFIG_FILE, saved)
-            print(f"Set {args.key} = {_toml_value(saved[args.key])}")
-        return 0
+        def save_global_config(current):
+            _write_toml(CONFIG_FILE, {key: value for key, value in current.items() if value != DEFAULTS[key]})
+        def validate(key, value):
+            if key == "end_action" and int(value) not in range(4): return "must be 0, 1, 2, or 3"
+            if key in {"image_duration_seconds", "thumbnail_size"} and float(value) <= 0: return "must be positive"
+            if key == "video_title_source" and value not in {"filename", "metadata"}: return "must be filename or metadata"
+            return None
+        return _jwkit_common.run_config_command(
+            tool="jwpl", args=args, config=resolved, defaults=DEFAULTS,
+            config_file=CONFIG_FILE, save_config=save_global_config,
+            descriptions=DESCRIPTIONS, parse_value=_parse_config_value,
+            validate=validate,
+        )
     except (OSError, ValueError, RuntimeError, sqlite3.Error, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
         print(color.red(f"jwpl: {exc}"), file=os.sys.stderr)
         return 2

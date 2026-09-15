@@ -97,6 +97,26 @@ class JwdlResolvePubsTest(unittest.TestCase):
         self.assertNotIn("newcode", self.jwdl.PUBS)
 
 
+class JwdlConfigTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jwdl = load_script_module("jwdl")
+
+    def test_toml_roundtrip_preserves_scalars_and_publications(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "config.toml"
+            config = dict(self.jwdl.DEFAULT_CONFIG)
+            config["workers"] = 7
+            config["pubs"] = {"custom": "Custom Songs"}
+            with mock.patch.object(self.jwdl, "CONFIG_DIR", config_file.parent), \
+                 mock.patch.object(self.jwdl, "CONFIG_FILE", config_file):
+                self.jwdl.save_config(config)
+                self.assertIn("[pubs]", config_file.read_text())
+                loaded = self.jwdl.load_config()
+        self.assertEqual(loaded["workers"], 7)
+        self.assertEqual(loaded["pubs"], {"custom": "Custom Songs"})
+
+
 class JwdlDownloadWithRetryTest(unittest.TestCase):
     """download_track/download_periodical_file/download_video all delegate
     their actual network fetch to this one shared helper now (previously

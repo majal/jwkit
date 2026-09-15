@@ -39,7 +39,7 @@ Enable selective use in `slverse`:
 
 ## Important Behavior / Defaults
 
-Backend defaults live in `~/.config/jwkit/ffinpaint/config.toml`. Use `ffinpaint config list|get|set`; every backend setting has a matching `ffinpaint run --<setting>` override. Setup's `--root` and `--checkpoint` remain friendly aliases for the corresponding saved E2FGVI paths.
+Backend defaults live in `~/.config/jwkit/ffinpaint/config.toml`. Use `ffinpaint config list|get|set|path|edit|reset|diff|check`; every backend setting has a matching `ffinpaint run --<setting>` override. Setup's `--root` and `--checkpoint` remain friendly aliases for the corresponding saved E2FGVI paths.
 
 `slverse` defaults to `delogo_engine = blur`. With `auto`, it samples the caption box against its surrounding backdrop and only invokes the configured backend when it sees significant foreground-like variation. If no backend is configured, it safely keeps using blur unless `delogo_inpaint_fallback = error` is set.
 
