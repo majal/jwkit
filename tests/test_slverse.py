@@ -22,6 +22,8 @@ class SlverseTimeParsingTest(unittest.TestCase):
         cls.slverse = load_script_module("slverse")
 
     def test_parse_hms(self) -> None:
+        self.assertAlmostEqual(self.slverse.parse_hms("12.212"), 12.212)
+        self.assertAlmostEqual(self.slverse.parse_hms("1:07.267"), 67.267)
         self.assertAlmostEqual(self.slverse.parse_hms("00:00:12.212"), 12.212)
         self.assertAlmostEqual(self.slverse.parse_hms("00:01:07.267"), 67.267)
         self.assertAlmostEqual(self.slverse.parse_hms("01:00:00.000"), 3600.0)

@@ -31,6 +31,8 @@ ffv all Ge 10:2 -p
 Every `slverse extract` option works in the normal and `any` forms. Use `slverse extract --help` for the complete list.
 Options are passed through unchanged, so newly added `slverse extract` flags work without an `ffv` update. In the `all` form, put options after the complete Bible reference; the option tail is forwarded intact to `slverse find`.
 
+In particular, `ffv ... -e TIME` passes `-e` through as `slverse extract --trim-end TIME`: it removes that duration from the natural verse window's tail. It is intentionally different from `ffrife --end`, which names an absolute source timestamp. Both accept `SS.sss`, `MM:SS.sss`, or `HH:MM:SS.sss`.
+
 ## Important Behavior / Defaults
 
 - `ffv <lang> ...` delegates to `slverse extract <lang> ...`.

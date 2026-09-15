@@ -66,6 +66,7 @@ jwpl inspect talk.jwlplaylist --json
 target `.jwlplaylist` already exists (default: ask, with a non-interactive fallback for
 cron/unattended runs - see the README's overwrite paragraph). Override for one run with
 `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout`.
+Time-valued options such as `--image-duration-seconds` and `--overwrite-timeout` accept `SS.sss`, `MM:SS.sss`, or `HH:MM:SS.sss`.
 
 A playlist is a DEFLATE-compressed ZIP containing:
 

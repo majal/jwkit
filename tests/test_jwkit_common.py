@@ -11,6 +11,26 @@ from unittest import mock
 from tests.support import load_script_module
 
 
+class JwkitCommonTimeParsingTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def test_accepts_seconds_minutes_and_hours(self) -> None:
+        self.assertEqual(self.common.parse_time_seconds("126.693"), 126.693)
+        self.assertEqual(self.common.parse_time_seconds("2:06.693"), 126.693)
+        self.assertEqual(self.common.parse_time_seconds("1:02:06.693"), 3726.693)
+
+    def test_rejects_invalid_clock_fields(self) -> None:
+        for value in ("", "1:60", "1:2:60", "-1", "nan", "1:2:3:4"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.common.parse_time_seconds(value)
+
+    def test_ranges_use_hyphen_for_clock_endpoints(self) -> None:
+        self.assertEqual(self.common.parse_time_range("2:06.693-3:26.696"), (126.693, 206.696))
+        self.assertEqual(self.common.parse_time_range("3.567:10.003"), (3.567, 10.003))
+
+
 class JwkitCommonConfigTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

@@ -152,10 +152,10 @@ def main(argv=None):
     setup = sub.add_parser("setup"); setup.add_argument("--root"); setup.add_argument("--checkpoint")
     config_parser = sub.add_parser("config", help="show or edit saved defaults")
     _jwkit_common.add_config_arguments(config_parser)
-    run = sub.add_parser("run"); run.add_argument("input"); run.add_argument("-o", "--output", required=True); run.add_argument("--box", required=True); run.add_argument("--start", type=float); run.add_argument("--end", type=float)
+    run = sub.add_parser("run"); run.add_argument("input"); run.add_argument("-o", "--output", required=True); run.add_argument("--box", required=True); run.add_argument("--start", type=_jwkit_common.parse_time_seconds, help="Source start timestamp"); run.add_argument("--end", type=_jwkit_common.parse_time_seconds, help="Source end timestamp, not a tail-trim amount")
     run.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     run.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
-    run.add_argument("--overwrite-timeout", type=float, help="Seconds to wait for an 'ask' answer before falling back")
+    run.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds, help="Time to wait for an 'ask' answer before falling back")
     add_config_flags(run)
     for p in (setup, config_parser, run):
         color_group = p.add_mutually_exclusive_group()

@@ -7,6 +7,7 @@ This is the canonical home for cross-tool configuration, update, output,
 encoding, and progress behavior. It is not tied to any one tool.
 """
 import datetime
+import math
 import json
 import os
 import platform
@@ -23,6 +24,63 @@ from pathlib import Path
 
 
 CONFIG_ACTIONS = ("list", "get", "set", "path", "edit", "reset", "diff", "check")
+
+
+def parse_time_seconds(value):
+    """Parse SS.sss, MM:SS.sss, or HH:MM:SS.sss into seconds.
+
+    Plain seconds may exceed 59. Colon forms use clock notation, so their
+    minute and second fields must be below 60. Hours are intentionally
+    unbounded for long media.
+    """
+    text = str(value).strip()
+    parts = text.split(":")
+    if not 1 <= len(parts) <= 3 or any(not part for part in parts):
+        raise ValueError("must be SS.sss, MM:SS.sss, or HH:MM:SS.sss")
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError("must be SS.sss, MM:SS.sss, or HH:MM:SS.sss") from exc
+    if any(not math.isfinite(number) or number < 0 for number in numbers):
+        raise ValueError("must be a finite non-negative time")
+    if len(numbers) > 1 and (numbers[-2] >= 60 or numbers[-1] >= 60):
+        raise ValueError("minutes and seconds must be below 60 in clock notation")
+    if len(numbers) == 1:
+        return numbers[0]
+    if len(numbers) == 2:
+        return numbers[0] * 60 + numbers[1]
+    return numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+
+
+def parse_time_range(value):
+    """Parse a time range while preserving legacy seconds-only ``A:B``.
+
+    Because colons now belong inside clock timestamps, colon-bearing
+    endpoints use ``START-END`` (for example ``1:02.5-2:03.75``). The old
+    seconds-only ``3.5:10`` spelling remains accepted for compatibility.
+    """
+    text = str(value).strip()
+    if "-" in text:
+        if text.count("-") != 1:
+            raise ValueError("must be START-END when either time contains a colon")
+        start_text, end_text = text.split("-", 1)
+    elif text.count(":") == 1:
+        start_text, end_text = text.split(":", 1)
+        if ":" in start_text or ":" in end_text:
+            raise ValueError("must be START-END when either time contains a colon")
+    else:
+        raise ValueError("must be START-END; legacy seconds-only START:END is also accepted")
+    start, end = parse_time_seconds(start_text), parse_time_seconds(end_text)
+    if end <= start:
+        raise ValueError("END must be greater than START")
+    return start, end
+
+
+def parse_auto_time_seconds(value):
+    """Accept ``auto`` or normalize a human time to numeric seconds."""
+    if str(value).strip().casefold() == "auto":
+        return "auto"
+    return f"{parse_time_seconds(value):g}"
 
 
 def add_config_arguments(parser):
@@ -622,7 +680,7 @@ def load_jwkit_config():
                 config["on_output_exists_unattended"] = v
             elif k == "overwrite_prompt_timeout":
                 try:
-                    config["overwrite_prompt_timeout"] = float(v)
+                    config["overwrite_prompt_timeout"] = parse_time_seconds(v)
                 except ValueError:
                     pass
     except OSError:

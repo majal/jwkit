@@ -197,6 +197,16 @@ class FfrifeTrimWindowTest(unittest.TestCase):
         ])
         self.assertEqual(self.ffrife.resolve_processing_window(args), (3.567, 10.003))
 
+    def test_clock_times_parse_for_bounds_and_window(self) -> None:
+        args = self.ffrife.build_parser().parse_args([
+            "run", "input.mp4", "--start", "2:06.693", "--end", "3:26.696",
+        ])
+        self.assertEqual(self.ffrife.resolve_processing_window(args), (126.693, 206.696))
+        args = self.ffrife.build_parser().parse_args([
+            "run", "input.mp4", "--window", "2:06.693-3:26.696",
+        ])
+        self.assertEqual(self.ffrife.resolve_processing_window(args), (126.693, 206.696))
+
     def test_window_requires_increasing_nonnegative_bounds(self) -> None:
         for value in ("not-a-window", "-1:2", "2:2", "3:2", "nan:8", "2:inf"):
             with self.subTest(value=value), self.assertRaises(SystemExit):
@@ -217,6 +227,13 @@ class FfrifeTrimWindowTest(unittest.TestCase):
             "run", "input.mp4", "--start", "2", "--end", "8",
         ])
         self.assertEqual(self.ffrife.resolve_processing_window(args), (2.0, 8.0))
+
+    def test_separate_bounds_must_increase(self) -> None:
+        args = self.ffrife.build_parser().parse_args([
+            "run", "input.mp4", "--start", "2:06.693", "--end", "1:26.696",
+        ])
+        with self.assertRaisesRegex(ValueError, "greater than"):
+            self.ffrife.resolve_processing_window(args)
 
 
 class FfrifeAtempoChainTest(unittest.TestCase):
