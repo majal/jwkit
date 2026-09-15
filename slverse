@@ -1163,6 +1163,23 @@ def describe_retime_edit(mode, boundaries, speed):
     times = "-".join(f"{b:g}" for b in boundaries)
     return f"{mode} motion {speed:g}x@{times}s"
 
+def default_extract_filename(book_name, chapter, verses, lang, args, config):
+    """Build a glanceable default name without altering explicit -o paths."""
+    suffixes = []
+    if (getattr(args, "clip_window", None) or getattr(args, "trim_start", None) is not None
+            or getattr(args, "trim_end", None) is not None or getattr(args, "offset_start", None) is not None
+            or getattr(args, "offset_end", None) is not None or getattr(args, "trim_mid_transitions", False)):
+        suffixes.append("cut")
+    if getattr(args, "slow", None):
+        suffixes.append("slow")
+    elif getattr(args, "fast", None):
+        suffixes.append("fast")
+    engine = str(config.get("interpolation_engine", "none")).strip().lower()
+    if engine != "none":
+        suffixes.append(engine)
+    edit_suffix = "".join(f"_{value}" for value in suffixes)
+    return f"{book_name.replace(' ', '_')}_{chapter}_{verses}_{lang}{edit_suffix}.mp4"
+
 def output_metadata_args(book_name, chapter, verses, lang, source_url, checksum, edit_note="normal-speed full verse window", title_edit=""):
     title = f"{book_name} {chapter}:{verses} {lang}" + (f" ({title_edit})" if title_edit else "")
     return ["-metadata", f"title={title}", "-metadata", f"artist=JW.org ({lang})",
@@ -2835,7 +2852,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     # timeline, as do concat/filter-complex paths.
     fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None)
     verses_str = format_verses_label(valid_verses)
-    out_filename = getattr(args, "output", None) or f"{book_name.replace(' ', '_')}_{chapter}_{verses_str}_{lang}.mp4"
+    out_filename = getattr(args, "output", None) or default_extract_filename(
+        book_name, chapter, verses_str, lang, args, config,
+    )
     if getattr(args, "output", None):
         Path(out_filename).parent.mkdir(parents=True, exist_ok=True)
     edit_bits = describe_cut_edit(args)

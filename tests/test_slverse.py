@@ -2434,6 +2434,26 @@ class SlverseEditDescriptionTest(unittest.TestCase):
     def test_no_mode_returns_none(self) -> None:
         self.assertIsNone(self.slverse.describe_retime_edit(None, None, None))
 
+    def test_default_filename_has_no_suffix_for_an_unedited_clip(self) -> None:
+        self.assertEqual(
+            self.slverse.default_extract_filename("Revelation", 13, "1-3", "ASL", self.args(), {"interpolation_engine": "none"}),
+            "Revelation_13_1-3_ASL.mp4",
+        )
+
+    def test_default_filename_combines_cut_speed_and_interpolation_edits(self) -> None:
+        args = self.args(clip_window=(3.0, 9.0), slow=["3", "5"])
+        self.assertEqual(
+            self.slverse.default_extract_filename("Revelation", 13, "1-3", "ASL", args, {"interpolation_engine": "rife"}),
+            "Revelation_13_1-3_ASL_cut_slow_rife.mp4",
+        )
+
+    def test_default_filename_marks_fast_and_each_interpolation_engine(self) -> None:
+        args = self.args(fast=["3", "5"])
+        self.assertEqual(
+            self.slverse.default_extract_filename("Psalm", 16, "11", "FSL", args, {"interpolation_engine": "minterpolate"}),
+            "Psalm_16_11_FSL_fast_minterpolate.mp4",
+        )
+
     def test_full_title_omits_transition_edit_but_keeps_it_in_editing_field(self) -> None:
         # Mirrors extract_one_lang's own title_edit/edit_note split.
         bits = self.slverse.describe_cut_edit(self.args(clip_window=(3.0, 9.0), keep_end_transition=True))
