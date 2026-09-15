@@ -1032,6 +1032,26 @@ def resolve_segment_source(url, lang, book_num, chapter, start_time, end_time, c
         return str(cached), cached
     return url, None
 
+def resolve_chapter_cache_source(url, lang, checksum, config, state):
+    """preview_source=cache: download the WHOLE chapter once (keyed by the
+    remote filename, same file cmd_extract's --write path would produce)
+    and reuse it - unlike resolve_segment_source's exact-window cache, any
+    verse window from this chapter is served from the same local file, so a
+    different verse range in the same chapter never re-hits the network.
+    Returns (source, cached_path) - cached_path is None (source is the
+    remote url, unchanged) if the download failed."""
+    cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang
+    cached = cache_dir / url.split("/")[-1]
+    if cached.exists():
+        note_cache_use(state, cached)
+        return str(cached), cached
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if download_file(url, cached, expected_checksum=checksum):
+        note_cache_use(state, cached)
+        enforce_cache_budget(config, state, protect=cached, added_bytes=cached.stat().st_size)
+        return str(cached), cached
+    return url, None
+
 # --- Video Processing ---
 def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     """Runs ffmpeg. Most extract/interpolate steps finish in a few seconds
@@ -2816,21 +2836,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             if cached_path:
                 start_time, end_time = 0.0, end_time - start_time
         elif preview_source != "remote":
-            cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang
-            cached = cache_dir / url.split("/")[-1]
-            if cached.exists():
-                note_cache_use(state, cached)
-                source = str(cached)
-                cached_path = cached
-            else:
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                if download_file(url, cached, expected_checksum=checksum):
-                    note_cache_use(state, cached)
-                    enforce_cache_budget(config, state, protect=cached, added_bytes=cached.stat().st_size)
-                    source = str(cached)
-                    cached_path = cached
-                # else: download failed (offline, CDN hiccup, etc) - fall
-                # back to streaming straight from the URL for this preview.
+            source, cached_path = resolve_chapter_cache_source(url, lang, checksum, config, state)
         # cache_in_use holds the file protected from another thread's
         # concurrent enforce_cache_budget call for as long as this preview
         # is actually reading it (mpv/ffplay playback can run for a while).
@@ -3092,6 +3098,7 @@ def cmd_find(args, config):
                 "verse": verse,
                 "found": marker is not None,
                 "url": entry["url"] if (entry and marker) else None,
+                "checksum": entry.get("checksum") if (entry and marker) else None,
                 "start": marker["start"] if marker else None,
                 "end": marker["end"] if marker else None,
                 "label": marker.get("label") if marker else None,
@@ -3141,15 +3148,15 @@ def cmd_find(args, config):
             multi = len(to_play) > 1
             window_size = config.get("preview_window_size", DEFAULT_CONFIG["preview_window_size"])
             # Same preview_source knob extract's own no-write preview uses:
-            # 'remote' streams straight from the CDN and never touches disk;
-            # anything else (default 'segment', or 'cache') fetches just
-            # this exact contiguous requested window and caches it (see
-            # resolve_segment_source) -
-            # cheap even across every matched language at once, since it's
-            # never the whole chapter. A repeat 'ffv all' of the same verse,
-            # or a later 'ffv <lang>' extract, then reuses the same small
-            # clip instead of hitting the network again.
-            use_cache = config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower() != "remote"
+            # 'remote' streams straight from the CDN and never touches disk.
+            # 'segment' (the default) fetches and caches just this exact
+            # contiguous requested window (see resolve_segment_source) -
+            # cheap, but a *different* verse range from the same chapter is
+            # a cache miss and re-hits the network. 'cache' instead
+            # downloads the whole chapter once (resolve_chapter_cache_source)
+            # and reuses it for any verse window in that chapter - worth it
+            # when you'll preview several different ranges from one chapter.
+            preview_source = config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower()
             if multi:
                 print(f"\nOpening {len(to_play)} preview windows, one per language/contiguous range, all paused - unpause each to review it.")
 
@@ -3158,14 +3165,16 @@ def cmd_find(args, config):
                 start_str = f"{int(row['start']//3600):02d}:{int(row['start']%3600//60):02d}:{row['start']%60:06.3f}"
                 dur = row["end"] - row["start"]
                 play_source = row["url"]
-                if use_cache:
+                if preview_source == "segment":
                     play_source, cached_segment = resolve_segment_source(row["url"], row["lang"], book_num, row["chapter"], row["start"], row["end"], config, state)
                     if cached_segment:
                         start_str = "00:00:00.000"
+                elif preview_source == "cache":
+                    play_source, _cached_chapter = resolve_chapter_cache_source(row["url"], row["lang"], row.get("checksum"), config, state)
                 return i, row, start_str, dur, play_source
 
             workers = min(len(to_play), int(config.get("preview_max_parallel", DEFAULT_CONFIG["preview_max_parallel"])))
-            if use_cache and workers > 1:
+            if preview_source != "remote" and workers > 1:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                     resolved = (future.result() for future in concurrent.futures.as_completed(
                         [pool.submit(resolve_preview, item) for item in enumerate(to_play)]
