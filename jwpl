@@ -248,26 +248,54 @@ def presentation_labels(media: list[Path], settings: dict[str, Any]) -> list[str
     width = len(str(largest))
     labels = []
     for position, (path, source_number) in enumerate(zip(media, source_numbers), start=1):
+        title_from_metadata = False
         if settings["video_title_source"] == "metadata" and path.suffix.lower() not in IMAGE_EXTENSIONS:
             try:
-                title = _embedded_title(path, settings) or path.stem
+                embedded_title = _embedded_title(path, settings)
+                title = embedded_title or path.stem
+                title_from_metadata = bool(embedded_title)
             except subprocess.CalledProcessError as exc:
                 raise RuntimeError(f"could not read embedded title from {path.name}: {exc}") from exc
         else:
             title = path.name
         if settings["number_titles"]:
             number = source_number if source_number is not None else position
-            title = f"{number:0{width}d} {_without_leading_number(Path(title).stem)}".strip()
+            # Only filenames have extensions. Treating an embedded title as
+            # a Path made ordinary periods (decimal timestamps and sentence
+            # punctuation) look like suffix separators and silently cut off
+            # the rest of JW Library's visible label.
+            unnumbered = title if title_from_metadata else Path(title).stem
+            title = f"{number:0{width}d} {_without_leading_number(unnumbered)}".strip()
         labels.append(title)
     return labels
+
+
+def _attached_picture_stream(source: Path, settings: dict[str, Any]) -> int | None:
+    """Return the first embedded cover-art stream, if the media has one."""
+    if source.suffix.lower() in IMAGE_EXTENSIONS:
+        return None
+    result = subprocess.run(
+        [str(settings["ffprobe"]), "-v", "error", "-show_entries",
+         "stream=index:stream_disposition=attached_pic", "-of", "json", str(source)],
+        check=True, capture_output=True, text=True,
+    )
+    for stream in json.loads(result.stdout or "{}").get("streams", []):
+        if stream.get("disposition", {}).get("attached_pic") == 1:
+            return int(stream["index"])
+    return None
 
 
 def _make_thumbnail(source: Path, destination: Path, settings: dict[str, Any]) -> None:
     size = int(settings["thumbnail_size"])
     command = [str(settings["ffmpeg"]), "-v", "error", "-y"]
-    if source.suffix.lower() not in IMAGE_EXTENSIONS:
-        command += ["-ss", "0"]
-    command += ["-i", str(source), "-frames:v", "1", "-vf", f"scale={size}:{size}:force_original_aspect_ratio=decrease", str(destination)]
+    attached_picture = _attached_picture_stream(source, settings)
+    if attached_picture is not None:
+        command += ["-i", str(source), "-map", f"0:{attached_picture}"]
+    else:
+        if source.suffix.lower() not in IMAGE_EXTENSIONS:
+            command += ["-ss", "0"]
+        command += ["-i", str(source)]
+    command += ["-frames:v", "1", "-vf", f"scale={size}:{size}:force_original_aspect_ratio=decrease", str(destination)]
     subprocess.run(command, check=True, capture_output=True)
 
 
@@ -328,6 +356,11 @@ def create_playlist(directory: Path, output: Path, name: str, settings: dict[str
             try:
                 duration_ticks = _duration_ticks(source, settings)
             except (subprocess.CalledProcessError, ValueError) as exc:
+                # Close explicitly before TemporaryDirectory removes the
+                # database. Besides avoiding a leaked handle warning, this
+                # matters on Windows, where an open SQLite file prevents the
+                # temporary workspace from being deleted.
+                connection.close()
                 raise RuntimeError(f"could not read duration from {source.name}: {exc}") from exc
             connection.execute("INSERT INTO PlaylistItemIndependentMediaMap VALUES(?,?,?)", (item_id, media_id, duration_ticks))
             connection.execute("INSERT INTO TagMap(TagMapId,PlaylistItemId,TagId,Position) VALUES(?,?,1,?)", (item_id, item_id, position))

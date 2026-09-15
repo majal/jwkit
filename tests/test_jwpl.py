@@ -117,6 +117,28 @@ class JwplTest(unittest.TestCase):
             labels = module.presentation_labels(media, settings)
         self.assertEqual(labels, ["01 Opening image", "02 A Good Video Title", "10 Closing image"])
 
+    def test_numbered_metadata_title_keeps_periods_and_decimal_timestamps(self):
+        media = [self.root / "03 opaque-video-code.mp4"]
+        settings = {**module.DEFAULTS, "video_title_source": "metadata", "number_titles": True}
+        with mock.patch.object(module, "_embedded_title", return_value="Thessalonians 5:12-13 FSL (cut e-7.017s; slow motion 0.5x@11.417-20"):
+            labels = module.presentation_labels(media, settings)
+        self.assertEqual(labels, ["3 Thessalonians 5:12-13 FSL (cut e-7.017s; slow motion 0.5x@11.417-20"])
+
+    def test_numbered_song_metadata_drops_track_number_but_keeps_full_title(self):
+        settings = {**module.DEFAULTS, "video_title_source": "metadata", "number_titles": True}
+        with mock.patch.object(module, "_embedded_title", return_value="103. Nuestros pastores son un regalo de Dios"):
+            labels = module.presentation_labels([self.root / "18 song.mp4"], settings)
+        self.assertEqual(labels, ["18 Nuestros pastores son un regalo de Dios"])
+
+    def test_thumbnail_prefers_embedded_attached_picture(self):
+        settings = {**module.DEFAULTS, "thumbnail_size": 250}
+        completed = subprocess.CompletedProcess([], 0, stdout='{"streams":[{"index":2,"disposition":{"attached_pic":1}}]}')
+        with mock.patch.object(module.subprocess, "run", side_effect=[completed, subprocess.CompletedProcess([], 0)]) as run:
+            module._make_thumbnail(self.root / "song.mp4", self.root / "thumb.jpg", settings)
+        command = run.call_args_list[1].args[0]
+        self.assertIn("0:2", command)
+        self.assertNotIn("-ss", command)
+
     def test_numbering_does_not_duplicate_existing_title_number(self):
         settings = {**module.DEFAULTS, "video_title_source": "metadata", "number_titles": True}
         with mock.patch.object(module, "_embedded_title", return_value="7 Finished Title"):
