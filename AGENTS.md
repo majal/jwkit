@@ -46,7 +46,7 @@ then remove the compatibility branch rather than carrying it indefinitely.
 
 **Smart batched deploy, with "push" as the deploy step** — this repo has
 no separate server-side deploy; a push to `main` is what goes live, since
-`jwdl-weekly.service`/`jwsl-sync-weekly.service` on `emeth4` auto-update
+`jwdl-weekly.service`/`slverse-sync-weekly.service` on `emeth4` auto-update
 by fast-forwarding against `origin` before every unattended run (see
 "Auto-Update" above). Commit continuously as work lands; test locally and
 push right away once you're happy with a verified change, rather than
@@ -58,9 +58,9 @@ deploy.
 
 ## Operational Notes
 
-- **`jwdl` is called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwdl-weekly.service` + `.timer`, `ExecStart=... %h/MyFiles/Digitalis/jwkit/jwdl all`, weekly). Any change to `jwdl`'s existing music CLI surface (`jwdl <pub> [lang]`, `jwdl all`, `jwdl list`) must stay backward-compatible, or the service needs a coordinated update on that host first. `jwdl periodicals ...` is a fully separate command path added specifically to avoid touching that surface — keep it that way rather than folding periodicals into the same `pub`/`all` positional.
-- **`slverse` is also called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwsl-sync-weekly.service` + `.timer` — the unit files keep the pre-rename `jwsl` name, only their `ExecStart` was updated to `%h/MyFiles/Digitalis/jwkit/slverse sync all`; renaming the unit files themselves was judged not worth the re-enable risk). This one was missed in the initial `jwsl`→`slverse`/`jwkit` split (2026-08-13) because the audit at the time only grepped for `jwdl`, not `jwsl` — found and fixed in a follow-up broader audit the same day. When auditing for live callers on a host, grep `ExecStart=` across **all** `~/.config/systemd/user/*.service` and (`sudo`) `/etc/systemd/system/*.service` for the tool's old **and** new name, not just the one you're actively changing.
-- **Auto-update (see below) runs before these unattended jobs too.** `jwdl-weekly.service` and `jwsl-sync-weekly.service` both call a jwkit tool directly, so if auto-update is on (the default) that command will `git fetch`+fast-forward jwkit *before* doing its actual job, unattended, with nobody reviewing the diff first. Fast-forward-only means it can't silently discard anything, but it does mean a bad push to `main` reaches these hosts on their very next scheduled run. Test before pushing to `main`, same as always — this isn't a reason to relax that, just a reminder the blast radius includes unattended jobs, not only interactive users.
+- **`jwdl` is called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwdl-weekly.service` + `.timer`, `ExecStart=... %h/MyFiles/Digitalis/jwkit/jwdl all`, weekly). Coordinate changes to the music CLI surface (`jwdl <pub> [lang]`, `jwdl all`, `jwdl list`) with that unit in the same rollout; do not retain an obsolete CLI solely for the service. `jwdl periodicals ...` remains a separate command path because it is a distinct workflow.
+- **`slverse` is also called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/slverse-sync-weekly.service` + `.timer`, `ExecStart=... %h/MyFiles/Digitalis/jwkit/slverse sync all`). Keep the unit source in the `bin` repo aligned with the deployed copy. When auditing live callers, inspect `ExecStart=` across **all** `~/.config/systemd/user/*.service` and (`sudo`) `/etc/systemd/system/*.service`, not only the expected unit.
+- **Auto-update (see below) runs before these unattended jobs too.** `jwdl-weekly.service` and `slverse-sync-weekly.service` both call a jwkit tool directly, so if auto-update is on (the default) that command will `git fetch`+fast-forward jwkit *before* doing its actual job, unattended, with nobody reviewing the diff first. Fast-forward-only means it can't silently discard anything, but it does mean a bad push to `main` reaches these hosts on their very next scheduled run. Test before pushing to `main`, same as always — this isn't a reason to relax that, just a reminder the blast radius includes unattended jobs, not only interactive users.
 
 ## Auto-Update (`_jwkit_common.py`)
 
@@ -148,7 +148,7 @@ Run `python3 -m tests` before pushing changes that affect tools, tests, or READM
 
 Commit is automatic (2026-08-14, operator-directed): once a change is good and verified, commit it right away so history captures every change and checkpoint. Don't ask first, and don't leave verified work sitting uncommitted "for later." Keep commits narrow — one logical change per commit, not batched unrelated edits.
 
-Push is separate and intentionally batched, not automatic on every commit — see the auto-update note above (`jwdl-weekly.service`/`jwsl-sync-weekly.service` fast-forward from `origin/main` unattended, so a push reaches those hosts on their next scheduled run with nobody reviewing the diff first). Push when you've verified a batch of commits as a whole, when the user asks, or before ending a work session — not reflexively after each individual commit. Never push when there are unresolved errors or relevant verification has not passed. In those cases, leave a clear status note with the next step.
+Push is separate and intentionally batched, not automatic on every commit — see the auto-update note above (`jwdl-weekly.service`/`slverse-sync-weekly.service` fast-forward from `origin/main` unattended, so a push reaches those hosts on their next scheduled run with nobody reviewing the diff first). Push when you've verified a batch of commits as a whole, when the user asks, or before ending a work session — not reflexively after each individual commit. Never push when there are unresolved errors or relevant verification has not passed. In those cases, leave a clear status note with the next step.
 
 Never force-push or rewrite history without the user's explicit go-ahead.
 
@@ -200,7 +200,7 @@ Same spirit as `maj-scripts`: practical and skimmable, a light touch is fine, bu
 - use `↑ TOC` consistently in README, and the back-link in `docs/<tool>.md`
 - keep examples concise and copy-pasteable
 - store config/state under `~/.config/jwkit/<tool>/` (see Configuration above), with a migration helper if you're renaming/moving an existing tool
-- if the tool has a live external caller (cron/systemd elsewhere), note it under Operational Notes above and keep its CLI surface backward-compatible
+- if the tool has a live external caller (cron/systemd elsewhere), note it under Operational Notes above and coordinate that caller's migration in the same rollout
 - add the tool to the `TOOLS`/`$Tools` list in both `install.sh` and `install.ps1` (see Installer above) so the one-line installers pick it up
 - wire in `_jwkit_common.maybe_auto_update(...)` right after `parse_args()` (see Auto-Update above) so the new tool participates in the shared update check
 - if the tool writes a final output file, call `_jwkit_common.resolve_output_conflict(...)` right before writing it and add the matching `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` flags (see Overwrite Handling above)
