@@ -698,6 +698,7 @@ class SlverseSegmentCacheTest(unittest.TestCase):
             Path(args[-1]).write_bytes(b"fake ffmpeg output")  # real ffmpeg writes to its last arg on success
 
         self.slverse.run_ffmpeg = fake_run_ffmpeg
+        self.slverse.segment_has_video = lambda path: True
         self.slverse.MAX_ATTEMPTS = 3
         self.slverse.RETRY_BACKOFF = 2
         # self.slverse.time IS the real, process-wide stdlib time module (see
@@ -722,6 +723,8 @@ class SlverseSegmentCacheTest(unittest.TestCase):
             self.assertEqual(args[args.index("-ss") + 1], "10.0")
             self.assertEqual(args[args.index("-to") + 1], "20.0")
             self.assertEqual(args[args.index("-reset_timestamps") + 1], "1")
+            self.assertEqual(args[args.index("-map") + 1], "0:v:0")
+            self.assertIn("-sn", args)
 
     def test_resolve_segment_source_reuses_cached_file_without_fetching(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -729,12 +732,37 @@ class SlverseSegmentCacheTest(unittest.TestCase):
             cached = self.slverse.segment_cache_path(config, "ASL", 54, 1, 10.0, 20.0)
             cached.parent.mkdir(parents=True)
             cached.write_bytes(b"already here")
+            self.slverse.segment_has_video = lambda path: True
             self.slverse.download_segment = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fetch"))
 
             source, cached_path = self.slverse.resolve_segment_source("http://example/vid.mp4", "ASL", 54, 1, 10.0, 20.0, config, {})
 
             self.assertEqual(source, str(cached))
             self.assertEqual(cached_path, cached)
+
+    def test_resolve_segment_source_replaces_cached_file_without_video(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = {"cache_dir": td}
+            cached = self.slverse.segment_cache_path(config, "INI", 48, 6, 77.477, 89.723)
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"subtitle only")
+            self.slverse.segment_has_video = lambda path: False
+
+            def replace_segment(url, path, start, end):
+                path.write_bytes(b"video")
+                return True
+
+            self.slverse.download_segment = replace_segment
+            state = {"_cache_bytes": {str(Path(td)): 999}, "_cache_access": {str(cached): 1}}
+            source, cached_path = self.slverse.resolve_segment_source(
+                "http://example/vid.mp4", "INI", 48, 6, 77.477, 89.723, config, state
+            )
+
+            self.assertEqual(source, str(cached))
+            self.assertEqual(cached_path, cached)
+            self.assertEqual(cached.read_bytes(), b"video")
+            self.assertNotEqual(state["_cache_access"][str(cached)], 1)
+            self.assertNotEqual(state["_cache_bytes"].get(str(Path(td))), 999)
 
     def test_resolve_segment_source_falls_back_to_url_when_fetch_fails(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1246,6 +1274,7 @@ class SlverseExtractPreviewTest(unittest.TestCase):
             return True
 
         self.slverse.download_segment = fake_download_segment
+        self.slverse.segment_has_video = lambda path: True
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
