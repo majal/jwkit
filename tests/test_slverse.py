@@ -168,6 +168,20 @@ class SlverseResolveVerseWindowTest(unittest.TestCase):
         start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window("ASL", 19, 16, [10], self.config())
         self.assertAlmostEqual(end, 133.633 + 15.782)
 
+    def test_no_trim_for_universal_per_verse_padding_below_the_floor(self) -> None:
+        # JW tags essentially every verse marker with a small nonzero
+        # endTransitionDuration (empirically 0.000-0.300s across a real
+        # index) as routine frame-boundary padding, not an actual trailing
+        # fade/endscreen to trim - see min_transition_duration. Real
+        # trailing transitions cluster at 1.0s+ in the same data; trimming
+        # this sub-floor one would just shave real content off the end for
+        # no reason.
+        self._stub_index([
+            {"verseNumber": 24, "startTime": "00:09:03.442", "duration": "00:00:24.591", "endTransitionDuration": "00:00:00.033", "label": "Matius 5:24"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window("INI", 40, 5, [24], self.config())
+        self.assertAlmostEqual(end, 543.442 + 24.591)
+
     def test_mid_transition_default_keeps_continuous_range(self) -> None:
         # A range spanning multiple paragraphs plays through a mid-range
         # transition untouched by default - only the LAST selected verse's
@@ -191,6 +205,19 @@ class SlverseResolveVerseWindowTest(unittest.TestCase):
         )
         # verse 8 spans [0, 10) of the window, transition is its last 2s -> drop [8, 10)
         self.assertEqual(kept_segments, [(0.0, 8.0), (10.0, 18.0)])
+
+    def test_trim_mid_transitions_ignores_universal_per_verse_padding(self) -> None:
+        # Same floor as trim_end_transition (min_transition_duration) - a
+        # 0.033s endTransitionDuration between verses is routine padding,
+        # not a real paragraph boundary worth jump-cutting.
+        self._stub_index([
+            {"verseNumber": 23, "startTime": "00:01:00.000", "duration": "00:00:10.000", "endTransitionDuration": "00:00:00.033", "label": "Matius 5:23"},
+            {"verseNumber": 24, "startTime": "00:01:10.000", "duration": "00:00:08.000", "endTransitionDuration": "00:00:00.000", "label": "Matius 5:24"},
+        ])
+        start, end, url, checksum, valid_verses, source_labels, kept_segments = self.slverse.resolve_verse_window(
+            "INI", 40, 5, [23, 24], self.config(trim_mid_transitions="true"),
+        )
+        self.assertEqual(kept_segments, [(0.0, end - start)])
 
     def test_trim_mid_transitions_cli_override(self) -> None:
         self._stub_index([
@@ -1351,6 +1378,31 @@ class SlverseOverlayFadeOutsTest(unittest.TestCase):
         self.assertEqual(len(fades), 1)
         self.assertTrue(fades[0][2])
 
+    def test_universal_per_verse_padding_is_not_a_real_transition(self) -> None:
+        # Real Matthew 5:22-25 marker data (INI): every single verse carries
+        # endTransitionDuration=0.033s (~1 frame at 30fps) - routine
+        # frame-boundary padding JW tags on every marker, not an actual
+        # paragraph fade (those cluster at 1.0s+ in the same index - see
+        # min_transition_duration's DEFAULT_CONFIG comment). Animating a
+        # down/hold/up dip inside a 33ms window is shorter than a single
+        # frame, producing a one-frame flash where the reference (and,
+        # since it shares this alpha expression, the source-SL label) both
+        # vanish - the bug this backs.
+        self._stub_index("40_5", [
+            {"verseNumber": 23, "startTime": "00:08:35.047", "duration": "00:00:28.395", "endTransitionDuration": "00:00:00.033", "label": "Matius 5:23"},
+            {"verseNumber": 24, "startTime": "00:09:03.442", "duration": "00:00:24.591", "endTransitionDuration": "00:00:00.033", "label": "Matius 5:24"},
+        ])
+        fades = self.slverse.overlay_fade_outs("INI", 40, 5, [23, 24], 515.047, 568.033, self.config())
+        self.assertEqual(fades, [])
+
+    def test_transition_at_or_above_the_floor_still_animates(self) -> None:
+        self._stub_index("40_5", [
+            {"verseNumber": 23, "startTime": "00:08:35.047", "duration": "00:00:28.395", "endTransitionDuration": "00:00:00.500", "label": "Matius 5:23"},
+            {"verseNumber": 24, "startTime": "00:09:03.442", "duration": "00:00:24.591", "endTransitionDuration": "00:00:00.000", "label": "Matius 5:24"},
+        ])
+        fades = self.slverse.overlay_fade_outs("INI", 40, 5, [23, 24], 515.047, 568.033, self.config())
+        self.assertEqual(len(fades), 1)
+
 
 class SlverseVerseReferenceWindowsTest(unittest.TestCase):
     """The bug this backs: `ffv ini Mt 5:23, 24 -fi` showed "Matthew 5:23-24"
@@ -1390,6 +1442,50 @@ class SlverseVerseReferenceWindowsTest(unittest.TestCase):
         ])
         windows = self.slverse.verse_reference_windows("ASL", 19, 16, [11], 0.0, 33.8)
         self.assertEqual(windows, [(11, 0.0, 33.8)])
+
+
+class SlverseRemapVerseWindowsTest(unittest.TestCase):
+    """remap_verse_windows/remap_through_timeline: a verse's drawtext window
+    has to move exactly the way its embedded chapter marker does (see
+    add_verse_chapters, which shares the same walk) - --slow/--fast's
+    speed scaling included. There is never a combined reference range in
+    the source, or in old ffv, so --slow/--fast must retime the per-verse
+    switch along with everything else, not fall back to a static label."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_identity_timeline_leaves_windows_untouched(self) -> None:
+        # trim_mid_transitions off (default) / no retiming: chapter_timeline
+        # is just the one full-duration segment at scale 1.0 - a no-op.
+        windows = [("23", 0.0, 12.0), ("24", 12.0, 20.0)]
+        timeline = [(0.0, 20.0, 1.0)]
+        self.assertEqual(self.slverse.remap_verse_windows(windows, timeline), windows)
+
+    def test_dropped_mid_transition_shifts_the_later_verse_back(self) -> None:
+        # trim_mid_transitions cut out [12, 13) (a paragraph transition) -
+        # verse 24 (originally 13-20) must start its on-screen reference at
+        # the jump-cut point (12), not still wait until the pre-cut 13.
+        windows = [("23", 0.0, 12.0), ("24", 13.0, 20.0)]
+        timeline = [(0.0, 12.0, 1.0), (13.0, 20.0, 1.0)]
+        self.assertEqual(
+            self.slverse.remap_verse_windows(windows, timeline),
+            [("23", 0.0, 12.0), ("24", 12.0, 19.0)],
+        )
+
+    def test_slow_boundary_mid_verse_splits_that_verse_into_two_windows(self) -> None:
+        # --slow with a boundary at t=15 (mid verse 24, which runs 12-20)
+        # halves speed from there on: verse 24 keeps showing across the
+        # retimed portion too, just as two back-to-back enable windows
+        # instead of one (build_overlay_filter draws the same text for
+        # both, so on screen it's one continuous, uninterrupted label).
+        windows = [("23", 0.0, 12.0), ("24", 12.0, 20.0)]
+        timeline = [(0.0, 15.0, 1.0), (15.0, 20.0, 2.0)]
+        self.assertEqual(
+            self.slverse.remap_verse_windows(windows, timeline),
+            [("23", 0.0, 12.0), ("24", 12.0, 15.0), ("24", 15.0, 25.0)],
+        )
 
 
 class SlverseBuildOverlayFilterMultiVerseTest(unittest.TestCase):
@@ -1718,6 +1814,15 @@ class SlverseResolveKeptSegmentsTest(unittest.TestCase):
         chapters_meta = {8: {"end": 70.0, "end_transition": 2.0}, 9: {"end": 78.0, "end_transition": 0.0}}
         segments = self.slverse.resolve_kept_segments(chapters_meta, [8, 9], 60.0, 78.0, trim_mid=True)
         self.assertEqual(segments, [(0.0, 8.0), (10.0, 18.0)])
+
+    def test_min_transition_floor_ignores_sub_floor_padding(self) -> None:
+        # A 0.033s end_transition (JW's routine per-verse padding, not a
+        # real paragraph boundary) must not be treated as a cut once a
+        # min_transition floor is passed - see resolve_verse_window's own
+        # min_transition_duration-derived call.
+        chapters_meta = {8: {"end": 70.0, "end_transition": 0.033}, 9: {"end": 78.0, "end_transition": 0.0}}
+        segments = self.slverse.resolve_kept_segments(chapters_meta, [8, 9], 60.0, 78.0, trim_mid=True, min_transition=0.5)
+        self.assertEqual(segments, [(0.0, 18.0)])
 
     def test_cuts_multiple_mid_range_boundaries(self) -> None:
         chapters_meta = {

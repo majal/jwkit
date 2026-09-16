@@ -144,6 +144,7 @@ DEFAULT_CONFIG = {
     "default_target_lang": "FSL",  # requesting this SL skips delogo/drawtext entirely - its own burned-in caption is already correct
     "trim_end_transition": "true",  # exclude JW's own trailing fade-out/copyright-endscreen transition (endTransitionDuration in the verse marker metadata - confirmed empirically to cover exactly the fade-to-black + JW.org copyright card after a chapter's/paragraph's last verse) from the very end of the extracted window - the right default for a cut that ends there. false (or --keep-end-transition for one run) restores the old behavior of extracting through the full marker duration, transition included. Only ever touches the LAST selected verse - see trim_mid_transitions for transitions in the middle of a multi-verse range.
     "trim_mid_transitions": "false",  # a verse range spanning multiple paragraphs plays through any mid-range paragraph transition untouched by default (it's one continuous scene, not something to cut) - set true (or --trim-mid-transitions for one run) to also cut those out, jump-cutting straight from one paragraph's last kept frame to the next paragraph's first. Never touches the range's own trailing transition - that's trim_end_transition's job. Not supported together with --slow/--fast; that combination keeps mid-range transitions.
+    "min_transition_duration": "0.5",  # endTransitionDuration below this (seconds) is treated as no transition at all, not a real fade - JW tags EVERY verse marker with a small nonzero endTransitionDuration (empirically clustered under 0.3s across a real INI index: 0.000-0.300s) as routine frame-boundary padding, distinct from an actual paragraph/chapter fade (empirically clustered at 1.0s+, up to 3.6s at a chapter end) - there is a clean gap between the two clusters, nothing observed in between. Without this floor, overlay_fade_outs would try to animate a down/hold/up dip inside a window shorter than a single video frame, producing a one-frame flash where the verse-reference overlay (and, since it shares the same alpha expression, the small source-SL label) vanishes for no visible reason - and trim_end_transition would shave that same sub-frame padding off the very end of an ordinary (non-paragraph-ending) verse for no reason either. Raise it if a real short fade you want animated is being swallowed, or lower it if a real transition this short turns out to exist in some language's markers.
     "sign_lang_ref_language": "ASL=en,FSL=en,BVL=es,SPE=es,INI=id",  # spoken/verse-reference language each sign language's burned-in caption is actually written in, e.g. "KEY=VAL,KEY2=VAL2" - NOT derivable from the ISO sign-language code in jwlangs.json (e.g. ASL's is "ase"), so this is a small editable table instead. When source and target share a reference language (e.g. ASL->FSL, both en), delogo/drawtext for the verse reference itself is skipped - only show_source_lang_label's small label still applies. Add an entry for any other language you use; an unlisted language is treated as never matching (falls back to the full overlay).
     "show_source_lang_label": "true",  # the small "which SL this clip came from" label under the verse reference - independent of overlay_source_label_alpha, which only controls its opacity when shown
     "mpv_show_osc": "true",  # mpv's on-screen controller/overlay that pops up on mouse movement, for every mpv window slverse opens (--play, find --play) - slverse always passes --no-config to mpv for reproducibility, so a personal mpv.conf that disables this doesn't apply here; set false to match a "nothing shows on hover" setup. Per-user preference, not something to default off for everyone.
@@ -194,7 +195,7 @@ def validate_config_value(key, value):
             return f"{key} must be at least 1"
         if key == "caption_detection_samples" and int(value) > 9:
             return f"{key} must be at most 9"
-        if key in ("interpolation_target_fps", "auto_sync_interval_hours", "download_retry_backoff") and float(value) < 0:
+        if key in ("interpolation_target_fps", "auto_sync_interval_hours", "download_retry_backoff", "min_transition_duration") and float(value) < 0:
             return f"{key} must be non-negative"
     except ValueError:
         return f"{key} has an invalid numeric value {value!r}"
@@ -250,6 +251,7 @@ CONFIG_HELP = {
     "default_target_lang": "Requesting this SL skips the overlay entirely - its own caption is already correct",
     "trim_end_transition": "Exclude JW's trailing fade-out/copyright-endscreen transition from extracted verses",
     "trim_mid_transitions": "Also cut mid-range paragraph transitions inside a multi-verse range (off by default - continuous play)",
+    "min_transition_duration": "Seconds below which endTransitionDuration is routine per-verse padding, not a real fade to animate/trim (default 0.5)",
     "sign_lang_ref_language": "SL-code=spoken-language table (e.g. ASL=en,BVL=es) - skips the reference swap when source/target already share one",
     "show_source_lang_label": "Show the small 'which SL this came from' label",
     "mpv_show_osc": "Show mpv's on-screen controller on mouse movement, for mpv windows slverse opens",
@@ -1250,18 +1252,46 @@ def output_metadata_args(book_name, chapter, verses, lang, source_url, checksum,
             "-metadata", "encoder=jwkit slverse", "-metadata", f"comment=Source: {source_url}",
             "-metadata", f"source_checksum={checksum or ''}", "-metadata", f"editing={edit_note}"]
 
+def remap_through_timeline(source_start, source_end, timeline_segments):
+    """Map a single [source_start, source_end) span - in this window's
+    pre-retime, zeroed-to-0 timeline - through timeline_segments
+    ((segment_start, segment_end, scale) triples covering the full
+    duration, from extract_one_lang's chapter_timeline) into the actual
+    output timeline: --slow/--fast's per-section speed scaling and
+    trim_mid_transitions' dropped segments both apply here exactly as
+    they do to embedded chapter markers (see add_verse_chapters, the
+    original home of this walk) - now shared with verse_reference_windows'
+    per-verse drawtext windows (see remap_verse_windows) so a verse's
+    on-screen reference and its chapter marker always agree. Returns a
+    list of (out_start, out_end) - normally one entry, but more than one
+    if the span straddles a segment boundary (a verse split by a dropped
+    mid-transition, or by a --slow/--fast retime boundary)."""
+    ranges = []
+    output_cursor = 0.0
+    for segment_start, segment_end, scale in timeline_segments:
+        clip_start, clip_end = max(source_start, segment_start), min(source_end, segment_end)
+        if clip_end > clip_start:
+            ranges.append((output_cursor + (clip_start - segment_start) * scale, output_cursor + (clip_end - segment_start) * scale))
+        output_cursor += (segment_end - segment_start) * scale
+    return ranges
+
+def remap_verse_windows(verse_windows, timeline_segments):
+    """verse_reference_windows' (label, source_start, source_end) triples,
+    remapped through timeline_segments into the timeline actually written
+    to disk - see remap_through_timeline."""
+    return [
+        (label, out_start, out_end)
+        for label, source_start, source_end in verse_windows
+        for out_start, out_end in remap_through_timeline(source_start, source_end, timeline_segments)
+    ]
+
 def add_verse_chapters(output_file, chapters_meta, verses, start_time, end_time, book_name, chapter, timeline_segments):
     """Attach seekable MP4 chapters from JW's verse markers without re-encoding."""
-    chapter_rows = []
-    for verse in verses:
-        row = chapters_meta[verse]
-        source_start, source_end = row["start"] - start_time, row["end"] - start_time
-        output_cursor = 0.0
-        for segment_start, segment_end, scale in timeline_segments:
-            chapter_start, chapter_end = max(source_start, segment_start), min(source_end, segment_end)
-            if chapter_end > chapter_start:
-                chapter_rows.append((output_cursor + (chapter_start - segment_start) * scale, output_cursor + (chapter_end - segment_start) * scale, f"{book_name} {chapter}:{verse}"))
-            output_cursor += (segment_end - segment_start) * scale
+    chapter_rows = [
+        (out_start, out_end, f"{book_name} {chapter}:{verse}")
+        for verse in verses
+        for out_start, out_end in remap_through_timeline(chapters_meta[verse]["start"] - start_time, chapters_meta[verse]["end"] - start_time, timeline_segments)
+    ]
     if not chapter_rows:
         return
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1913,15 +1943,18 @@ def has_audio_stream(source):
         return False
     return bool(result.stdout.strip())
 
-def resolve_kept_segments(chapters_meta, valid_verses, start, end, trim_mid):
+def resolve_kept_segments(chapters_meta, valid_verses, start, end, trim_mid, min_transition=0.0):
     """[(seg_start, seg_end), ...] in seconds relative to the window's own
     start (0) - everything to actually keep. [(0, end-start)] (the whole
     window, one segment) unless trim_mid is true AND a verse other than the
-    last selected one has its own nonzero end_transition (a paragraph
-    boundary in the middle of the range, not the range's own trailing one -
-    see trim_end_transition for that). Only verses before the last are
-    considered: the last verse's own transition is trim_end_transition's
-    call, made separately by the caller before `end` ever reaches here."""
+    last selected one has its own end_transition of at least
+    min_transition_duration (a real paragraph boundary in the middle of the
+    range, not the range's own trailing one - see trim_end_transition for
+    that, or overlay_fade_outs for why a shorter endTransitionDuration is
+    routine per-verse padding rather than something worth cutting on). Only
+    verses before the last are considered: the last verse's own transition
+    is trim_end_transition's call, made separately by the caller before
+    `end` ever reaches here."""
     duration = end - start
     if not trim_mid or len(valid_verses) < 2:
         return [(0.0, duration)]
@@ -1929,7 +1962,7 @@ def resolve_kept_segments(chapters_meta, valid_verses, start, end, trim_mid):
     drops = []
     for v in valid_verses[:-1]:
         et = chapters_meta[v].get("end_transition", 0)
-        if et > 0:
+        if et >= min_transition and et > 0:
             drop_end = chapters_meta[v]["end"] - start
             drop_start = drop_end - et
             if 0 < drop_start < drop_end <= duration:
@@ -2743,12 +2776,13 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
 
     start = chapters_meta[valid_verses[0]]["start"]
     end = chapters_meta[valid_verses[-1]]["end"]
+    min_transition = float(config.get("min_transition_duration", DEFAULT_CONFIG["min_transition_duration"]))
     should_trim_transition = str(config.get("trim_end_transition", DEFAULT_CONFIG["trim_end_transition"])).strip().lower() != "false"
     if keep_end_transition:
         should_trim_transition = False
     if should_trim_transition:
         end_transition = chapters_meta[valid_verses[-1]].get("end_transition", 0)
-        if end_transition > 0 and end - end_transition > start:
+        if end_transition >= min_transition and end - end_transition > start:
             end -= end_transition
 
     if clip_window:
@@ -2761,7 +2795,7 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
     trim_mid = str(config.get("trim_mid_transitions", DEFAULT_CONFIG["trim_mid_transitions"])).strip().lower() == "true"
     if trim_mid_transitions is not None:
         trim_mid = trim_mid_transitions
-    kept_segments = resolve_kept_segments(chapters_meta, valid_verses, start, end, trim_mid)
+    kept_segments = resolve_kept_segments(chapters_meta, valid_verses, start, end, trim_mid, min_transition)
 
     source_labels = [chapters_meta[v]["label"] for v in valid_verses if chapters_meta[v].get("label")]
     return start, end, entry["url"], entry.get("checksum"), valid_verses, source_labels, kept_segments
@@ -2772,15 +2806,27 @@ def overlay_fade_outs(lang, book_num, chapter, valid_verses, start, end, config,
     source_timeline). is_final marks the extracted range's own trailing
     transition (fading to JW's copyright endscreen, only present at all when
     it's being kept rather than trimmed) - see fading_alpha for why that one
-    gets a different envelope than a mid-range verse-to-verse transition."""
+    gets a different envelope than a mid-range verse-to-verse transition.
+
+    A transition shorter than min_transition_duration is skipped entirely
+    (treated as a plain hard cut, full alpha throughout) rather than
+    animated: JW tags essentially every verse marker with a small nonzero
+    endTransitionDuration as routine frame-boundary padding, not an actual
+    fade - see min_transition_duration's own DEFAULT_CONFIG comment for the
+    empirical cluster gap this floor sits in. Animating one of those anyway
+    would try to fit a down/hold/up dip inside a window shorter than a
+    single video frame, which reads as a one-frame flash where the overlay
+    (and, since it shares this same alpha expression, the small
+    source-SL label) vanishes for no visible reason."""
     meta = markers_to_verse_times(load_index(lang).get(f"{book_num}_{chapter}", {}).get("markers", []))
     trim_end = str(config.get("trim_end_transition", DEFAULT_CONFIG["trim_end_transition"])).strip().lower() != "false" and not keep_end_transition
     trim_mid = str(config.get("trim_mid_transitions", DEFAULT_CONFIG["trim_mid_transitions"])).strip().lower() == "true" if trim_mid_transitions is None else trim_mid_transitions
+    min_transition = float(config.get("min_transition_duration", DEFAULT_CONFIG["min_transition_duration"]))
     fades = []
     for v in valid_verses:
         is_final = v == valid_verses[-1]
         transition = meta.get(v, {}).get("end_transition", 0)
-        if not transition or (is_final and trim_end) or (not is_final and trim_mid):
+        if transition < min_transition or (is_final and trim_end) or (not is_final and trim_mid):
             continue
         fade_end = meta[v]["end"]
         fade_start = fade_end - transition
@@ -3002,6 +3048,12 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             chapter_timeline.append((seg_start, seg_end, 1 / speed if retimed else 1.0))
     else:
         chapter_timeline = [(seg_start, seg_end, 1.0) for seg_start, seg_end in kept_segments]
+    # Same remap chapter_timeline already gets for embedded chapter markers
+    # (add_verse_chapters below) - a verse's on-screen reference has to
+    # switch at the same instant its chapter marker does, whether that's
+    # shifted by a dropped mid-transition or stretched/compressed by
+    # --slow/--fast.
+    output_verse_windows = remap_verse_windows(verse_windows, chapter_timeline)
 
     if args.onthefly:
         extract_mode = "onthefly"
@@ -3017,9 +3069,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
 
     if extract_mode == "onthefly":
         if mode:
-            extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, [(verses_str, 0.0, end_time - start_time)], lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
+            extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, output_verse_windows, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
         else:
-            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verse_windows, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
+            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, output_verse_windows, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
     else:
         # 'segment' fetches just this verse window on a miss; 'cache'
         # additionally pulls the whole chapter on a miss. Either way,
@@ -3037,9 +3089,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             print(f"[{lang}] Source: {url}")
         with cache_in_use(cached_artifact) if cached_artifact else contextlib.nullcontext():
             if mode:
-                extract_verse_sections(local_path, out_filename, local_start, local_end, book_name, chapter, [(verses_str, 0.0, local_end - local_start)], lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
+                extract_verse_sections(local_path, out_filename, local_start, local_end, book_name, chapter, output_verse_windows, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
             else:
-                extract_verse(local_path, out_filename, local_start, local_end, book_name, chapter, verse_windows, lang, config, remote=cached_artifact is None, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
+                extract_verse(local_path, out_filename, local_start, local_end, book_name, chapter, output_verse_windows, lang, config, remote=cached_artifact is None, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
 
         if cached_artifact and config.get("cache_policy") == "delete_after_use":
             cached_artifact.unlink(missing_ok=True)
