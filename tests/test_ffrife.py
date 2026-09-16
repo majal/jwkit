@@ -704,6 +704,68 @@ class FfrifeLongRunTest(unittest.TestCase):
                 self.ffrife._render_rife_chunks("rife", incoming, outgoing, 25, "model", config, root / "state.json")
             self.assertEqual(calls, first_calls)
 
+    def test_run_rife_chunk_retries_a_transient_crash_and_succeeds(self) -> None:
+        # rife-ncnn-vulkan is known to segfault intermittently mid-run on
+        # some GPU backends - a chunk that fails once should still complete
+        # via a fresh retry rather than aborting the whole job.
+        attempts = []
+        with tempfile.TemporaryDirectory() as td:
+            chunk_out = Path(td) / "out"
+            chunk_out.mkdir()
+
+            def fake_run(rife_path, in_frames, out_frames, target_count, **_kwargs):
+                attempts.append(target_count)
+                if len(attempts) == 1:
+                    (Path(out_frames) / "partial.png").write_bytes(b"png")
+                    raise self.ffrife.subprocess.CalledProcessError(-11, [rife_path])
+                for index in range(target_count):
+                    (Path(out_frames) / f"{index:08d}.png").write_bytes(b"png")
+
+            with patch.object(self.ffrife, "run_rife", fake_run), patch.object(self.ffrife.time, "sleep") as sleep:
+                self.ffrife.run_rife_chunk("rife", Path(td) / "in", chunk_out, 5, "model",
+                                           "1:1:1", "auto", label="RIFE chunk 1/1")
+            self.assertEqual(len(attempts), 2)
+            sleep.assert_called_once()
+            # The crashed attempt's partial output must not survive into the
+            # successful retry's frame count.
+            self.assertEqual(len(list(chunk_out.glob("*.png"))), 5)
+
+    def test_run_rife_chunk_raises_after_exhausting_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            chunk_out = Path(td) / "out"
+            chunk_out.mkdir()
+
+            def always_crashes(rife_path, in_frames, out_frames, target_count, **_kwargs):
+                raise self.ffrife.subprocess.CalledProcessError(-11, [rife_path])
+
+            with patch.object(self.ffrife, "run_rife", always_crashes), \
+                 patch.object(self.ffrife.time, "sleep"):
+                with self.assertRaises(self.ffrife.subprocess.CalledProcessError):
+                    self.ffrife.run_rife_chunk("rife", Path(td) / "in", chunk_out, 5, "model",
+                                               "1:1:1", "auto", label="RIFE chunk 1/1")
+
+    def test_chunk_loop_recovers_from_one_transient_rife_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            incoming, outgoing = root / "in", root / "out"
+            incoming.mkdir()
+            for index in range(8):
+                (incoming / f"{index:08d}.png").write_bytes(b"png")
+
+            calls = []
+
+            def flaky_run(_binary, _input, output, target_count, **_kwargs):
+                calls.append(target_count)
+                if len(calls) == 2:  # second chunk crashes once, then succeeds on retry
+                    raise self.ffrife.subprocess.CalledProcessError(-11, ["rife"])
+                for index in range(target_count):
+                    (Path(output) / f"{index:08d}.png").write_bytes(b"png")
+
+            config = {"chunk_frames": "4", "cooldown_seconds": "0", "rife_threads": "1:1:1", "rife_gpu": "auto"}
+            with patch.object(self.ffrife, "run_rife", flaky_run), patch.object(self.ffrife.time, "sleep"):
+                self.ffrife._render_rife_chunks("rife", incoming, outgoing, 20, "model", config, root / "state.json")
+            self.assertEqual(len(list(outgoing.glob("*.png"))), 20)
+
     def test_render_rife_frames_reuses_complete_extraction_on_resume(self) -> None:
         config = {"rife_binary_path": "/fake/rife", "chunk_frames": "0",
                   "scene_detection": "false"}

@@ -99,6 +99,8 @@ Profiles are only presets. Override workers, chunk size, and pauses independentl
 ./ffrife input.mp4 -o output.mp4 --profile balanced -j 1:1:1 -c 600 --cooldown 30
 ```
 
+A chunk that crashes outright (the upstream `rife-ncnn-vulkan`/`rife-ncnn-vulkan.exe` binary itself dying, e.g. a SIGSEGV from a flaky Vulkan/Metal driver) is retried in place, up to 3 attempts, before giving up on the whole run - most transient crashes are gone by the second attempt, so a single flaky invocation no longer costs the rest of an otherwise-successful chunked job.
+
 Interrupted runs resume automatically when the same input, output, and interpolation options are used. To opt out for one run:
 
 ```bash
