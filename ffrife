@@ -599,6 +599,29 @@ def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, sl
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, [rife_path])
 
+def run_rife_chunk(rife_path, chunk_in, chunk_out, chunk_target, model_path, threads, gpu, label):
+    """run_rife wrapper for the per-chunk loops in _render_rife_chunks:
+    retries a chunk from scratch if the upstream rife-ncnn-vulkan binary
+    itself crashes (observed in the wild as an intermittent SIGSEGV on
+    Apple Silicon's Vulkan/Metal backend several chunks into an otherwise
+    identical run, not tied to any particular chunk's content) instead of
+    losing the whole multi-hour job to one flaky invocation of a chunk
+    that's trivially re-runnable. A deterministic failure (bad args, a
+    frame the binary can never process) still surfaces after MAX_ATTEMPTS,
+    same as before this wrapper existed."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            run_rife(rife_path, chunk_in, chunk_out, chunk_target, model_path=model_path,
+                     threads=threads, gpu=gpu)
+            return
+        except subprocess.CalledProcessError as exc:
+            if attempt == MAX_ATTEMPTS:
+                raise
+            print(f"{label} crashed ({exc}); retrying (attempt {attempt + 1}/{MAX_ATTEMPTS})...")
+            shutil.rmtree(chunk_out, ignore_errors=True)
+            Path(chunk_out).mkdir(parents=True, exist_ok=True)
+            time.sleep(RETRY_BACKOFF ** attempt)
+
 # --- Retiming (slow-motion/fast-forward) ---
 def parse_speed(value):
     """Accepts whatever notation is most natural to type: a plain decimal
@@ -1927,8 +1950,9 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
             last_interval = round((end - 1) * target_intervals / total_intervals)
             chunk_target = max(2, last_interval - first_interval + 1)
             print(f"RIFE chunk {index + 1}/{len(ranges)} ({end - start} source frames)...")
-            run_rife(rife_path, chunk_in, chunk_out, chunk_target, model_path=model_path,
-                     threads=config.get("rife_threads"), gpu=config.get("rife_gpu"))
+            run_rife_chunk(rife_path, chunk_in, chunk_out, chunk_target, model_path,
+                           config.get("rife_threads"), config.get("rife_gpu"),
+                           label=f"RIFE chunk {index + 1}/{len(ranges)}")
             _write_json_atomic(marker, {"target_count": chunk_target})
             completed.add(chunk_key)
             _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int)})
@@ -2021,8 +2045,9 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         last_interval = round((end - 1) * target_intervals / total_intervals)
         chunk_target = max(2, last_interval - first_interval + 1)
         print(f"RIFE chunk {index + 1}/{len(ranges)} ({end - start} source frames)...")
-        run_rife(rife_path, chunk_in, chunk_out, chunk_target, model_path=model_path,
-                 threads=config.get("rife_threads"), gpu=config.get("rife_gpu"))
+        run_rife_chunk(rife_path, chunk_in, chunk_out, chunk_target, model_path,
+                       config.get("rife_threads"), config.get("rife_gpu"),
+                       label=f"RIFE chunk {index + 1}/{len(ranges)}")
         if cuts:
             # Before chunk_in goes away, not after: under windowed
             # extraction those frames ARE the only copy of this chunk's
@@ -2978,7 +3003,13 @@ def main():
         if output is None:
             sys.exit(1)
 
-        ok = interpolate(args.input, output, config, start=start, end=end, vf=args.vf, fps=args.fps, speed=args.speed)
+        try:
+            ok = interpolate(args.input, output, config, start=start, end=end, vf=args.vf, fps=args.fps, speed=args.speed)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(f"Failed: {exc}", file=sys.stderr)
+            sys.exit(1)
         sys.exit(0 if ok else 1)
     elif args.command in ("batch", "bulk"):
         apply_run_overrides(args, config)
