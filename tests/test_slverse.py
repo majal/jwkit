@@ -1173,18 +1173,18 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         # The whole point of default_target_lang: requesting the SL whose
         # own burned-in caption is already correct should cut clean, not
         # draw a second caption on top of the first.
-        result = self.slverse.build_overlay_filter("FSL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
+        result = self.slverse.build_overlay_filter("FSL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=False)
         self.assertIsNone(result)
 
     def test_target_lang_match_is_case_insensitive(self) -> None:
-        result = self.slverse.build_overlay_filter("fsl", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
+        result = self.slverse.build_overlay_filter("fsl", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=False)
         self.assertIsNone(result)
 
     def test_builds_overlay_for_non_target_lang(self) -> None:
         # BVL (es) -> FSL (en): different reference languages, so the full
         # delogo+drawtext still applies - unlike ASL->FSL below, which now
         # share "en" and skip the reference swap (see sign_lang_ref_language).
-        result = self.slverse.build_overlay_filter("BVL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
+        result = self.slverse.build_overlay_filter("BVL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=False)
         self.assertIsNotNone(result)
         self.assertIn("delogo=", result)
         self.assertIn("drawtext=", result)
@@ -1192,25 +1192,25 @@ class SlverseOverlayFilterTest(unittest.TestCase):
 
     def test_show_box_true_uses_delogo_show_1(self) -> None:
         # Preview mode: draw the box, don't actually blur anything.
-        result = self.slverse.build_overlay_filter("BVL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=True)
+        result = self.slverse.build_overlay_filter("BVL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=True)
         self.assertIn("show=1", result)
 
     def test_source_lang_label_included(self) -> None:
-        result = self.slverse.build_overlay_filter("bvl", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
+        result = self.slverse.build_overlay_filter("bvl", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=False)
         self.assertIn("text='BVL'", result)
 
     def test_skips_reference_when_ref_languages_match(self) -> None:
         # ASL and FSL are different sign languages but both caption in
         # English (sign_lang_ref_language default), so the verse-reference
         # swap itself is unnecessary - only the small source-SL label draws.
-        result = self.slverse.build_overlay_filter("ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False)
+        result = self.slverse.build_overlay_filter("ASL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=False)
         self.assertIsNotNone(result)
         self.assertNotIn("delogo=", result)
         self.assertIn("text='ASL'", result)
 
     def test_skips_reference_and_label_returns_none(self) -> None:
         result = self.slverse.build_overlay_filter(
-            "ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL", show_source_lang_label="false"), show_box=False,
+            "ASL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL", show_source_lang_label="false"), show_box=False,
         )
         self.assertIsNone(result)
 
@@ -1219,7 +1219,7 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         # proven to share a reference language with the target, so it gets
         # the full (safe) overlay rather than being assumed to match.
         result = self.slverse.build_overlay_filter(
-            "XSL", "Psalm", 16, "11", self.config(default_target_lang="FSL", sign_lang_ref_language="FSL=en"), show_box=False,
+            "XSL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL", sign_lang_ref_language="FSL=en"), show_box=False,
         )
         self.assertIn("delogo=", result)
 
@@ -1236,7 +1236,7 @@ class SlverseOverlayFilterTest(unittest.TestCase):
 
         self.slverse.measure_text_size = fake_measure
         result = self.slverse.build_overlay_filter(
-            "INI", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False,
+            "INI", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=False,
             source_labels=["Mazmur 16:11"],
         )
         self.assertIn("Mazmur 16:11", seen)
@@ -1245,7 +1245,7 @@ class SlverseOverlayFilterTest(unittest.TestCase):
 
     def test_exact_source_caption_automatically_skips_reference_replacement(self) -> None:
         result = self.slverse.build_overlay_filter(
-            "XSL", "Psalm", 16, "11",
+            "XSL", "Psalm", 16, [("11", 0.0, 1.0)],
             self.config(default_target_lang="FSL", sign_lang_ref_language="", show_source_lang_label="true"),
             show_box=False, source_labels=["  PSALM 16:11  "],
         )
@@ -1254,7 +1254,7 @@ class SlverseOverlayFilterTest(unittest.TestCase):
 
     def test_confident_pixel_box_replaces_proxy_dimensions(self) -> None:
         result = self.slverse.build_overlay_filter(
-            "BVL", "Psalm", 16, "11", self.config(default_target_lang="FSL"),
+            "BVL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"),
             show_box=False, source_labels=["Salmos 16:11"], detected_caption_box=(100, 57, 200, 24),
         )
         self.assertIn("delogo=x=98:y=55:w=204:h=28", result)
@@ -1276,11 +1276,11 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         # font-metric estimate) should differ, not the label's own spacing.
         config = self.config(default_target_lang="FSL", sign_lang_ref_language="", show_source_lang_label="true")
         without_detection = self.slverse.build_overlay_filter(
-            "XSL", "Psalm", 16, "11", config, show_box=False, source_labels=["  PSALM 16:11  "],
+            "XSL", "Psalm", 16, [("11", 0.0, 1.0)], config, show_box=False, source_labels=["  PSALM 16:11  "],
         )
         overlay_y = int(config["overlay_y"])
         with_detection = self.slverse.build_overlay_filter(
-            "XSL", "Psalm", 16, "11", config, show_box=False, source_labels=["  PSALM 16:11  "],
+            "XSL", "Psalm", 16, [("11", 0.0, 1.0)], config, show_box=False, source_labels=["  PSALM 16:11  "],
             detected_caption_box=(int(config["overlay_x"]), overlay_y, 200, 24),
         )
         label_y_without = re.search(r"drawtext=text='XSL'.*?:y=(\d+):", without_detection).group(1)
@@ -1295,7 +1295,7 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         # follow that same down/hold/up shape, not fade out and then snap
         # straight back to full opacity.
         result = self.slverse.build_overlay_filter(
-            "ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False,
+            "ASL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=False,
             fade_outs=[(10.0, 13.0, False)],
         )
         self.assertIn("if(between(t\\,10.000\\,13.000)", result)
@@ -1307,7 +1307,7 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         # --keep-end-transition / trim_end_transition=false) has nothing to
         # recover into - the clip just ends - so it stays a plain fade-out.
         result = self.slverse.build_overlay_filter(
-            "ASL", "Psalm", 16, "11", self.config(default_target_lang="FSL"), show_box=False,
+            "ASL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=False,
             fade_outs=[(10.0, 13.0, True)],
         )
         self.assertIn("if(between(t\\,10.000\\,13.000)", result)
@@ -1350,6 +1350,88 @@ class SlverseOverlayFadeOutsTest(unittest.TestCase):
         )
         self.assertEqual(len(fades), 1)
         self.assertTrue(fades[0][2])
+
+
+class SlverseVerseReferenceWindowsTest(unittest.TestCase):
+    """The bug this backs: `ffv ini Mt 5:23, 24 -fi` showed "Matthew 5:23-24"
+    for the whole clip instead of switching to "5:24" when verse 24 starts
+    (old ffv's per-verse generate_filters() behavior) - see
+    build_overlay_filter's per-window drawtext loop."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def _stub_index(self, key, markers) -> None:
+        self.slverse.load_index = lambda lang: {key: {"markers": markers}}
+
+    def test_two_verses_split_at_the_correct_boundary(self) -> None:
+        self._stub_index("40_5", [
+            {"verseNumber": 23, "startTime": "00:00:00.000", "duration": "00:00:12.000", "label": "Matthew 5:23"},
+            {"verseNumber": 24, "startTime": "00:00:12.000", "duration": "00:00:08.000", "label": "Matthew 5:24"},
+        ])
+        windows = self.slverse.verse_reference_windows("INI", 40, 5, [23, 24], 0.0, 20.0)
+        self.assertEqual(windows, [(23, 0.0, 12.0), (24, 12.0, 20.0)])
+
+    def test_clips_to_the_extraction_window(self) -> None:
+        # A trimmed end transition shortens `end` below the verse's own
+        # marker end - the window must follow the actual extracted range,
+        # not the full untrimmed verse.
+        self._stub_index("40_5", [
+            {"verseNumber": 23, "startTime": "00:00:00.000", "duration": "00:00:12.000", "label": "Matthew 5:23"},
+            {"verseNumber": 24, "startTime": "00:00:12.000", "duration": "00:00:08.000", "label": "Matthew 5:24"},
+        ])
+        windows = self.slverse.verse_reference_windows("INI", 40, 5, [23, 24], 0.0, 18.0)
+        self.assertEqual(windows, [(23, 0.0, 12.0), (24, 12.0, 18.0)])
+
+    def test_single_verse_spans_the_whole_window(self) -> None:
+        self._stub_index("19_16", [
+            {"verseNumber": 11, "startTime": "00:00:00.000", "duration": "00:00:33.800", "label": "Psalm 16:11"},
+        ])
+        windows = self.slverse.verse_reference_windows("ASL", 19, 16, [11], 0.0, 33.8)
+        self.assertEqual(windows, [(11, 0.0, 33.8)])
+
+
+class SlverseBuildOverlayFilterMultiVerseTest(unittest.TestCase):
+    """build_overlay_filter's per-window drawtext switching (see
+    SlverseVerseReferenceWindowsTest above for where the windows come from)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def setUp(self) -> None:
+        self.slverse.resolve_font_paths = lambda config: (None, None)
+        self.slverse.measure_text_size = lambda text, font_path, fontsize: (100, 30)
+
+    def config(self, **overrides):
+        cfg = dict(self.slverse.DEFAULT_CONFIG)
+        cfg.update(overrides)
+        return cfg
+
+    def test_each_verse_gets_its_own_gated_drawtext(self) -> None:
+        windows = [(23, 0.0, 12.0), (24, 12.0, 20.0)]
+        result = self.slverse.build_overlay_filter(
+            "BVL", "Matthew", 5, windows, self.config(default_target_lang="FSL"), show_box=False,
+        )
+        self.assertIn(r"drawtext=text='Matthew 5\:23'", result)
+        self.assertIn(r"drawtext=text='Matthew 5\:24'", result)
+        self.assertIn("enable='between(t\\,0.000\\,12.000)'", result)
+        self.assertIn("enable='between(t\\,12.000\\,20.000)'", result)
+        # Exactly one delogo covering the whole clip - the blurred region
+        # itself doesn't move between verses, only the text drawn over it.
+        self.assertEqual(result.count("delogo="), 1)
+
+    def test_single_window_has_no_enable_gate(self) -> None:
+        # A single-verse clip's drawtext must stay always-on (no enable=) -
+        # matching the pre-fix behavior exactly rather than adding a
+        # needless (and harmless, but noisy) enable clause.
+        windows = [("11", 0.0, 33.8)]
+        result = self.slverse.build_overlay_filter(
+            "BVL", "Psalm", 16, windows, self.config(default_target_lang="FSL"), show_box=False,
+        )
+        self.assertIn(r"drawtext=text='Psalm 16\:11'", result)
+        self.assertNotIn("enable=", result)
 
 
 class SlverseExtractPreviewTest(unittest.TestCase):
@@ -1850,7 +1932,7 @@ class SlverseExtractVerseInpaintTest(unittest.TestCase):
 
     def extract(self, **config_overrides):
         self.slverse.extract_verse(
-            "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL",
+            "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL",
             self.config(**config_overrides),
         )
 
@@ -1993,7 +2075,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         config = {"interpolate": "false", "interpolation_engine": "rife"}
 
         self.slverse.extract_verse_sections(
-            "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
+            "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", config,
             "fast", [3.0, 6.0], 3,
         )
 
@@ -2010,7 +2092,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         config = {"interpolate": "false", "interpolation_engine": "rife", "smooth_slow_motion": "false"}
 
         self.slverse.extract_verse_sections(
-            "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
+            "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", config,
             "slow", [5.0], 0.5,
         )
 
@@ -2025,7 +2107,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         config = {"interpolate": "false", "interpolation_engine": "rife"}
 
         self.slverse.extract_verse_sections(
-            "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
+            "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", config,
             "fast", [5.0], 3,
         )
 
@@ -2054,7 +2136,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         config = {"interpolate": "true", "interpolation_engine": "rife", "default_target_lang": "FSL", "interpolation_target_fps": "60"}
 
         self.slverse.extract_verse_sections(
-            "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
+            "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", config,
             "slow", [5.0], 0.5,
         )
 
@@ -2090,7 +2172,7 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         config = {"interpolate": "false", "interpolation_engine": "rife", "smooth_slow_motion": "true"}
 
         self.slverse.extract_verse_sections(
-            "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
+            "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", config,
             "slow", [5.0], 0.5,
         )
 
@@ -2175,7 +2257,7 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         # extract_verse just passes interpolation_target_fps straight through.
         config = {"interpolate": "true", "interpolation_engine": "rife", "default_target_lang": "FSL", "interpolation_target_fps": "50"}
 
-        self.slverse.extract_verse("http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config, remote=True)
+        self.slverse.extract_verse("http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", config, remote=True)
 
         self.assertEqual(len(calls), 1)
         args, kwargs = calls[0]
@@ -2197,7 +2279,7 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         config = {"interpolate": "true", "interpolation_engine": "rife", "interpolation_target_fps": "60"}
 
         self.slverse.extract_verse(
-            "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, "11", "ASL", config,
+            "source.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", config,
             kept_segments=[(0.0, 4.0), (6.0, 10.0)],
         )
 
@@ -2422,7 +2504,7 @@ class SlverseLaunchMpvTest(unittest.TestCase):
         self.slverse.build_overlay_filter = lambda *a, **k: None
         self.slverse.run_ffmpeg = lambda *a, **k: self.fail("overlay-free preview must not encode")
 
-        self.slverse.preview_verse("source.mp4", 10.0, 15.0, "Psalm", 16, "11", "FSL", {}, use_mpv=True)
+        self.slverse.preview_verse("source.mp4", 10.0, 15.0, "Psalm", 16, [("11", 0.0, 1.0)], "FSL", {}, use_mpv=True)
 
         cmd = self.captured_cmd[0]
         self.assertIn("--start=10.0", cmd)
@@ -2436,7 +2518,7 @@ class SlverseLaunchMpvTest(unittest.TestCase):
         ffmpeg_calls = []
         self.slverse.run_ffmpeg = lambda cmd, duration=None: ffmpeg_calls.append(cmd)
 
-        self.slverse.preview_verse("source.mp4", 10.0, 15.0, "Psalm", 16, "11", "ASL", {}, use_mpv=True)
+        self.slverse.preview_verse("source.mp4", 10.0, 15.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", {}, use_mpv=True)
 
         self.assertEqual(len(ffmpeg_calls), 1)
         self.assertEqual(ffmpeg_calls[0][ffmpeg_calls[0].index("-vf") + 1], "drawtext=text='ASL'")
