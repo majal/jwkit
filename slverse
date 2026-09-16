@@ -1039,6 +1039,29 @@ def find_cached_superset(chapter_dir, checksum, start_time, end_time, state):
         return None
     return path, start_time - seg_start, end_time - seg_start
 
+def _discard_redundant_segments(chapter_dir, checksum, state):
+    """Once a whole chapter is cached (fetch_whole warm-up), every segment
+    file under the current checksum is a pure subset of it - free disk to
+    reclaim right away instead of waiting for LRU eviction to notice. Skips
+    a segment another thread is actively reading (cache_in_use), same as
+    enforce_cache_budget's own eviction pass. Returns whether anything was
+    actually removed, so the caller knows whether to invalidate its cached
+    cache-size total."""
+    checksum = _cache_safe_checksum(checksum)
+    with _CACHE_LOCK:
+        inuse = {Path(p) for p in _CACHE_INUSE}
+    removed = False
+    for path in chapter_dir.glob(f"seg-{checksum}-*-v3.mp4"):
+        if path.resolve() in inuse:
+            continue
+        try:
+            path.unlink()
+            state.get("_cache_access", {}).pop(str(path), None)
+            removed = True
+        except OSError:
+            pass
+    return removed
+
 def resolve_cached_source(url, lang, book_num, chapter, checksum, start_time, end_time, config, state, fetch_whole=False):
     """The single entry point every cache-aware caller (extract's preview,
     find --play, and extract's segment/cache write modes) goes through, so
@@ -1068,6 +1091,8 @@ def resolve_cached_source(url, lang, book_num, chapter, checksum, start_time, en
         if download_file(url, full, expected_checksum=checksum):
             note_cache_use(state, full)
             enforce_cache_budget(config, state, protect=full, added_bytes=full.stat().st_size)
+            if _discard_redundant_segments(chapter_dir, checksum, state):
+                invalidate_cache_totals(state, Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])))
             return str(full), full, start_time, end_time
         return url, None, start_time, end_time
 

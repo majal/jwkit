@@ -826,6 +826,35 @@ class SlverseCachedSourceTest(unittest.TestCase):
             self.assertEqual(cached_path, self.slverse.chapter_cache_dir(config, "ASL", 5, 2) / "full-abc123-v3.mp4")
             self.assertEqual((start, end), (20.0, 25.0))
 
+    def test_resolve_cached_source_discards_redundant_segments_once_the_whole_chapter_is_cached(self) -> None:
+        # A whole-chapter download makes every existing same-checksum segment
+        # a pure subset of it - that disk space should be reclaimed right
+        # away rather than sitting around until LRU eviction gets to it.
+        with tempfile.TemporaryDirectory() as td:
+            config = {"cache_dir": td}
+            chapter_dir = self.slverse.chapter_cache_dir(config, "ASL", 5, 2)
+            chapter_dir.mkdir(parents=True)
+            redundant_seg = chapter_dir / "seg-abc123-20000-25000-v3.mp4"
+            redundant_seg.write_bytes(b"now-redundant segment")
+            other_chapter_seg = self.slverse.chapter_cache_dir(config, "ASL", 5, 3)
+            other_chapter_seg.mkdir(parents=True)
+            (other_chapter_seg / "seg-abc123-0-5000-v3.mp4").write_bytes(b"unrelated chapter, untouched")
+            state = {"_cache_access": {str(redundant_seg): 1}}
+
+            self.slverse.download_file = lambda url, path, expected_checksum=None: (Path(path).write_bytes(b"whole chapter"), True)[1]
+            self.slverse.segment_has_video = lambda path: True
+
+            # A window the existing [20, 25] segment does NOT cover, so this
+            # is a genuine cache miss that reaches the fetch_whole download -
+            # not an immediate superset hit on the segment itself.
+            self.slverse.resolve_cached_source(
+                "http://example/vid.mp4", "ASL", 5, 2, "abc123", 100.0, 105.0, config, state, fetch_whole=True,
+            )
+
+            self.assertFalse(redundant_seg.exists())
+            self.assertNotIn(str(redundant_seg), state["_cache_access"])
+            self.assertTrue((other_chapter_seg / "seg-abc123-0-5000-v3.mp4").exists())  # different chapter - left alone
+
     def test_purge_stale_chapter_cache_removes_old_checksum_files_on_next_access(self) -> None:
         # A chapter jw.org hasn't finished narrating yet can get verses
         # added/re-recorded under the *same* URL - a cached file must be
