@@ -1363,15 +1363,21 @@ def wants_overlay(lang, config):
     target_lang = (config.get("default_target_lang") or "").strip().upper()
     return not (target_lang and lang.upper() == target_lang)
 
-def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box, source_labels=None, fade_outs=None, detected_caption_box=None):
+def build_overlay_filter(lang, book_name, chapter, verse_windows, config, show_box, source_labels=None, fade_outs=None, detected_caption_box=None):
     """delogo (blur out the source video's own burned-in reference caption)
-    + drawtext (the correct reference, in the caption position old ffv
-    used) + a small label of which sign language this clip came from -
-    mirrors old ffv's generate_filters(). Returns None when `lang` is the
-    configured default_target_lang: that language's own burned-in caption
-    is already correct, so no overlay is needed at all (old ffv's
-    `if [ "${ll}" = "${lang_tr}" ]` early-out - skip delogo/drawtext
-    entirely rather than draw a second caption on top of the first).
+    + one drawtext per entry in `verse_windows` (each gated to its own
+    `enable='between(t,...)'` span, so a multi-verse clip's reference
+    switches verse-by-verse instead of showing the whole range's label
+    throughout - see verse_reference_windows) + a small label of which
+    sign language this clip came from - mirrors old ffv's
+    generate_filters(). `verse_windows` is a list of (label, start, end)
+    with start/end zeroed to this output's own timeline; a single-verse
+    clip is just one window spanning the whole thing. Returns None when
+    `lang` is the configured default_target_lang: that language's own
+    burned-in caption is already correct, so no overlay is needed at all
+    (old ffv's `if [ "${ll}" = "${lang_tr}" ]` early-out - skip delogo/
+    drawtext entirely rather than draw a second caption on top of the
+    first).
 
     Beyond that exact-language match, sign_lang_ref_language may also mark
     `lang` and default_target_lang as sharing the same spoken/reference
@@ -1412,11 +1418,12 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     # about to draw. This automatically handles same-reference-language pairs
     # without requiring a permanent SL-code mapping. Keep the mapping as a
     # fallback for spelling/abbreviation differences and multi-label ranges.
-    label_text = f"{book_name} {chapter}:{verse_label}"
     def normalized_caption(text):
         return " ".join(unicodedata.normalize("NFKC", str(text)).casefold().split())
-    if len(source_labels or []) == 1 and normalized_caption(source_labels[0]) == normalized_caption(label_text):
-        skip_reference = True
+    if len(source_labels or []) == 1 and len(verse_windows) == 1:
+        single_label_text = f"{book_name} {chapter}:{verse_windows[0][0]}"
+        if normalized_caption(source_labels[0]) == normalized_caption(single_label_text):
+            skip_reference = True
 
     show_label = str(config.get("show_source_lang_label", DEFAULT_CONFIG["show_source_lang_label"])).strip().lower() != "false"
     if skip_reference and not show_label:
@@ -1471,7 +1478,7 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
     # source-SL label still needs to sit BELOW it rather than on top of it
     # (drawing at the bare overlay_y position would overlap the still-visible
     # original caption one-for-one).
-    measure_candidates = list(dict.fromkeys(source_labels or [])) or [label_text]
+    measure_candidates = list(dict.fromkeys(source_labels or [])) or [f"{book_name} {chapter}:{label}" for label, _, _ in verse_windows]
     w = h = 0
     for candidate in measure_candidates:
         cw, ch = measure_text_size(candidate, estimator_font, fontsize)
@@ -1499,8 +1506,16 @@ def build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box
             # "1 Timothy 1:11" alike - see measure_text_size), not a per-text
             # measurement that could itself run short.
             delogo = f"delogo=x={x - ESTIMATOR_MARGIN}:y={y - ESTIMATOR_MARGIN}:w={w + ESTIMATOR_MARGIN * 2 + width_pad}:h={h + ESTIMATOR_MARGIN + height_pad}:show={show}"
-        drawtext = f"drawtext=text='{esc(label_text)}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y}:alpha='{fading_alpha(alpha)}'"
-        filters += [delogo, drawtext]
+        filters.append(delogo)
+        # One drawtext per verse window, each confined to its own span via
+        # `enable` - see verse_reference_windows/build_overlay_filter's
+        # docstring. A single-verse clip is just one window covering the
+        # whole duration, so this collapses to the old always-on drawtext.
+        multi = len(verse_windows) > 1
+        for label, win_start, win_end in verse_windows:
+            text = f"{book_name} {chapter}:{label}"
+            enable = f":enable='between(t\\,{win_start:.3f}\\,{win_end:.3f})'" if multi else ""
+            filters.append(f"drawtext=text='{esc(text)}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y}:alpha='{fading_alpha(alpha)}'{enable}")
 
     if show_label:
         # A dedicated line-height, not `h`: `h` is the caption's tight glyph
@@ -1614,7 +1629,7 @@ def detect_caption_box(source, start_time, end_time, config, samples=None):
     agreeing = [box for box in boxes if all(abs(box[axis] - medians[axis]) <= (6 if axis < 2 else 10) for axis in range(4))]
     return medians if len(agreeing) >= required else None
 
-def preview_verse(source, start_time, end_time, book_name, chapter, verse_label, lang, config, use_mpv=False, source_url=None, source_labels=None, fade_outs=None):
+def preview_verse(source, start_time, end_time, book_name, chapter, verse_windows, lang, config, use_mpv=False, source_url=None, source_labels=None, fade_outs=None):
     """Default 'slverse extract' behavior (no --write): play the verse with
     its overlay applied live - including a visible box where delogo would
     remove the source caption - without writing anything to disk. Mirrors
@@ -1623,7 +1638,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_label,
     drawtext even when the external ffmpeg-full has it, so --play/-m makes a
     quick compatibility preview clip first."""
     detected_box = detect_caption_box(source, start_time, end_time, config) if wants_overlay(lang, config) else None
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=True, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_windows, config, show_box=True, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
     duration = end_time - start_time
 
     from_cache = source_url is not None and str(source) != str(source_url)
@@ -1737,7 +1752,7 @@ def shrink_box_for_inpaint(box, config):
     new_w, new_h = max(1, w - width_pad), max(1, h - height_pad)
     return (x + (w - new_w) // 2, y + (h - new_h) // 2, new_w, new_h)
 
-def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, remote=False, source_labels=None, kept_segments=None, fade_outs=None, metadata_args=None):
+def extract_verse(source, output_file, start_time, end_time, book_name, chapter, verse_windows, lang, config, remote=False, source_labels=None, kept_segments=None, fade_outs=None, metadata_args=None):
     """Single-pass: trim + overlay + (for framerate/minterpolate) the fps
     filter all happen in ONE ffmpeg encode, straight from `source`. Used to
     be two full lossy re-encode generations (extract-with-overlay, then a
@@ -1758,7 +1773,7 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     with the rife engine here - ffrife owns its own PNG extraction and
     doesn't know about kept_segments."""
     detected_box = detect_caption_box(source, start_time, end_time, config) if wants_overlay(lang, config) else None
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_windows, config, show_box=False, source_labels=source_labels, fade_outs=fade_outs, detected_caption_box=detected_box)
     engine = effective_interpolation_engine(config)
     duration = end_time - start_time
     segments = kept_segments or [(0.0, duration)]
@@ -2085,7 +2100,7 @@ def encode_rife_frame_sections(source, output_file, sections, target_fps, config
         output_duration = sum((end - start) / (speed or 1.0) for start, end, speed, _ in sections)
         run_ffmpeg(cmd, duration=output_duration)
 
-def extract_verse_sections(source, output_file, start_time, end_time, book_name, chapter, verse_label, lang, config, mode, boundaries, speed, source_labels=None, metadata_args=None):
+def extract_verse_sections(source, output_file, start_time, end_time, book_name, chapter, verse_windows, lang, config, mode, boundaries, speed, source_labels=None, metadata_args=None):
     """--slow/--fast: split the verse window at `boundaries` (seconds,
     relative to the verse's own start) into alternating normal/retimed
     sections at `speed` - ported from the standalone ffslow/fffast tools'
@@ -2094,7 +2109,7 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
     preserving atempo-retimed before the audio pieces are concatenated, so
     it stays aligned with both ffmpeg- and RIFE-retimed video."""
     detected_box = detect_caption_box(source, start_time, end_time, config)
-    overlay = build_overlay_filter(lang, book_name, chapter, verse_label, config, show_box=False, source_labels=source_labels, detected_caption_box=detected_box)
+    overlay = build_overlay_filter(lang, book_name, chapter, verse_windows, config, show_box=False, source_labels=source_labels, detected_caption_box=detected_box)
     engine = effective_interpolation_engine(config)
     smooth_slow = str(config.get("smooth_slow_motion", "true")).lower() in ("true", "1", "yes", "on")
     slow_engine = config.get("interpolation_engine", DEFAULT_CONFIG["interpolation_engine"]) if smooth_slow else engine
@@ -2774,6 +2789,26 @@ def overlay_fade_outs(lang, book_num, chapter, valid_verses, start, end, config,
             fades.append((left, right, is_final) if source_timeline else (left - start, right - start, is_final))
     return fades
 
+def verse_reference_windows(lang, book_num, chapter, valid_verses, start, end):
+    """(verse_number, window_start, window_end) per verse, clipped to
+    [start, end] and zeroed to this output window's own 0-based timeline -
+    the multi-verse counterpart of showing a single combined "23-24" label
+    for the whole clip. Old ffv drew one drawtext per verse in the range,
+    each gated by its own `enable='between(t,...)'` window (see its
+    generate_filters) so the reference switches from "23" to "24" exactly
+    when the source itself moves into verse 24, rather than showing the
+    whole range's label throughout - see build_overlay_filter."""
+    meta = markers_to_verse_times(load_index(lang).get(f"{book_num}_{chapter}", {}).get("markers", []))
+    windows = []
+    for v in valid_verses:
+        vmeta = meta.get(v)
+        if not vmeta:
+            continue
+        left, right = max(vmeta["start"], start), min(vmeta["end"], end)
+        if right > left:
+            windows.append((v, left - start, right - start))
+    return windows
+
 def resolve_retime_args(args, duration):
     """Turn --slow/--fast's raw TIME strings into (mode, boundaries,
     speed), validated against this window's actual `duration`. Returns
@@ -2901,6 +2936,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     # timeline, as do concat/filter-complex paths.
     fade_outs = overlay_fade_outs(lang, book_num, chapter, valid_verses, start_time, end_time, config, getattr(args, "keep_end_transition", False), True if getattr(args, "trim_mid_transitions", False) else None)
     verses_str = format_verses_label(valid_verses)
+    verse_windows = verse_reference_windows(lang, book_num, chapter, valid_verses, start_time, end_time)
     out_filename = getattr(args, "output", None) or default_extract_filename(
         book_name, chapter, verses_str, lang, args, config,
     )
@@ -2934,7 +2970,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         # concurrent enforce_cache_budget call for as long as this preview
         # is actually reading it (mpv/ffplay playback can run for a while).
         with cache_in_use(cached_path) if cached_path else contextlib.nullcontext():
-            preview_verse(source, start_time, end_time, book_name, chapter, verses_str, lang, config, use_mpv=args.play, source_url=url, source_labels=source_labels, fade_outs=fade_outs)
+            preview_verse(source, start_time, end_time, book_name, chapter, verse_windows, lang, config, use_mpv=args.play, source_url=url, source_labels=source_labels, fade_outs=fade_outs)
         return lang, None, None
 
     jwkit_config = _jwkit_common.load_jwkit_config()
@@ -2981,9 +3017,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
 
     if extract_mode == "onthefly":
         if mode:
-            extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
+            extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, [(verses_str, 0.0, end_time - start_time)], lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
         else:
-            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
+            extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verse_windows, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
     else:
         # 'segment' fetches just this verse window on a miss; 'cache'
         # additionally pulls the whole chapter on a miss. Either way,
@@ -3001,9 +3037,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             print(f"[{lang}] Source: {url}")
         with cache_in_use(cached_artifact) if cached_artifact else contextlib.nullcontext():
             if mode:
-                extract_verse_sections(local_path, out_filename, local_start, local_end, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
+                extract_verse_sections(local_path, out_filename, local_start, local_end, book_name, chapter, [(verses_str, 0.0, local_end - local_start)], lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
             else:
-                extract_verse(local_path, out_filename, local_start, local_end, book_name, chapter, verses_str, lang, config, remote=cached_artifact is None, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
+                extract_verse(local_path, out_filename, local_start, local_end, book_name, chapter, verse_windows, lang, config, remote=cached_artifact is None, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
 
         if cached_artifact and config.get("cache_policy") == "delete_after_use":
             cached_artifact.unlink(missing_ok=True)
