@@ -1488,6 +1488,37 @@ class SlverseRemapVerseWindowsTest(unittest.TestCase):
         )
 
 
+class SlverseRemapFadeOutsTest(unittest.TestCase):
+    """remap_fade_outs: extract_verse_sections (--slow/--fast) shares
+    extract_verse's own mid-transition alpha-fade dip now, so its fade
+    window has to move through a retime exactly the way the verse windows
+    already do (SlverseRemapVerseWindowsTest above) - otherwise the dip
+    would fire at the pre-retime instant instead of the actual one in the
+    output that gets written to disk."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def test_identity_timeline_leaves_fade_untouched(self) -> None:
+        fade_outs = [(10.0, 13.0, False)]
+        timeline = [(0.0, 20.0, 1.0)]
+        self.assertEqual(self.slverse.remap_fade_outs(fade_outs, timeline), fade_outs)
+
+    def test_slow_boundary_before_the_fade_stretches_its_position(self) -> None:
+        # A --slow boundary at t=5 (before the fade at 10-13) halves speed
+        # from there on: the fade's own position and width both scale by
+        # the same factor as everything after the boundary.
+        fade_outs = [(10.0, 13.0, False)]
+        timeline = [(0.0, 5.0, 1.0), (5.0, 20.0, 2.0)]
+        # pre-boundary: 5s untouched. post-boundary: (10-5)*2=10 -> starts
+        # at 5+10=15; (13-5)*2=16 -> ends at 5+16=21.
+        self.assertEqual(self.slverse.remap_fade_outs(fade_outs, timeline), [(15.0, 21.0, False)])
+
+    def test_no_fade_outs_is_a_noop(self) -> None:
+        self.assertEqual(self.slverse.remap_fade_outs(None, [(0.0, 20.0, 1.0)]), [])
+
+
 class SlverseBuildOverlayFilterMultiVerseTest(unittest.TestCase):
     """build_overlay_filter's per-window drawtext switching (see
     SlverseVerseReferenceWindowsTest above for where the windows come from)."""
@@ -2190,6 +2221,24 @@ class SlverseExtractVerseSectionsTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-t") + 1], "10.0")
         fc = cmd[cmd.index("-filter_complex") + 1]
         self.assertIn("setpts=PTS/3", fc)
+
+    def test_fade_outs_is_forwarded_to_build_overlay_filter(self) -> None:
+        # extract_verse's plain path already fades the overlay through a
+        # real mid-range paragraph transition; --slow/--fast has to get the
+        # same treatment now that both share per-verse drawtext windows.
+        calls = []
+        self.slverse.build_overlay_filter = lambda *a, **k: calls.append(k) or None
+        self.slverse.run_ffmpeg = lambda cmd, duration=None: None
+        config = {"interpolate": "false", "interpolation_engine": "rife"}
+        fade_outs = [(3.0, 4.0, False)]
+
+        self.slverse.extract_verse_sections(
+            "http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", config,
+            "fast", [3.0, 6.0], 3, fade_outs=fade_outs,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].get("fade_outs"), fade_outs)
 
     def test_slow_mode_with_non_rife_engine_uses_single_pass_filter_complex(self) -> None:
         calls = []
