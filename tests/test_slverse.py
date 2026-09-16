@@ -656,21 +656,21 @@ class SlverseCacheBudgetTest(unittest.TestCase):
             self.assertEqual(persisted.get("_cache_bytes", {}), {})
 
 
-class SlverseSegmentCacheTest(unittest.TestCase):
+class SlverseCachedSourceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.slverse = load_script_module("slverse")
 
-    def test_segment_cache_path_is_stable_and_scoped_by_lang_book_chapter_window(self) -> None:
+    def test_cache_paths_are_scoped_by_lang_book_chapter_and_checksum(self) -> None:
         config = {"cache_dir": "/cache"}
-        a = self.slverse.segment_cache_path(config, "ASL", 54, 1, 221.788, 236.336)
-        b = self.slverse.segment_cache_path(config, "ASL", 54, 1, 221.788, 236.336)
-        different_window = self.slverse.segment_cache_path(config, "ASL", 54, 1, 221.788, 240.0)
-        different_lang = self.slverse.segment_cache_path(config, "FSL", 54, 1, 221.788, 236.336)
-        self.assertEqual(a, b)
-        self.assertNotEqual(a, different_window)
-        self.assertNotEqual(a, different_lang)
-        self.assertEqual(a.parent, Path("/cache/ASL/segments"))
+        chapter_dir = self.slverse.chapter_cache_dir(config, "ASL", 54, 1)
+        self.assertEqual(chapter_dir, Path("/cache/ASL/54_1"))
+        self.assertNotEqual(chapter_dir, self.slverse.chapter_cache_dir(config, "FSL", 54, 1))
+        self.assertNotEqual(chapter_dir, self.slverse.chapter_cache_dir(config, "ASL", 54, 2))
+        full_a = self.slverse.full_chapter_cache_path(chapter_dir, "aaa111")
+        full_b = self.slverse.full_chapter_cache_path(chapter_dir, "bbb222")
+        self.assertEqual(full_a.parent, chapter_dir)
+        self.assertNotEqual(full_a, full_b)  # different checksum - different cache entry
 
     def test_download_segment_uses_zero_based_output_seek_and_retries_on_failure(self) -> None:
         calls = []
@@ -710,25 +710,71 @@ class SlverseSegmentCacheTest(unittest.TestCase):
             self.assertEqual(args[args.index("-map") + 1], "0:v:0")
             self.assertIn("-sn", args)
 
-    def test_resolve_segment_source_reuses_cached_file_without_fetching(self) -> None:
+    def test_resolve_cached_source_reuses_exact_cached_segment_without_fetching(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             config = {"cache_dir": td}
-            cached = self.slverse.segment_cache_path(config, "ASL", 54, 1, 10.0, 20.0)
-            cached.parent.mkdir(parents=True)
+            chapter_dir = self.slverse.chapter_cache_dir(config, "ASL", 54, 1)
+            chapter_dir.mkdir(parents=True)
+            cached = chapter_dir / "seg-abc123-10000-20000-v3.mp4"
             cached.write_bytes(b"already here")
             self.slverse.segment_has_video = lambda path: True
             self.slverse.download_segment = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fetch"))
 
-            source, cached_path = self.slverse.resolve_segment_source("http://example/vid.mp4", "ASL", 54, 1, 10.0, 20.0, config, {})
+            source, cached_path, start, end = self.slverse.resolve_cached_source(
+                "http://example/vid.mp4", "ASL", 54, 1, "abc123", 10.0, 20.0, config, {},
+            )
 
             self.assertEqual(source, str(cached))
             self.assertEqual(cached_path, cached)
+            self.assertEqual((start, end), (0.0, 10.0))
 
-    def test_resolve_segment_source_replaces_cached_file_without_video(self) -> None:
+    def test_resolve_cached_source_reuses_a_wider_cached_range_for_a_narrower_request(self) -> None:
+        # This is the behavior the whole redesign exists for: a verse range
+        # cached by one command (e.g. 'ffv all 1 Peter 2:21-23 -p') must
+        # serve a later, narrower request for one verse out of that range
+        # (e.g. '2:23' alone) without re-hitting the network, regardless of
+        # whether the two requests came from the same command/session.
         with tempfile.TemporaryDirectory() as td:
             config = {"cache_dir": td}
-            cached = self.slverse.segment_cache_path(config, "INI", 48, 6, 77.477, 89.723)
-            cached.parent.mkdir(parents=True)
+            chapter_dir = self.slverse.chapter_cache_dir(config, "ASL", 5, 2)
+            chapter_dir.mkdir(parents=True)
+            cached = chapter_dir / "seg-abc123-10000-25000-v3.mp4"
+            cached.write_bytes(b"already here")
+            self.slverse.segment_has_video = lambda path: True
+            self.slverse.download_segment = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fetch"))
+
+            source, cached_path, start, end = self.slverse.resolve_cached_source(
+                "http://example/vid.mp4", "ASL", 5, 2, "abc123", 20.0, 25.0, config, {},
+            )
+
+            self.assertEqual(cached_path, cached)
+            self.assertEqual((start, end), (10.0, 15.0))  # offset into the wider cached file
+
+    def test_resolve_cached_source_prefers_a_full_chapter_cache_over_any_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = {"cache_dir": td}
+            chapter_dir = self.slverse.chapter_cache_dir(config, "ASL", 5, 2)
+            chapter_dir.mkdir(parents=True)
+            full = chapter_dir / "full-abc123-v3.mp4"
+            full.write_bytes(b"whole chapter")
+            (chapter_dir / "seg-abc123-20000-25000-v3.mp4").write_bytes(b"narrower segment")
+            self.slverse.segment_has_video = lambda path: True
+            self.slverse.download_file = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fetch"))
+            self.slverse.download_segment = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fetch"))
+
+            source, cached_path, start, end = self.slverse.resolve_cached_source(
+                "http://example/vid.mp4", "ASL", 5, 2, "abc123", 20.0, 25.0, config, {},
+            )
+
+            self.assertEqual(cached_path, full)
+            self.assertEqual((start, end), (20.0, 25.0))  # full chapter keeps original timestamps
+
+    def test_resolve_cached_source_replaces_cached_file_without_video(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = {"cache_dir": td}
+            chapter_dir = self.slverse.chapter_cache_dir(config, "INI", 48, 6)
+            chapter_dir.mkdir(parents=True)
+            cached = chapter_dir / "seg-def456-77477-89723-v3.mp4"
             cached.write_bytes(b"subtitle only")
             self.slverse.segment_has_video = lambda path: False
 
@@ -738,25 +784,82 @@ class SlverseSegmentCacheTest(unittest.TestCase):
 
             self.slverse.download_segment = replace_segment
             state = {"_cache_bytes": {str(Path(td)): 999}, "_cache_access": {str(cached): 1}}
-            source, cached_path = self.slverse.resolve_segment_source(
-                "http://example/vid.mp4", "INI", 48, 6, 77.477, 89.723, config, state
+            source, cached_path, start, end = self.slverse.resolve_cached_source(
+                "http://example/vid.mp4", "INI", 48, 6, "def456", 77.477, 89.723, config, state,
             )
 
-            self.assertEqual(source, str(cached))
             self.assertEqual(cached_path, cached)
             self.assertEqual(cached.read_bytes(), b"video")
-            self.assertNotEqual(state["_cache_access"][str(cached)], 1)
-            self.assertNotEqual(state["_cache_bytes"].get(str(Path(td))), 999)
+            self.assertNotEqual(state["_cache_access"].get(str(cached)), 1)
 
-    def test_resolve_segment_source_falls_back_to_url_when_fetch_fails(self) -> None:
+    def test_resolve_cached_source_falls_back_to_url_when_fetch_fails(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             config = {"cache_dir": td}
             self.slverse.download_segment = lambda *a, **k: False
 
-            source, cached_path = self.slverse.resolve_segment_source("http://example/vid.mp4", "ASL", 54, 1, 10.0, 20.0, config, {})
+            source, cached_path, start, end = self.slverse.resolve_cached_source(
+                "http://example/vid.mp4", "ASL", 54, 1, "abc123", 10.0, 20.0, config, {},
+            )
 
             self.assertEqual(source, "http://example/vid.mp4")
             self.assertIsNone(cached_path)
+            self.assertEqual((start, end), (10.0, 20.0))
+
+    def test_resolve_cached_source_fetch_whole_downloads_the_full_chapter_on_a_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = {"cache_dir": td}
+            calls = []
+
+            def fake_download_file(url, path, expected_checksum=None):
+                calls.append((url, path))
+                Path(path).write_bytes(b"whole chapter")
+                return True
+
+            self.slverse.download_file = fake_download_file
+            self.slverse.segment_has_video = lambda path: True
+
+            source, cached_path, start, end = self.slverse.resolve_cached_source(
+                "http://example/vid.mp4", "ASL", 5, 2, "abc123", 20.0, 25.0, config, {}, fetch_whole=True,
+            )
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(cached_path, self.slverse.chapter_cache_dir(config, "ASL", 5, 2) / "full-abc123-v3.mp4")
+            self.assertEqual((start, end), (20.0, 25.0))
+
+    def test_purge_stale_chapter_cache_removes_old_checksum_files_on_next_access(self) -> None:
+        # A chapter jw.org hasn't finished narrating yet can get verses
+        # added/re-recorded under the *same* URL - a cached file must be
+        # keyed to the source's own checksum, not just found-and-trusted by
+        # its filename, or a stale byte range would be served forever.
+        with tempfile.TemporaryDirectory() as td:
+            config = {"cache_dir": td}
+            chapter_dir = self.slverse.chapter_cache_dir(config, "ASL", 5, 2)
+            chapter_dir.mkdir(parents=True)
+            stale_full = chapter_dir / "full-oldsum-v3.mp4"
+            stale_full.write_bytes(b"stale whole chapter")
+            stale_seg = chapter_dir / "seg-oldsum-10000-20000-v3.mp4"
+            stale_seg.write_bytes(b"stale segment")
+            state = {"_cache_access": {str(stale_full): 1, str(stale_seg): 1}}
+
+            calls = []
+
+            def fake_download_segment(url, path, start, end):
+                calls.append((start, end))
+                Path(path).write_bytes(b"fresh segment")
+                return True
+
+            self.slverse.download_segment = fake_download_segment
+            self.slverse.segment_has_video = lambda path: True
+
+            source, cached_path, start, end = self.slverse.resolve_cached_source(
+                "http://example/vid.mp4", "ASL", 5, 2, "newsum", 10.0, 20.0, config, state,
+            )
+
+            self.assertFalse(stale_full.exists())
+            self.assertFalse(stale_seg.exists())
+            self.assertNotIn(str(stale_full), state["_cache_access"])
+            self.assertNotIn(str(stale_seg), state["_cache_access"])
+            self.assertEqual(len(calls), 1)  # had to refetch - old bytes weren't reused despite covering the window
 
     def test_download_segment_against_a_real_local_file_produces_a_playable_trim(self) -> None:
         # Runs real ffmpeg (no network - a synthetic local source stands in
@@ -1299,8 +1402,9 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         self.assertEqual(preview_calls[0][1].get("source_url"), "http://example/vid.mp4")
 
     def test_preview_source_segment_reuses_already_cached_segment(self) -> None:
-        seg_path = self.slverse.segment_cache_path(self.base_config(), "FSL", 19, 16, 10.0, 20.0)
-        seg_path.parent.mkdir(parents=True)
+        chapter_dir = self.slverse.chapter_cache_dir(self.base_config(), "FSL", 19, 16)
+        seg_path = chapter_dir / "seg-abc123-10000-20000-v3.mp4"
+        chapter_dir.mkdir(parents=True)
         seg_path.write_bytes(b"fake segment")
         preview_calls = []
         self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
@@ -1324,7 +1428,7 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         self.assertEqual(len(self.download_calls), 1)
         self.assertEqual(self.download_calls[0][0], "http://example/vid.mp4")
         played_source = preview_calls[0][0][0]
-        self.assertEqual(played_source, str(self.cache_dir / "FSL" / "vid.mp4"))
+        self.assertEqual(played_source, str(self.slverse.chapter_cache_dir(self.base_config(), "FSL", 19, 16) / "full-abc123-v3.mp4"))
         self.assertEqual(preview_calls[0][1].get("source_url"), "http://example/vid.mp4")
 
     def test_preview_source_remote_streams_url_and_never_downloads(self) -> None:
@@ -1340,9 +1444,10 @@ class SlverseExtractPreviewTest(unittest.TestCase):
         self.assertEqual(played_source, "http://example/vid.mp4")
 
     def test_preview_source_cache_reuses_already_downloaded_whole_chapter(self) -> None:
-        lang_dir = self.cache_dir / "FSL"
-        lang_dir.mkdir(parents=True)
-        (lang_dir / "vid.mp4").write_bytes(b"fake video")
+        chapter_dir = self.slverse.chapter_cache_dir(self.base_config(), "FSL", 19, 16)
+        chapter_dir.mkdir(parents=True)
+        full = chapter_dir / "full-abc123-v3.mp4"
+        full.write_bytes(b"fake video")
         preview_calls = []
         self.slverse.preview_verse = lambda *a, **k: preview_calls.append((a, k))
         args = argparse.Namespace(write=False, play=False, onthefly=False, cache=False, segment=False)
@@ -1351,7 +1456,7 @@ class SlverseExtractPreviewTest(unittest.TestCase):
 
         self.assertEqual(self.download_calls, [])  # already cached - no download needed
         played_source = preview_calls[0][0][0]
-        self.assertEqual(played_source, str(lang_dir / "vid.mp4"))
+        self.assertEqual(played_source, str(full))
 
     def test_write_flag_encodes_and_returns_a_filename(self) -> None:
         extract_calls = []
@@ -2113,12 +2218,14 @@ class SlversePreviewGroupingTest(unittest.TestCase):
 
 class SlverseFindPlayCacheTest(unittest.TestCase):
     """'ffv all <ref> -p' -> 'slverse find ... --play'. Regression coverage
-    for the gap where find --play ignored preview_source entirely and
-    always went through resolve_segment_source: a different verse range
-    from the same chapter (e.g. 2:21-23 then 2:23) was an exact-window
-    cache miss and re-hit the network even with preview_source=cache
-    configured, which promises a whole-chapter download reused across any
-    verse window in that chapter."""
+    for two related gaps: (1) find --play used to ignore preview_source
+    entirely and always fetch/cache only the exact requested window, so a
+    different but overlapping verse range from the same chapter (e.g.
+    2:21-23 then 2:23) was a cache miss and re-hit the network; (2) even
+    after routing through the shared cache, a narrower request needs to
+    reuse a wider *already-cached* window regardless of which preview_source
+    fetched it, which is what resolve_cached_source's superset lookup does
+    for 'segment' mode now, not just 'cache' mode."""
 
     def setUp(self) -> None:
         # Fresh module + isolated state/config paths per test, so this never
@@ -2168,7 +2275,7 @@ class SlverseFindPlayCacheTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def find_args(self, verse):
-        return argparse.Namespace(book="1 Peter", chapter=2, verse=verse, play=True, verbose=False, json=False)
+        return argparse.Namespace(book="1 Peter", chapter=2, verse=verse, play=True, list_only=False, verbose=False, json=False)
 
     def config(self, **overrides):
         cfg = dict(self.slverse.DEFAULT_CONFIG)
@@ -2176,13 +2283,26 @@ class SlverseFindPlayCacheTest(unittest.TestCase):
         cfg.update(overrides)
         return cfg
 
-    def test_segment_mode_re_fetches_for_a_different_verse_range_in_the_same_chapter(self) -> None:
+    def test_segment_mode_reuses_a_cached_range_for_a_narrower_verse_within_it(self) -> None:
+        # The originally reported bug: 'ffv all 1 Peter 2:21-23 -p' followed
+        # by 'ffv all 1 Peter 2:23 -p' used to re-hit the network for the
+        # second command even though verse 23's bytes were already in the
+        # first command's cached range. Fixed at the default preview_source
+        # (segment) - no whole-chapter download needed to get this reuse.
         config = self.config(preview_source="segment")
         self.slverse.cmd_find(self.find_args("21-23"), config)
         self.slverse.cmd_find(self.find_args("23"), config)
 
         self.assertEqual(self.download_calls, [])
-        self.assertEqual(len(self.segment_download_calls), 2)  # distinct windows - the reported cache miss
+        self.assertEqual(len(self.segment_download_calls), 1)  # 2nd request was covered by the 1st
+
+    def test_segment_mode_still_fetches_for_a_genuinely_disjoint_verse_range(self) -> None:
+        config = self.config(preview_source="segment")
+        self.slverse.cmd_find(self.find_args("21"), config)
+        self.slverse.cmd_find(self.find_args("23"), config)  # not adjacent/overlapping with verse 21's window
+
+        self.assertEqual(self.download_calls, [])
+        self.assertEqual(len(self.segment_download_calls), 2)  # genuinely nothing to reuse
 
     def test_cache_mode_reuses_the_whole_chapter_for_a_different_verse_range(self) -> None:
         config = self.config(preview_source="cache")
@@ -2191,6 +2311,23 @@ class SlverseFindPlayCacheTest(unittest.TestCase):
 
         self.assertEqual(self.segment_download_calls, [])
         self.assertEqual(len(self.download_calls), 1)  # whole chapter fetched once, reused for verse 23 alone
+
+    def test_default_lists_and_previews(self) -> None:
+        args = self.find_args("23")
+        args.play, args.list_only = False, False  # neither flag passed - preview still runs by default
+
+        self.slverse.cmd_find(args, self.config(preview_source="segment"))
+
+        self.assertEqual(len(self.segment_download_calls), 1)
+
+    def test_list_only_skips_previewing(self) -> None:
+        args = self.find_args("23")
+        args.list_only = True
+
+        self.slverse.cmd_find(args, self.config(preview_source="segment"))
+
+        self.assertEqual(self.segment_download_calls, [])
+        self.assertEqual(self.download_calls, [])
 
 
 class SlverseLaunchMpvTest(unittest.TestCase):

@@ -25,7 +25,9 @@ Install jwkit normally, then configure `slverse` once with `slverse setup`.
 ```bash
 ffv FSL Rev 21:1-3
 ffv any 1 Sa-mu-en 2:12-17
-ffv all Ge 10:2 -p
+ffv all Ge 10:2
+ffv all Ge 10:2 -l
+ffv BVL,FSL 1 Peter 2:23 -fi
 ```
 
 Every `slverse extract` option works in the normal and `any` forms. Use `slverse extract --help` for the complete list.
@@ -35,9 +37,9 @@ In particular, `ffv ... -e TIME` passes `-e` through as `slverse extract --trim-
 
 ## Important Behavior / Defaults
 
-- `ffv <lang> ...` delegates to `slverse extract <lang> ...`.
+- `ffv <lang> ...` delegates to `slverse extract <lang> ...`. `<lang>` also accepts a comma list (e.g. `ffv BVL,FSL ...`) to encode several sign languages from one command - each one runs through `-f`/`--write` in parallel (`extract_workers` in config controls how many at once).
 - `ffv any ...` tries `slverse`'s configured `languages` in order and stops at the first available verse.
-- `ffv all ...` delegates to `slverse find`; use `-p`/`--play` to open matching previews.
+- `ffv all ...` delegates to `slverse find`, which lists matches **and previews each one** by default; pass `-l`/`--list-only` to just list. `-p`/`--play` still works but is a no-op now that preview is the default.
 - `ffv config ...` delegates to `slverse config ...`, including `path`, `edit`, `reset`, `diff`, and `check`.
 - Configuration belongs to `slverse`, so the launcher cannot drift into a second set of defaults.
 

@@ -102,7 +102,7 @@ DEFAULT_CONFIG = {
     "cache_dir": str(DEFAULT_CACHE_DIR),
     "cache_policy": "lru",  # keep_all, lru, delete_after_use
     "cache_max_size": "1G",  # unix-style size: K/M/G/T/P/E (decimal SI) or Ki/Mi/Gi/Ti/Pi/Ei (binary IEC) - see _jwkit_common.parse_size
-    "extract_mode": "segment",  # cache only the requested window by default; use --cache when several verses from one chapter will amortize the full download
+    "extract_mode": "segment",  # fetch only the requested window on a miss by default, reusing whatever's already cached for that chapter at any granularity (see resolve_cached_source); use --cache when several verses from one chapter will amortize pulling the full download up front
     "hardware_encoder": "cpu",  # nvenc, videotoolbox, qsv, cpu
     "video_codec": "av1",  # h264, hevc, av1 - royalty-free and meaningfully smaller than hevc at matched quality; falls back to hevc then h264 automatically if this machine/ffmpeg build can't actually encode it (see build_encode_args)
     "video_crf": "auto",  # codec-specific balanced quality: h264=20, hevc=23, av1=30
@@ -120,7 +120,7 @@ DEFAULT_CONFIG = {
     "auto_sync": "true",  # once-a-day background refresh on extract/find/bulk, so non-techies stay current without running 'sync' themselves
     "auto_sync_interval_hours": "24",
     "auto_sync_background": "true",  # run the once-a-day refresh as a detached subprocess so it never blocks the current command; false restores the old blocking-in-foreground behavior
-    "preview_source": "segment",  # extract's preview mode (no --write) and find --play: 'segment' fetches and caches just the verse window being previewed - fast, no repeat bandwidth for the same window, but never pulls a whole chapter just to preview a few seconds of it; 'cache' instead downloads the WHOLE chapter once and reuses that, worth it only if you'll preview several different verses from the same chapter; 'remote' always streams straight from the URL and never touches disk
+    "preview_source": "segment",  # extract's preview mode (no --write) and find --play: 'segment' fetches just the verse window being previewed on a miss - fast, never pulls a whole chapter just to preview a few seconds of it - but reuses whatever's already cached for that chapter at ANY granularity (a whole chapter, a range, or another verse), so it's never a repeat cache miss just because the exact window differs from a prior request; 'cache' additionally pulls the WHOLE chapter on a miss, worth it only if you'll preview several different verses from the same chapter; 'remote' always streams straight from the URL and never touches disk
     "preview_window_size": "65%",  # multi-language preview windows (slverse find --play), as an mpv --autofit percentage of screen size - ignored for a single-language preview, which still autoplays fullscreen
     "preview_max_parallel": "4",  # concurrent segment downloads for find --play; each completed language window opens while the remaining downloads continue
     "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
@@ -208,7 +208,7 @@ CONFIG_HELP = {
     "cache_dir": "Where cached full-chapter downloads live",
     "cache_policy": "keep_all, lru, delete_after_use - what happens to a cached chapter after use",
     "cache_max_size": "Cache size cap, e.g. 500M, 5G, 2Gi - oldest-used chapters evicted first once hit (cache_policy=lru)",
-    "extract_mode": "segment (default, cache just the requested window), cache (reuse whole chapters), or onthefly (no disk use)",
+    "extract_mode": "segment (default, fetch just the requested window on a miss, reusing any already-cached window for that chapter), cache (also pull the whole chapter on a miss), or onthefly (no disk use)",
     "hardware_encoder": "cpu, nvenc, videotoolbox, or qsv",
     "video_codec": "h264, hevc, or av1",
     "video_crf": "Encode quality (lower = higher quality/larger file)",
@@ -226,7 +226,7 @@ CONFIG_HELP = {
     "auto_sync": "Once-a-day automatic metadata refresh on extract/find/bulk",
     "auto_sync_interval_hours": "Hours between automatic refreshes",
     "auto_sync_background": "Run the automatic refresh as a detached background process instead of blocking",
-    "preview_source": "segment (default, cache just the verse window), cache (download the whole chapter once, reuse), or remote (always stream) - for preview (extract without --write) and find --play",
+    "preview_source": "segment (default, fetch just the verse window on a miss, reusing any already-cached window for that chapter), cache (also pull the whole chapter on a miss), or remote (always stream) - for preview (extract without --write) and find --play",
     "preview_window_size": "mpv --autofit percentage for 'find --play' multi-language preview windows",
     "preview_max_parallel": "Concurrent segment downloads for find --play (default 4)",
     "font_path": "Manual font file override (skips font_family)",
@@ -942,29 +942,141 @@ def cache_dir_size(cache_dir):
                 total += p.stat().st_size
     return total
 
-# --- Segment cache ---
-# A whole-chapter cache (see cmd_extract's extract_mode=cache) is the right
-# call when you'll pull several different verses from the same chapter - one
-# download serves all of them. But a quick single-verse preview or a one-off
-# extract doesn't need the other 39 minutes of chapter sitting on disk. This
-# is the same byte-approximate remote seek onthefly mode already relies on
-# (see extract_verse's own -ss-before-i comment) - just persisted afterward
-# so a repeat request for the exact same window costs no further bandwidth,
-# without ever pulling the full chapter. cache_dir_size needs no changes: it
-# already walks the whole cache_dir tree recursively, so segment files
-# (nested one level deeper, under <lang>/segments/) already count toward
-# 'cache list' the same as whole cached chapters. enforce_cache_budget's own
-# running-total tracking (see there) also needs no segment-specific
-# handling - a segment file is just another path under cache_dir to it.
+# --- Verse-window cache ---
+# One cache per chapter, any granularity: a whole chapter, a multi-verse
+# range, and a single verse all live side by side under
+# cache_dir/<lang>/<book>_<chapter>/, and any of them can serve a request
+# whose window they cover - a whole-chapter download from one command
+# satisfies a single-verse request from a completely different command
+# later, and vice versa (a narrower cached segment that happens to be a
+# superset of a new, even-narrower request also counts). This is the same
+# byte-approximate remote seek onthefly mode already relies on (see
+# extract_verse's own -ss-before-i comment) - just persisted afterward so a
+# repeat request for an already-covered window costs no further bandwidth.
+# cache_dir_size/cmd_cache need no changes for this: they already walk the
+# whole cache_dir tree recursively per <lang>, so a nested per-chapter
+# directory already counts toward 'cache list'/'clean' the same as before.
+#
+# Cache entries are keyed by the source's own checksum (from jw.org's
+# pub-media API), not by filename or URL - a chapter jw.org hasn't finished
+# narrating yet gets verses added or re-recorded over time *under the same
+# URL*, so trusting the URL/filename alone (the old scheme) could silently
+# keep serving pre-update bytes forever. purge_stale_chapter_cache drops
+# anything cached under a non-current checksum on every lookup, so a stale
+# byte range is purged and replaced the next time that chapter is used,
+# without waiting for LRU eviction to eventually get to it.
 
-def segment_cache_path(config, lang, book_num, chapter, start_time, end_time):
-    cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang / "segments"
-    # v2 segments are zero-based.  The old stream-copy files retained a
-    # non-zero MP4 start_time, but ffmpeg's input -ss still interpreted the
-    # requested chapter timestamp relative to the short file and sought past
-    # EOF.  Keep the cache-key version explicit so those files are not reused.
-    name = f"{book_num}_{chapter}_{round(start_time * 1000)}-{round(end_time * 1000)}-v2.mp4"
-    return cache_dir / name
+_SEGMENT_CACHE_RE = re.compile(r"^seg-([^-]+)-(\d+)-(\d+)-v3\.mp4$")
+
+def chapter_cache_dir(config, lang, book_num, chapter):
+    return Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang / f"{book_num}_{chapter}"
+
+def _cache_safe_checksum(checksum):
+    """jw.org's pub-media checksums are plain hex in practice, but this is
+    external API data embedded directly into a filename - strip anything
+    that isn't alphanumeric so an unexpected checksum format (a slash, a
+    dash that would break _SEGMENT_CACHE_RE's parsing, ...) can never
+    produce a bad path instead of just a cache miss."""
+    return re.sub(r"[^A-Za-z0-9]", "", str(checksum)) or "nochecksum"
+
+def full_chapter_cache_path(chapter_dir, checksum):
+    return chapter_dir / f"full-{_cache_safe_checksum(checksum)}-v3.mp4"
+
+def purge_stale_chapter_cache(chapter_dir, checksum, state):
+    """Delete every cached file for this chapter whose checksum isn't the
+    current one - see the module comment above. Best-effort: a file another
+    process is mid-write/mid-read on (segment_has_video also guards against
+    a torn write elsewhere) just gets picked up on a later pass."""
+    if not chapter_dir.exists():
+        return
+    checksum = _cache_safe_checksum(checksum)
+    current_full = full_chapter_cache_path(chapter_dir, checksum).name
+    for path in chapter_dir.iterdir():
+        if not path.is_file() or path.name == current_full:
+            continue
+        match = _SEGMENT_CACHE_RE.match(path.name)
+        if match and match.group(1) == checksum:
+            continue
+        if not (path.name.startswith("full-") or match):
+            continue  # not a cache file this scheme recognizes - leave it alone
+        try:
+            path.unlink()
+            state.get("_cache_access", {}).pop(str(path), None)
+            print(f"Discarding stale cached {'chapter' if path.name.startswith('full-') else 'segment'} (source changed): {path.name}")
+        except OSError:
+            pass
+
+def find_cached_superset(chapter_dir, checksum, start_time, end_time, state):
+    """A cached window - whole chapter or segment, from any prior request -
+    that fully covers [start_time, end_time] can serve this one without
+    touching the network. Returns (path, local_start, local_end) or None.
+    Prefers the whole chapter (original timestamps, no offset math needed),
+    then the tightest-fitting covering segment. Millisecond rounding in
+    segment filenames means an exact-seeming boundary can be off by ~1ms -
+    a small tolerance avoids mistaking that for 'doesn't cover it'."""
+    checksum = _cache_safe_checksum(checksum)
+    full = full_chapter_cache_path(chapter_dir, checksum)
+    if full.exists():
+        if segment_has_video(full):
+            return full, start_time, end_time
+        full.unlink(missing_ok=True)
+        state.get("_cache_access", {}).pop(str(full), None)
+    best = None
+    for path in chapter_dir.glob(f"seg-{checksum}-*-v3.mp4"):
+        match = _SEGMENT_CACHE_RE.match(path.name)
+        if not match:
+            continue
+        seg_start, seg_end = int(match.group(2)) / 1000.0, int(match.group(3)) / 1000.0
+        if seg_start <= start_time + 0.01 and seg_end >= end_time - 0.01:
+            if best is None or (seg_end - seg_start) < (best[2] - best[1]):
+                best = (path, seg_start, seg_end)
+    if not best:
+        return None
+    path, seg_start, _ = best
+    if not segment_has_video(path):
+        path.unlink(missing_ok=True)
+        state.get("_cache_access", {}).pop(str(path), None)
+        return None
+    return path, start_time - seg_start, end_time - seg_start
+
+def resolve_cached_source(url, lang, book_num, chapter, checksum, start_time, end_time, config, state, fetch_whole=False):
+    """The single entry point every cache-aware caller (extract's preview,
+    find --play, and extract's segment/cache write modes) goes through, so
+    they all reuse each other's cached bytes at whatever granularity was
+    actually fetched. fetch_whole=True additionally pulls the whole chapter
+    on a miss (explicit warm-up: preview_source/extract_mode=cache);
+    otherwise a miss fetches only the requested window - caching never
+    proactively downloads more than what's actually being watched or
+    extracted just because interoperable reuse is available.
+
+    Returns (source, cached_path, local_start, local_end). cached_path is
+    None (source is the remote url, start/end unchanged) if every fetch
+    attempt failed - the same graceful offline fallback every caller
+    already relied on before this."""
+    chapter_dir = chapter_cache_dir(config, lang, book_num, chapter)
+    purge_stale_chapter_cache(chapter_dir, checksum, state)
+
+    hit = find_cached_superset(chapter_dir, checksum, start_time, end_time, state)
+    if hit:
+        path, local_start, local_end = hit
+        note_cache_use(state, path)
+        return str(path), path, local_start, local_end
+
+    chapter_dir.mkdir(parents=True, exist_ok=True)
+    if fetch_whole:
+        full = full_chapter_cache_path(chapter_dir, checksum)  # sanitizes internally; download_file below verifies the raw checksum
+        if download_file(url, full, expected_checksum=checksum):
+            note_cache_use(state, full)
+            enforce_cache_budget(config, state, protect=full, added_bytes=full.stat().st_size)
+            return str(full), full, start_time, end_time
+        return url, None, start_time, end_time
+
+    seg = chapter_dir / f"seg-{_cache_safe_checksum(checksum)}-{round(start_time * 1000)}-{round(end_time * 1000)}-v3.mp4"
+    if download_segment(url, seg, start_time, end_time):
+        note_cache_use(state, seg)
+        enforce_cache_budget(config, state, protect=seg, added_bytes=seg.stat().st_size)
+        return str(seg), seg, 0.0, end_time - start_time
+    return url, None, start_time, end_time
 
 def segment_has_video(path):
     """Return whether a prospective cached segment contains real video."""
@@ -1006,51 +1118,6 @@ def download_segment(url, output_path, start_time, end_time):
             if attempt < MAX_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF ** attempt)
     return False
-
-def resolve_segment_source(url, lang, book_num, chapter, start_time, end_time, config, state):
-    """Cache-or-stream just the requested verse window instead of the whole
-    chapter - shared by extract's preview mode (preview_source=segment),
-    extract_mode=segment, and find --play, so all three reuse each other's
-    small cached clips instead of re-fetching bytes, and none of them ever
-    pulls a full chapter just to look at a few seconds of it. Returns
-    (source, cached_path) - cached_path is None (source is the remote url,
-    unchanged) if the fetch failed, matching resolve_verse_window's/preview's
-    own graceful offline fallback."""
-    cached = segment_cache_path(config, lang, book_num, chapter, start_time, end_time)
-    if cached.exists():
-        if segment_has_video(cached):
-            note_cache_use(state, cached)
-            return str(cached), cached
-        cached.unlink(missing_ok=True)
-        state.get("_cache_access", {}).pop(str(cached), None)
-        invalidate_cache_totals(state, Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])))
-        print(f"Discarding unusable cached segment without video: {cached}")
-    cached.parent.mkdir(parents=True, exist_ok=True)
-    if download_segment(url, cached, start_time, end_time):
-        note_cache_use(state, cached)
-        enforce_cache_budget(config, state, protect=cached, added_bytes=cached.stat().st_size)
-        return str(cached), cached
-    return url, None
-
-def resolve_chapter_cache_source(url, lang, checksum, config, state):
-    """preview_source=cache: download the WHOLE chapter once (keyed by the
-    remote filename, same file cmd_extract's --write path would produce)
-    and reuse it - unlike resolve_segment_source's exact-window cache, any
-    verse window from this chapter is served from the same local file, so a
-    different verse range in the same chapter never re-hits the network.
-    Returns (source, cached_path) - cached_path is None (source is the
-    remote url, unchanged) if the download failed."""
-    cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])) / lang
-    cached = cache_dir / url.split("/")[-1]
-    if cached.exists():
-        note_cache_use(state, cached)
-        return str(cached), cached
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    if download_file(url, cached, expected_checksum=checksum):
-        note_cache_use(state, cached)
-        enforce_cache_budget(config, state, protect=cached, added_bytes=cached.stat().st_size)
-        return str(cached), cached
-    return url, None
 
 # --- Video Processing ---
 def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
@@ -2820,23 +2887,24 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         # Default: preview only, nothing written to disk deliberately - the
         # locally cached file is the one exception, and it's opt-out rather
         # than opt-in (see preview_source). 'segment' (the default) fetches
-        # and caches just this verse window - the same byte-approximate
-        # remote seek onthefly mode already relies on, just persisted so a
-        # repeat preview of the same window costs no further bandwidth.
-        # 'cache' instead downloads the WHOLE chapter once and reuses that,
-        # worth it only if you'll preview several different verses from the
-        # same chapter in this session. 'remote' always streams straight
-        # from the URL and never touches disk. Either way the remote URL is
-        # still shown alongside what's playing.
+        # and caches just this verse window, reusing whatever's already
+        # cached for this chapter at any granularity (see
+        # resolve_cached_source) - the same byte-approximate remote seek
+        # onthefly mode already relies on, just persisted so a repeat
+        # preview of an already-covered window costs no further bandwidth.
+        # 'cache' additionally downloads the WHOLE chapter on a miss instead
+        # of just the window, worth it only if you'll preview several
+        # different verses from the same chapter in this session. 'remote'
+        # always streams straight from the URL and never touches disk.
+        # Either way the remote URL is still shown alongside what's playing.
         source = url
         cached_path = None
         preview_source = config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower()
-        if preview_source == "segment":
-            source, cached_path = resolve_segment_source(url, lang, book_num, chapter, start_time, end_time, config, state)
-            if cached_path:
-                start_time, end_time = 0.0, end_time - start_time
-        elif preview_source != "remote":
-            source, cached_path = resolve_chapter_cache_source(url, lang, checksum, config, state)
+        if preview_source != "remote":
+            source, cached_path, start_time, end_time = resolve_cached_source(
+                url, lang, book_num, chapter, checksum, start_time, end_time, config, state,
+                fetch_whole=(preview_source == "cache"),
+            )
         # cache_in_use holds the file protected from another thread's
         # concurrent enforce_cache_budget call for as long as this preview
         # is actually reading it (mpv/ffplay playback can run for a while).
@@ -2891,54 +2959,31 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             extract_verse_sections(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
         else:
             extract_verse(url, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=True, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
-    elif extract_mode == "segment":
-        # Same idea as extract_mode=cache below, but scoped to just this
-        # verse window instead of the whole chapter (see resolve_segment_
-        # source) - the right call for a one-off extract, or a few verses
-        # spread across many languages, rather than several different
-        # verses from the same chapter (chapter-level 'cache' amortizes
-        # better there).
-        local_path, cached_seg = resolve_segment_source(url, lang, book_num, chapter, start_time, end_time, config, state)
+    else:
+        # 'segment' fetches just this verse window on a miss; 'cache'
+        # additionally pulls the whole chapter on a miss. Either way,
+        # resolve_cached_source first reuses whatever's already cached for
+        # this chapter - at ANY granularity, from any previous segment/
+        # cache/preview/find --play request - before touching the network.
+        fetch_whole = extract_mode == "cache"
+        local_path, cached_artifact, local_start, local_end = resolve_cached_source(
+            url, lang, book_num, chapter, checksum, start_time, end_time, config, state, fetch_whole=fetch_whole,
+        )
+        if cached_artifact is None and fetch_whole:
+            return lang, None, f"Download failed for {lang} {book_name} {chapter}."
         if not getattr(args, "quiet", False):
             print(f"[{lang}] Source cache: {local_path}")
             print(f"[{lang}] Source: {url}")
-        with cache_in_use(cached_seg) if cached_seg else contextlib.nullcontext():
-            local_start, local_end = (0.0, duration) if cached_seg else (start_time, end_time)
+        with cache_in_use(cached_artifact) if cached_artifact else contextlib.nullcontext():
             if mode:
                 extract_verse_sections(local_path, out_filename, local_start, local_end, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
             else:
-                extract_verse(local_path, out_filename, local_start, local_end, book_name, chapter, verses_str, lang, config, remote=cached_seg is None, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
-    else:
-        cache_dir = Path(config["cache_dir"]) / lang
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        local_path = cache_dir / url.split("/")[-1]
+                extract_verse(local_path, out_filename, local_start, local_end, book_name, chapter, verses_str, lang, config, remote=cached_artifact is None, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
 
-        newly_downloaded = not local_path.exists()
-        if newly_downloaded:
-            if not download_file(url, local_path, expected_checksum=checksum):
-                return lang, None, f"Download failed for {lang} {book_name} {chapter}."
-        else:
-            if not getattr(args, "quiet", False): print(f"[{lang}] Using cached video file.")
-
-        if not getattr(args, "quiet", False):
-            print(f"[{lang}] Source cache: {local_path}")
-            print(f"[{lang}] Source: {url}")
-
-        note_cache_use(state, local_path)
-        # Protects local_path from a concurrent thread's enforce_cache_budget
-        # call for as long as ffmpeg is actually reading it here.
-        with cache_in_use(local_path):
-            if mode:
-                extract_verse_sections(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, mode, boundaries, speed, source_labels=source_labels, metadata_args=metadata_args)
-            else:
-                extract_verse(local_path, out_filename, start_time, end_time, book_name, chapter, verses_str, lang, config, remote=False, source_labels=source_labels, kept_segments=kept_segments, fade_outs=fade_outs, metadata_args=metadata_args)
-
-        if config.get("cache_policy") == "delete_after_use":
-            os.remove(local_path)
-            state["_cache_access"].pop(str(local_path), None)
+        if cached_artifact and config.get("cache_policy") == "delete_after_use":
+            cached_artifact.unlink(missing_ok=True)
+            state.get("_cache_access", {}).pop(str(cached_artifact), None)
             print(f"[{lang}] Cleaned up cached video file.")
-        else:
-            enforce_cache_budget(config, state, protect=local_path, added_bytes=local_path.stat().st_size if newly_downloaded else 0)
 
     chapters_meta = markers_to_verse_times(load_index(lang).get(f"{book_num}_{chapter}", {}).get("markers", []))
     add_verse_chapters(out_filename, chapters_meta, valid_verses, start_time, end_time, book_name, chapter, chapter_timeline)
@@ -3064,7 +3109,9 @@ def group_contiguous_preview_rows(results):
 def cmd_find(args, config):
     """Default output is a compact checkmark table grouped by language -
     easiest to scan at a glance, and the format non-technical users actually
-    want. --verbose brings back the full URL/mpv-command block per match;
+    want, followed by opening a preview for each match (pass --list-only/-l
+    to skip previewing). --verbose brings back the full URL/mpv-command
+    block per match;
     --json is for scripts (always the full lang x verse array, found or
     not). 'verse' takes a single verse, a range (25-27), or a comma list,
     the same syntax extract's reference string uses."""
@@ -3140,37 +3187,38 @@ def cmd_find(args, config):
                 print(f"{mark} {lang_display(lang, jwlangs)} {r['book']} {r['chapter']}:{r['verse']}")
             print()
 
-    if args.play:
+    if not args.list_only:
         if not command_exists("mpv"):
-            print(COLOR.yellow("(--play needs mpv, which isn't installed)"))
+            print(COLOR.yellow("(preview needs mpv, which isn't installed - pass --list-only/-l to skip previewing)"))
         else:
             to_play = group_contiguous_preview_rows(results)
             multi = len(to_play) > 1
             window_size = config.get("preview_window_size", DEFAULT_CONFIG["preview_window_size"])
             # Same preview_source knob extract's own no-write preview uses:
             # 'remote' streams straight from the CDN and never touches disk.
-            # 'segment' (the default) fetches and caches just this exact
-            # contiguous requested window (see resolve_segment_source) -
-            # cheap, but a *different* verse range from the same chapter is
-            # a cache miss and re-hits the network. 'cache' instead
-            # downloads the whole chapter once (resolve_chapter_cache_source)
-            # and reuses it for any verse window in that chapter - worth it
-            # when you'll preview several different ranges from one chapter.
+            # 'segment' (the default) fetches just the requested window on a
+            # miss; 'cache' additionally pulls the whole chapter on a miss.
+            # Either way resolve_cached_source reuses whatever's already
+            # cached for this chapter - at any granularity, from any prior
+            # segment/cache/preview/find --play request - before touching
+            # the network, so a *different* verse range from an
+            # already-cached chapter is never a cache miss just because it
+            # doesn't match a previous request byte-for-byte.
             preview_source = config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower()
             if multi:
                 print(f"\nOpening {len(to_play)} preview windows, one per language/contiguous range, all paused - unpause each to review it.")
 
             def resolve_preview(item):
                 i, row = item
-                start_str = f"{int(row['start']//3600):02d}:{int(row['start']%3600//60):02d}:{row['start']%60:06.3f}"
-                dur = row["end"] - row["start"]
+                start, end = row["start"], row["end"]
                 play_source = row["url"]
-                if preview_source == "segment":
-                    play_source, cached_segment = resolve_segment_source(row["url"], row["lang"], book_num, row["chapter"], row["start"], row["end"], config, state)
-                    if cached_segment:
-                        start_str = "00:00:00.000"
-                elif preview_source == "cache":
-                    play_source, _cached_chapter = resolve_chapter_cache_source(row["url"], row["lang"], row.get("checksum"), config, state)
+                if preview_source != "remote":
+                    play_source, _cached, start, end = resolve_cached_source(
+                        row["url"], row["lang"], book_num, row["chapter"], row.get("checksum"), start, end, config, state,
+                        fetch_whole=(preview_source == "cache"),
+                    )
+                start_str = f"{int(start//3600):02d}:{int(start%3600//60):02d}:{start%60:06.3f}"
+                dur = end - start
                 return i, row, start_str, dur, play_source
 
             workers = min(len(to_play), int(config.get("preview_max_parallel", DEFAULT_CONFIG["preview_max_parallel"])))
@@ -3405,7 +3453,8 @@ def main():
     p_find.add_argument("book", help="Book name or number")
     p_find.add_argument("chapter", type=int)
     p_find.add_argument("verse", help="Single verse, a range (25-27), or a comma list (1,3,5)")
-    p_find.add_argument("-p", "--play", action="store_true", help="Also stream-preview each match with mpv")
+    p_find.add_argument("-p", "--play", action="store_true", help="Stream-preview each match with mpv (default: on - this flag is kept only for older scripts/muscle memory)")
+    p_find.add_argument("-l", "--list-only", action="store_true", help="List matches only, don't open previews")
     add_find_parallel_argument(p_find)
     p_find.add_argument("-v", "--verbose", action="store_true", help="Show full match details (URL, mpv command) instead of the compact checkmark list")
     p_find.add_argument("--json", action="store_true", help="Machine-readable JSON instead of the checkmark list (always includes every synced language, found or not)")
