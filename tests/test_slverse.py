@@ -2594,6 +2594,36 @@ class SlverseFindPlayCacheTest(unittest.TestCase):
         self.assertEqual(self.segment_download_calls, [])
         self.assertEqual(self.download_calls, [])
 
+    def test_multi_language_play_only_focuses_first_window_parallel(self) -> None:
+        # Regression coverage: every cascaded preview window used to call
+        # focus_process, so each new window stole focus and covered the one
+        # already being watched. Only the first window that actually opens
+        # should take focus; the rest must open behind it. This exercises
+        # the ThreadPoolExecutor (as_completed) branch, where launch order
+        # can differ from the original per-language result order.
+        self.slverse.synced_languages = lambda: ["ASL", "BVL"]
+        launch_calls: list = []
+        self.slverse.launch_mpv = lambda *a, **k: launch_calls.append(k)
+
+        self.slverse.cmd_find(self.find_args("23"), self.config(preview_source="segment", preview_max_parallel="4"))
+
+        self.assertEqual(len(launch_calls), 2)
+        self.assertEqual(sorted(call["focus"] for call in launch_calls), [False, True])
+
+    def test_multi_language_play_only_focuses_first_window_sequential(self) -> None:
+        # Same invariant as above, but for the sequential fallback branch
+        # (preview_max_parallel=1 skips the thread pool entirely).
+        self.slverse.synced_languages = lambda: ["ASL", "BVL"]
+        launch_calls: list = []
+        self.slverse.launch_mpv = lambda *a, **k: launch_calls.append(k)
+
+        self.slverse.cmd_find(self.find_args("23"), self.config(preview_source="segment", preview_max_parallel="1"))
+
+        self.assertEqual(len(launch_calls), 2)
+        self.assertEqual(sorted(call["focus"] for call in launch_calls), [False, True])
+        self.assertTrue(launch_calls[0]["focus"])
+        self.assertFalse(launch_calls[1]["focus"])
+
 
 class SlverseLaunchMpvTest(unittest.TestCase):
     @classmethod
@@ -2652,6 +2682,21 @@ class SlverseLaunchMpvTest(unittest.TestCase):
     def test_rich_text_outer_quotes_do_not_become_part_of_mpv_flags(self) -> None:
         self.assertEqual(self.slverse.parse_mpv_options("“--fs --screen=1”"), ["--fs", "--screen=1"])
 
+    def test_focus_process_called_by_default(self) -> None:
+        pids = []
+        self.slverse.focus_process = lambda pid: pids.append(pid)
+        self.slverse.launch_mpv(["file.mp4"])
+        self.assertEqual(pids, [1234])
+
+    def test_focus_false_skips_focus_process(self) -> None:
+        # cmd_find's multi-window cascade passes focus=False for every
+        # window after the first, so a later window doesn't steal focus and
+        # cover the one already being watched.
+        pids = []
+        self.slverse.focus_process = lambda pid: pids.append(pid)
+        self.slverse.launch_mpv(["file.mp4"], focus=False)
+        self.assertEqual(pids, [])
+
     def test_overlay_free_preview_plays_source_without_temp_encode(self) -> None:
         self.slverse.command_exists = lambda name: True
         self.slverse.detect_caption_box = lambda *a, **k: None
@@ -2664,6 +2709,19 @@ class SlverseLaunchMpvTest(unittest.TestCase):
         self.assertIn("--start=10.0", cmd)
         self.assertIn("--length=5.0", cmd)
         self.assertEqual(cmd[-1], "source.mp4")
+        # Single-language preview used to force fullscreen; it should now be
+        # windowed at the same size as the multi-language cascade.
+        self.assertIn("--fullscreen=no", cmd)
+        self.assertIn(f"--autofit={self.slverse.DEFAULT_CONFIG['preview_window_size']}", cmd)
+
+    def test_overlay_free_preview_honors_configured_window_size(self) -> None:
+        self.slverse.command_exists = lambda name: True
+        self.slverse.detect_caption_box = lambda *a, **k: None
+        self.slverse.build_overlay_filter = lambda *a, **k: None
+
+        self.slverse.preview_verse("source.mp4", 10.0, 15.0, "Psalm", 16, [("11", 0.0, 1.0)], "FSL", {"preview_window_size": "50%"}, use_mpv=True)
+
+        self.assertIn("--autofit=50%", self.captured_cmd[0])
 
     def test_overlay_preview_keeps_compatible_external_ffmpeg_encode(self) -> None:
         self.slverse.command_exists = lambda name: True
@@ -2677,6 +2735,11 @@ class SlverseLaunchMpvTest(unittest.TestCase):
         self.assertEqual(len(ffmpeg_calls), 1)
         self.assertEqual(ffmpeg_calls[0][ffmpeg_calls[0].index("-vf") + 1], "drawtext=text='ASL'")
         self.assertIn("ultrafast", ffmpeg_calls[0])
+        # The temp-encoded overlay preview should also be windowed, not
+        # fullscreen, matching the overlay-free path above.
+        cmd = self.captured_cmd[0]
+        self.assertIn("--fullscreen=no", cmd)
+        self.assertIn(f"--autofit={self.slverse.DEFAULT_CONFIG['preview_window_size']}", cmd)
 
 class SlverseAddToPathProfileTest(unittest.TestCase):
     @classmethod

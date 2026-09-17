@@ -121,7 +121,7 @@ DEFAULT_CONFIG = {
     "auto_sync_interval_hours": "24",
     "auto_sync_background": "true",  # run the once-a-day refresh as a detached subprocess so it never blocks the current command; false restores the old blocking-in-foreground behavior
     "preview_source": "segment",  # extract's preview mode (no --write) and find --play: 'segment' fetches just the verse window being previewed on a miss - fast, never pulls a whole chapter just to preview a few seconds of it - but reuses whatever's already cached for that chapter at ANY granularity (a whole chapter, a range, or another verse), so it's never a repeat cache miss just because the exact window differs from a prior request; 'cache' additionally pulls the WHOLE chapter on a miss, worth it only if you'll preview several different verses from the same chapter; 'remote' always streams straight from the URL and never touches disk
-    "preview_window_size": "65%",  # multi-language preview windows (slverse find --play), as an mpv --autofit percentage of screen size - ignored for a single-language preview, which still autoplays fullscreen
+    "preview_window_size": "65%",  # every mpv preview/playback window slverse opens (extract's live preview, extract -m/--play, find --play), as an mpv --autofit percentage of screen size, aspect preserved
     "preview_max_parallel": "4",  # concurrent segment downloads for find --play; each completed language window opens while the remaining downloads continue
     "font_path": "",  # full manual override (skips font_family entirely, same file used for main text + delogo sizing)
     "font_family": "noto-sans-display",  # noto-sans-display, inter, google-sans-flex - see FONT_FAMILIES
@@ -228,7 +228,7 @@ CONFIG_HELP = {
     "auto_sync_interval_hours": "Hours between automatic refreshes",
     "auto_sync_background": "Run the automatic refresh as a detached background process instead of blocking",
     "preview_source": "segment (default, fetch just the verse window on a miss, reusing any already-cached window for that chapter), cache (also pull the whole chapter on a miss), or remote (always stream) - for preview (extract without --write) and find --play",
-    "preview_window_size": "mpv --autofit percentage for 'find --play' multi-language preview windows",
+    "preview_window_size": "mpv --autofit percentage for every preview/playback window (extract preview, extract -m, find --play)",
     "preview_max_parallel": "Concurrent segment downloads for find --play (default 4)",
     "font_path": "Manual font file override (skips font_family)",
     "font_family": "noto-sans-display, inter, or google-sans-flex",
@@ -401,7 +401,7 @@ def parse_mpv_options(value):
     return shlex.split(value)
 
 
-def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, geometry=None, autofit=None, config=None):
+def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, geometry=None, autofit=None, config=None, focus=True):
     """Spawn mpv with `args` and try to bring it to the front on every OS.
     --force-window=immediate plus mpv's own --focus-on=open default (mpv
     0.34+) cover Linux/Windows window managers reasonably well; see
@@ -423,7 +423,16 @@ def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, g
     disables the mouse-hover on-screen controller) never applies to windows
     slverse opens - pass `config` so the mpv_show_osc setting (default true,
     matching stock mpv) can add --osc=no back in per-user, without changing
-    the default for anyone who hasn't set it."""
+    the default for anyone who hasn't set it.
+
+    focus=False skips the focus_process front-bringing call below, so this
+    window opens without disturbing whatever's already frontmost - a
+    launch from a background terminal process doesn't get the NSApplication
+    activation a Dock/Finder launch would (see focus_process), so a window
+    opened this way simply doesn't steal focus rather than needing to be
+    explicitly sent to the back. cmd_find's multi-language --play cascade
+    uses this for every window after the first, so you can start watching
+    the one already on top while the rest keep opening behind it."""
     cmd = ["mpv", "--no-config", "--force-window=immediate"]
     cmd.append("--fullscreen=yes" if fullscreen else "--fullscreen=no")
     cmd.append("--keep-open=yes" if keep_open else "--no-keep-open")
@@ -439,7 +448,8 @@ def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, g
         cmd += parse_mpv_options(config["mpv_options"])
     cmd += list(args)
     proc = subprocess.Popen(cmd)
-    focus_process(proc.pid)
+    if focus:
+        focus_process(proc.pid)
     if wait:
         proc.wait()
     return proc
@@ -1693,8 +1703,9 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_window
             print(f"Previewing: {source}")
             if from_cache:
                 print(f"Source: {source_url}")
+            window_size = config.get("preview_window_size", DEFAULT_CONFIG["preview_window_size"])
             if not overlay:
-                launch_mpv([f"--start={start_time}", f"--length={duration}", str(source)], config=config)
+                launch_mpv([f"--start={start_time}", f"--length={duration}", str(source)], config=config, fullscreen=False, autofit=window_size)
                 return
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_out = Path(tmp_dir) / "preview.mkv"
@@ -1703,7 +1714,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_window
                     cmd += ["-vf", overlay]
                 cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "copy", "-f", "matroska", str(tmp_out)]
                 run_ffmpeg(cmd, duration=duration)
-                launch_mpv([str(tmp_out)], config=config)
+                launch_mpv([str(tmp_out)], config=config, fullscreen=False, autofit=window_size)
             return
 
     ffplay_args = ["-ss", str(start_time), "-t", str(duration), "-i", str(source)]
@@ -3122,7 +3133,8 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
 
     if args.play:
         if command_exists("mpv"):
-            launch_mpv([out_filename], config=config)
+            window_size = config.get("preview_window_size", DEFAULT_CONFIG["preview_window_size"])
+            launch_mpv([out_filename], config=config, fullscreen=False, autofit=window_size)
         else:
             print(COLOR.yellow(f"[{lang}] (--play needs mpv, which isn't installed)"))
 
@@ -3338,7 +3350,7 @@ def cmd_find(args, config):
             # doesn't match a previous request byte-for-byte.
             preview_source = config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower()
             if multi:
-                print(f"\nOpening {len(to_play)} preview windows, one per language/contiguous range, all paused - unpause each to review it.")
+                print(f"\nOpening {len(to_play)} preview windows, one per language/contiguous range, all paused - unpause each to review it. Only the first window takes focus; the rest open behind it.")
 
             def resolve_preview(item):
                 i, row = item
@@ -3359,23 +3371,31 @@ def cmd_find(args, config):
                     resolved = (future.result() for future in concurrent.futures.as_completed(
                         [pool.submit(resolve_preview, item) for item in enumerate(to_play)]
                     ))
-                    for i, r, start_str, dur, play_source in resolved:
+                    # launch_i tracks launch order (not original list order i,
+                    # which as_completed() scrambles) so only the window that
+                    # actually opens first takes focus - every later window
+                    # opens behind it instead of covering what's already
+                    # playing. See launch_mpv's focus= docstring.
+                    for launch_i, (i, r, start_str, dur, play_source) in enumerate(resolved):
                         launch_mpv(
                             [f"--start={start_str}", f"--length={dur:.3f}", play_source],
                             wait=False, fullscreen=not multi, paused=multi, config=config,
                             autofit=window_size if multi else None,
                             geometry=f"+{40 + (i % 5) * 60}+{40 + (i % 5) * 60}" if multi else None,
+                            focus=(launch_i == 0),
                         )
             else:
                 for item in enumerate(to_play):
                     i, r, start_str, dur, play_source = resolve_preview(item)
-                    # Multiple matches are windowed/paused and cascaded;
+                    # Multiple matches are windowed/paused and cascaded, only
+                    # the first taking focus so the rest open behind it;
                     # a single match keeps fullscreen autoplay.
                     launch_mpv(
                         [f"--start={start_str}", f"--length={dur:.3f}", play_source],
                         wait=False, fullscreen=not multi, paused=multi, config=config,
                         autofit=window_size if multi else None,
                         geometry=f"+{40 + (i % 5) * 60}+{40 + (i % 5) * 60}" if multi else None,
+                        focus=(i == 0),
                     )
             save_state(state)
 
