@@ -2697,6 +2697,18 @@ class SlverseLaunchMpvTest(unittest.TestCase):
         self.slverse.launch_mpv(["file.mp4"], focus=False)
         self.assertEqual(pids, [])
 
+    def test_focus_false_also_tells_mpv_not_to_self_focus(self) -> None:
+        # focus_process alone wasn't enough: mpv's own --focus-on=open
+        # default still self-activates a newly created window on at least
+        # some window managers, independent of whether the launching
+        # process itself was activated. focus=False must override that too.
+        self.slverse.launch_mpv(["file.mp4"], focus=False)
+        self.assertIn("--focus-on=never", self.captured_cmd[0])
+
+    def test_focus_true_does_not_override_mpvs_own_focus_on_default(self) -> None:
+        self.slverse.launch_mpv(["file.mp4"])
+        self.assertNotIn("--focus-on=never", self.captured_cmd[0])
+
     def test_overlay_free_preview_plays_source_without_temp_encode(self) -> None:
         self.slverse.command_exists = lambda name: True
         self.slverse.detect_caption_box = lambda *a, **k: None

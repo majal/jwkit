@@ -425,17 +425,21 @@ def launch_mpv(args, wait=True, fullscreen=True, keep_open=True, paused=False, g
     matching stock mpv) can add --osc=no back in per-user, without changing
     the default for anyone who hasn't set it.
 
-    focus=False skips the focus_process front-bringing call below, so this
-    window opens without disturbing whatever's already frontmost - a
-    launch from a background terminal process doesn't get the NSApplication
-    activation a Dock/Finder launch would (see focus_process), so a window
-    opened this way simply doesn't steal focus rather than needing to be
-    explicitly sent to the back. cmd_find's multi-language --play cascade
-    uses this for every window after the first, so you can start watching
-    the one already on top while the rest keep opening behind it."""
+    focus=False skips the focus_process front-bringing call below AND tells
+    mpv itself not to focus its own new window (--focus-on=never - mpv's
+    default is --focus-on=open, which turned out to be the real culprit:
+    even with focus_process skipped, mpv 0.34+ still self-activates its own
+    window on creation on at least some window managers, so a background-
+    process launch not getting NSApplication activation wasn't sufficient
+    on its own). cmd_find's multi-language --play cascade passes focus=False
+    for every window after the first, so you can start watching the one
+    already on top while the rest keep opening behind it instead of each
+    new one covering the last."""
     cmd = ["mpv", "--no-config", "--force-window=immediate"]
     cmd.append("--fullscreen=yes" if fullscreen else "--fullscreen=no")
     cmd.append("--keep-open=yes" if keep_open else "--no-keep-open")
+    if not focus:
+        cmd.append("--focus-on=never")
     if config is not None and str(config.get("mpv_show_osc", DEFAULT_CONFIG["mpv_show_osc"])).strip().lower() == "false":
         cmd.append("--osc=no")
     if paused:
