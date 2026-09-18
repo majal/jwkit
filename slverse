@@ -1511,7 +1511,17 @@ def build_overlay_filter(lang, book_name, chapter, verse_windows, config, show_b
         expr = str(base)
         for fade_start, fade_end, is_final in reversed(fade_outs or []):
             if is_final:
-                expr = f"if(between(t\\,{fade_start:.3f}\\,{fade_end:.3f})\\,{base}*({fade_end:.3f}-t)/{fade_end - fade_start:.3f}\\,{expr})"
+                # Unlike the mid-transition dip below, this must resolve to a
+                # hard 0 once t passes fade_end, not fall through to `expr`
+                # (which defaults to full opacity) - build_overlay_filter
+                # leaves this label's own `enable` window open-ended past
+                # this point (see its last-window comment), specifically so
+                # a RIFE/interpolation timeline that overshoots this fade's
+                # source-marker-derived end by a few ms doesn't drop the
+                # caption outright; that only stays correct if this
+                # expression, not `enable`, is what keeps the label hidden
+                # once its fade-out is actually done.
+                expr = f"if(lt(t\\,{fade_start:.3f})\\,{expr}\\,if(lt(t\\,{fade_end:.3f})\\,{base}*({fade_end:.3f}-t)/{fade_end - fade_start:.3f}\\,0))"
                 continue
             third = (fade_end - fade_start) / 3
             down_end, up_start = fade_start + third, fade_end - third
@@ -1568,9 +1578,30 @@ def build_overlay_filter(lang, book_name, chapter, verse_windows, config, show_b
         # docstring. A single-verse clip is just one window covering the
         # whole duration, so this collapses to the old always-on drawtext.
         multi = len(verse_windows) > 1
-        for label, win_start, win_end in verse_windows:
+        last_index = len(verse_windows) - 1
+        for i, (label, win_start, win_end) in enumerate(verse_windows):
             text = f"{book_name} {chapter}:{label}"
-            enable = f":enable='between(t\\,{win_start:.3f}\\,{win_end:.3f})'" if multi else ""
+            if not multi:
+                enable = ""
+            elif i == last_index:
+                # The clip's last verse hands off to nothing, so don't cap
+                # this window with a hard upper bound the way mid-clip
+                # verse-to-verse handoffs need to (those must close exactly
+                # where the next verse's window opens). win_end here is
+                # derived from JW's source-timeline markers, but the actual
+                # written video's last frame can land a few ms past it -
+                # RIFE's target-frame-count rounding, or plain ffmpeg frame
+                # extraction including one extra boundary frame (see
+                # ffrife.render_rife_frames) - and a closed `between()`
+                # window silently drops the caption for those trailing
+                # frames instead of just holding it. Safe to leave open:
+                # fading_alpha's is_final branch (see above) already drives
+                # this exact label's alpha to a hard 0 once its own
+                # end-transition fade completes, so this can't make the
+                # label reappear once it should be gone.
+                enable = f":enable='gte(t\\,{win_start:.3f})'"
+            else:
+                enable = f":enable='between(t\\,{win_start:.3f}\\,{win_end:.3f})'"
             filters.append(f"drawtext=text='{esc(text)}'{font_arg}:fontcolor=white:fontsize={fontsize}:x={x}:y={y}:alpha='{fading_alpha(alpha)}'{enable}")
 
     if show_label:

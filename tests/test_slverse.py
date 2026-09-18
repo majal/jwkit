@@ -1337,8 +1337,18 @@ class SlverseOverlayFilterTest(unittest.TestCase):
             "ASL", "Psalm", 16, [("11", 0.0, 1.0)], self.config(default_target_lang="FSL"), show_box=False,
             fade_outs=[(10.0, 13.0, True)],
         )
-        self.assertIn("if(between(t\\,10.000\\,13.000)", result)
-        self.assertNotIn("if(lt(t", result)
+        # Single-window clip: no `enable` gate at all (see
+        # test_single_window_has_no_enable_gate), so this fade's own alpha
+        # expression is what has to resolve to a hard 0 once t passes
+        # fade_end=13.0, not fall back to full opacity - see fading_alpha's
+        # is_final branch.
+        self.assertIn("if(lt(t\\,10.000)", result)
+        self.assertIn("if(lt(t\\,13.000)", result)
+        self.assertIn(",0))", result)
+        # One-way: ramps down from base to 0 and stays there - never ramps
+        # back up the way a mid-transition's down/hold/up dip would (that
+        # ramp's the only place this alpha math ever writes literal "t-").
+        self.assertNotIn("t-", result)
 
 
 class SlverseOverlayFadeOutsTest(unittest.TestCase):
@@ -1543,8 +1553,12 @@ class SlverseBuildOverlayFilterMultiVerseTest(unittest.TestCase):
         )
         self.assertIn(r"drawtext=text='Matthew 5\:23'", result)
         self.assertIn(r"drawtext=text='Matthew 5\:24'", result)
+        # Mid-clip handoff: closed on both ends, verse 23 -> 24 exactly at 12.0.
         self.assertIn("enable='between(t\\,0.000\\,12.000)'", result)
-        self.assertIn("enable='between(t\\,12.000\\,20.000)'", result)
+        # Last verse hands off to nothing, so its window stays open past
+        # win_end - see build_overlay_filter's last-window comment.
+        self.assertIn("enable='gte(t\\,12.000)'", result)
+        self.assertNotIn("between(t\\,12.000\\,20.000)", result)
         # Exactly one delogo covering the whole clip - the blurred region
         # itself doesn't move between verses, only the text drawn over it.
         self.assertEqual(result.count("delogo="), 1)
