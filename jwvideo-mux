@@ -1553,16 +1553,33 @@ _RIFE_SUFFIX_RE = re.compile(r"_rife$")
 _RESOLUTION_TOKEN_RE = re.compile(r"\br\d+[pP]\b")
 
 
-def parse_lang_tokens(raw: str | None) -> tuple[list[str], dict[str, Path]]:
+def _looks_like_local_file(token: str) -> bool:
+    """Heuristic for parse_lang_tokens: does a bare (no '=') token look like a filename rather
+    than a language code? Real language codes here are always short, plain alphabetic strings
+    (see KNOWN_LANGUAGES) with no path separator or extension, so a '/' or '\\' (a directory
+    component) or a '.' (an extension) is enough to tell the two apart -- deliberately not also
+    checking Path(token).is_file(), since that would depend on the current directory's actual
+    contents and could misfire on a same-named file that happens to sit in it."""
+    return "/" in token or "\\" in token or "." in token
+
+
+def parse_lang_tokens(raw: str | None) -> tuple[list[str | None], dict[str, Path], dict[int, Path]]:
     """Parse a -v/-a/-s value into language codes, in order, plus any `CODE=path/to/file`
-    overrides. The override form lets a user pin an exact local file to a language code
-    instead of relying on filename-matching heuristics -- useful when local-file-mode
-    discovery would otherwise be ambiguous (e.g. a _rife and non-_rife encode, or two
-    different resolutions, of the same language sitting in the same folder)."""
-    codes: list[str] = []
+    overrides and bare-filename entries.
+
+    `CODE=path` pins an exact local file to a language explicitly. A bare token with no `=`
+    that looks like a filename (see _looks_like_local_file) is left as a `None` placeholder in
+    `codes` at its original position, paired with its path in the returned `bare` dict
+    (`{index: path}`) -- a plain code string alone can't tell "TG" (a language) from
+    "video.mp4" (a file) apart, so resolving a bare entry into a real code needs
+    infer_lang_code_from_filename, which the caller runs once it knows the local-file-mode base
+    video to infer against (not available here, since this function only sees one -v/-a/-s value
+    at a time)."""
+    codes: list[str | None] = []
     overrides: dict[str, Path] = {}
+    bare: dict[int, Path] = {}
     if not raw:
-        return codes, overrides
+        return codes, overrides, bare
     for token in raw.split(","):
         token = token.strip()
         if not token:
@@ -1572,9 +1589,67 @@ def parse_lang_tokens(raw: str | None) -> tuple[list[str], dict[str, Path]]:
             code = code.strip().upper()
             codes.append(code)
             overrides[code] = Path(path.strip()).expanduser()
+        elif _looks_like_local_file(token):
+            bare[len(codes)] = Path(token).expanduser()
+            codes.append(None)
         else:
             codes.append(token.upper())
-    return codes, overrides
+    return codes, overrides, bare
+
+
+def infer_lang_code_from_filename(path: Path, base_vid_path: Path, base_lang: str) -> str | None:
+    """Infer a bare file's language code by checking whether its name follows the same
+    `{prefix}_{CODE}_...` convention as base_vid_path, where `{prefix}` is everything before
+    `_{base_lang}_` in base_vid_path's own name.
+
+    Deliberately looser than resolve_language_video_candidates' reverse lookup (which also
+    requires the tail *after* the code to match before trusting a candidate): here the caller
+    already handed us one specific file, so there's no ambiguity between candidates to resolve,
+    and requiring the tail to match too would defeat the point -- the tail (resolution, a _rife
+    suffix, ...) is exactly what's expected to differ when a language was only ever downloaded
+    at a different resolution or without RIFE interpolation. Returns None if base_vid_path
+    doesn't use the convention at all, or path's name doesn't share its prefix -- a bare file is
+    a convenience over the unambiguous CODE=path form, not a guess-at-all-costs feature.
+    """
+    marker = f"_{base_lang}_"
+    if marker not in base_vid_path.name:
+        return None
+    prefix = base_vid_path.name.split(marker, 1)[0]
+    match = re.match(rf"^{re.escape(prefix)}_([A-Za-z]{{1,6}})_", path.name)
+    return match.group(1).upper() if match else None
+
+
+def resolve_bare_file_langs(
+    codes: list[str | None], bare: dict[int, Path], base_vid_path: Path | None, base_lang: str, flag: str,
+) -> dict[str, Path]:
+    """Fill in the `None` placeholders parse_lang_tokens leaves for bare-filename tokens,
+    inferring each one's language code via infer_lang_code_from_filename. Mutates `codes` in
+    place so the caller's language list ends up with real codes at the same positions, and
+    returns `{code: path}` to merge into that flag's own override dict.
+
+    A bare file can't always be resolved: with no local-file-mode base to compare against (an
+    API-mode docid/URL input), or a filename that doesn't share the base's naming convention
+    closely enough to infer from, this is a hard error pointing at the explicit CODE=path form
+    rather than silently guessing wrong.
+    """
+    resolved: dict[str, Path] = {}
+    for index, path in bare.items():
+        if base_vid_path is None:
+            color_print(
+                f"  Bare filename '{path}' in {flag} needs local file mode (an existing file as "
+                f"the main input) to infer its language -- use {flag} CODE={path} instead.", "red",
+            )
+            sys.exit(1)
+        code = infer_lang_code_from_filename(path, base_vid_path, base_lang)
+        if code is None:
+            color_print(
+                f"  Could not infer a language code for '{path}' from its filename -- pin it "
+                f"explicitly instead, e.g. {flag} CODE={path}.", "red",
+            )
+            sys.exit(1)
+        codes[index] = code
+        resolved[code] = path
+    return resolved
 
 
 def _lang_glob_pattern(base_name: str, base_lang: str, lang: str) -> str | None:
@@ -1662,14 +1737,44 @@ def resolve_language_video_candidates(
     return None, candidates
 
 
+_COVER_ART_MIME_TYPES = {"mjpeg": "image/jpeg", "png": "image/png"}
+_COVER_ART_EXTENSIONS = {"mjpeg": ".jpg", "png": ".png"}
+
+
+def find_attached_picture_stream(path: Path) -> tuple[int, str] | None:
+    """Return (v_index, codec_name) for an embedded cover-art/thumbnail stream in `path` -- a
+    video-type stream flagged disposition `attached_pic`, common in jw.org MP4s and ID3-tagged
+    MP3s alike. `v_index` is the stream's position among *video-type* streams only (0-based),
+    matching ffmpeg's `v:N` map specifier. None if `path` has no such stream, or ffprobe can't
+    read it at all.
+
+    This matters because main()'s primary mux path maps each language's video with an explicit
+    `-map idx:v:0` (its *first* video stream, i.e. the real footage) -- which never happens to
+    also pick up a later attached-pic stream, so any embedded cover art is otherwise silently
+    dropped from the merged output even though nothing asked for that."""
+    try:
+        raw = command_output([
+            "ffprobe", "-v", "error", "-select_streams", "v",
+            "-show_entries", "stream=index,codec_name:stream_disposition=attached_pic",
+            "-of", "json", str(path),
+        ])
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    streams = json.loads(raw).get("streams", [])
+    for v_index, stream in enumerate(streams):
+        if stream.get("disposition", {}).get("attached_pic") == 1:
+            return v_index, stream.get("codec_name", "")
+    return None
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         return run_config(sys.argv[2:])
     parser = argparse.ArgumentParser(description="jwvideo-mux: Merge videos, audio, and subtitles from jw.org")
     parser.add_argument("input", help="URL, docid, or local file pattern to process")
-    parser.add_argument("-v", "--video", help="Comma-separated language codes for video tracks; a code may be CODE=path/to/file.mp4 to pin an exact local file instead of auto-matching one")
-    parser.add_argument("-a", "--audio", help="Comma-separated language codes for audio tracks; a code may be CODE=path/to/file to pin an exact local file instead of auto-matching one")
-    parser.add_argument("-s", "--subs", help="Comma-separated subtitle languages; empty uses video/audio languages; a code may be CODE=path/to/file.vtt to pin an exact local file")
+    parser.add_argument("-v", "--video", help="Comma-separated language codes for video tracks; an entry may instead be CODE=path/to/file.mp4 to pin an exact local file, or a bare path/to/file.mp4 to have its language code inferred from its filename (local file mode only)")
+    parser.add_argument("-a", "--audio", help="Comma-separated language codes for audio tracks; an entry may instead be CODE=path/to/file to pin an exact local file, or a bare path/to/file to have its language code inferred from its filename (local file mode only)")
+    parser.add_argument("-s", "--subs", help="Comma-separated subtitle languages; empty uses video/audio languages; an entry may instead be CODE=path/to/file.vtt to pin an exact local file, or a bare path/to/file.vtt to have its language code inferred from its filename (local file mode only)")
     parser.add_argument("-r", "--res", "--resolution", dest="res", help="Target resolution")
     parser.add_argument("-c", "--container", choices=["mkv", "mp4"], help="Export container format")
     parser.add_argument("-S", "--single-streams", action=argparse.BooleanOptionalAction, default=None, help="Produce separate single-stream videos")
@@ -1709,42 +1814,66 @@ def main():
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     check_dependencies()
     
-    vid_langs, vid_overrides = parse_lang_tokens(args.video) if args.video and args.video.upper() != "NONE" else ([], {})
-    aud_langs, aud_overrides = parse_lang_tokens(args.audio) if args.audio and args.audio.upper() != "NONE" else ([], {})
+    vid_langs, vid_overrides, vid_bare = parse_lang_tokens(args.video) if args.video and args.video.upper() != "NONE" else ([], {}, {})
+    aud_langs, aud_overrides, aud_bare = parse_lang_tokens(args.audio) if args.audio and args.audio.upper() != "NONE" else ([], {}, {})
 
     # If explicit subs is NONE, then sub_langs is empty.
     if args.subs and args.subs.upper() == "NONE":
-        sub_langs_explicit, sub_overrides = [], {}
-        sub_langs = []
+        sub_langs_explicit, sub_overrides, sub_bare = [], {}, {}
+        sub_langs_defaulted = False
     elif not args.subs:
         # Default to all media langs if not specified
-        sub_langs_explicit, sub_overrides = [], {}
-        sub_langs = list(dict.fromkeys(vid_langs + aud_langs))
+        sub_langs_explicit, sub_overrides, sub_bare = [], {}, {}
+        sub_langs_defaulted = True
     else:
-        sub_langs_explicit, sub_overrides = parse_lang_tokens(args.subs)
+        sub_langs_explicit, sub_overrides, sub_bare = parse_lang_tokens(args.subs)
+        sub_langs_defaulted = False
+
+    # The base language (whichever -v/-a code names the file given as the main input) can't
+    # itself be a bare-filename entry -- that file is already the positional input, so pointing
+    # -v/-a's *first* code at another file doesn't mean anything.
+    if vid_langs and vid_langs[0] is None:
+        color_print("Error: the base language (first -v code) can't be a bare filename -- pass it as the main input instead.", "red")
+        sys.exit(1)
+    if not vid_langs and aud_langs and aud_langs[0] is None:
+        color_print("Error: the base language (first -a code) can't be a bare filename -- pass it as the main input instead.", "red")
+        sys.exit(1)
+    base_lang = vid_langs[0] if vid_langs else (aud_langs[0] if aud_langs else "E")
+
+    is_local_file = Path(args.input).is_file()
+    base_vid_path = Path(args.input).absolute() if is_local_file else None
+    for flag, codes, bare, overrides in (
+        ("-v", vid_langs, vid_bare, vid_overrides),
+        ("-a", aud_langs, aud_bare, aud_overrides),
+        ("-s", sub_langs_explicit, sub_bare, sub_overrides),
+    ):
+        overrides.update(resolve_bare_file_langs(codes, bare, base_vid_path, base_lang, flag))
+
+    if sub_langs_defaulted:
+        sub_langs = list(dict.fromkeys(vid_langs + aud_langs))
+    elif args.subs and args.subs.upper() == "NONE":
+        sub_langs = []
+    else:
         sub_langs = sub_langs_explicit
-        
+
     if not vid_langs and not aud_langs and not sub_langs:
         color_print("Error: You must specify at least one video, audio, or subtitle language.", "red")
         sys.exit(1)
-        
+
     all_langs = list(dict.fromkeys(vid_langs + aud_langs + sub_langs))
-    
+
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     local_files = {}
 
-    if Path(args.input).is_file():
+    if is_local_file:
         color_print("\n>> Local file mode detected. Skipping API downloads...", "header")
         # Keep a deliberately supplied symlink location intact. This makes
         # local-language staging possible without copying large source videos.
-        base_vid_path = Path(args.input).absolute()
         if args.output_dir == ".":
             out_dir = base_vid_path.parent
-        
-        base_lang = vid_langs[0] if vid_langs else (aud_langs[0] if aud_langs else "E")
-        
+
         local_files[base_lang] = {'video': base_vid_path}
 
         # Attempt to find a subtitle sidecar for the base video (same name, .vtt or .srt --
@@ -1916,10 +2045,10 @@ def main():
             color_print(f"Variant analysis failed: {exc}", "red")
             sys.exit(1)
         if args.manual_overrides:
-            if not Path(args.input).is_file():
+            if not is_local_file:
                 color_print("  --manual-overrides only applies in local-file mode; ignoring.", "yellow")
             else:
-                anchor_path = Path(args.input).absolute()
+                anchor_path = base_vid_path
                 talk_folder = anchor_path.parent.parent.name
                 try:
                     overrides = load_manual_overrides(args.manual_overrides)
@@ -2146,10 +2275,52 @@ def main():
         sys.exit(0)
     out_path = resolved_out_path
 
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + ff_inputs + ff_maps + ff_meta + ["-c:v", "copy", "-c:a", "copy", str(out_path)]
-    
+    # Carry over base_vid's own embedded cover-art/thumbnail stream, if it has one -- the loops
+    # above only ever map each language's *first* video stream (`idx:v:0`, the real footage),
+    # so a later attached-pic stream nothing else references would otherwise be silently
+    # dropped even though the source file already had it. MP4/MOV can just re-map the existing
+    # stream (ffmpeg preserves its attached_pic disposition through a stream copy automatically);
+    # Matroska does not carry that disposition through a plain re-map (confirmed empirically),
+    # so for mkv the single frame is extracted to a standalone temp image and added via
+    # ffmpeg's dedicated -attach mechanism instead, which matroska does mark correctly.
+    art_extra_args: list[str] = []
+    art_temp_path: Path | None = None
+    if base_vid:
+        attached_pic = find_attached_picture_stream(base_vid)
+        if attached_pic is not None:
+            art_v_index, art_codec = attached_pic
+            if args.container == "mp4":
+                art_input_idx = get_or_add_input(base_vid)
+                art_extra_args = ["-map", f"{art_input_idx}:v:{art_v_index}?"]
+            elif art_codec in _COVER_ART_MIME_TYPES:
+                fd, art_temp_name = tempfile.mkstemp(
+                    suffix=_COVER_ART_EXTENSIONS[art_codec], prefix="jwvideo-mux-art-",
+                )
+                os.close(fd)
+                art_temp_path = Path(art_temp_name)
+                extract = subprocess.run([
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(base_vid),
+                    "-map", f"0:v:{art_v_index}", "-frames:v", "1", "-c", "copy", str(art_temp_path),
+                ])
+                if extract.returncode == 0:
+                    attachment_index = video_stream_idx + audio_stream_idx + subtitle_stream_idx
+                    art_extra_args = [
+                        "-attach", str(art_temp_path),
+                        f"-metadata:s:{attachment_index}", f"mimetype={_COVER_ART_MIME_TYPES[art_codec]}",
+                    ]
+                else:
+                    art_temp_path.unlink(missing_ok=True)
+                    art_temp_path = None
+
+    cmd = (
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + ff_inputs + ff_maps + ff_meta
+        + art_extra_args + ["-c:v", "copy", "-c:a", "copy", str(out_path)]
+    )
+
     color_print(f"Creating merged {args.container.upper()}: {out_name}", "cyan")
     res = subprocess.run(cmd)
+    if art_temp_path is not None:
+        art_temp_path.unlink(missing_ok=True)
     if res.returncode == 0:
         color_print("✓ Merged video created successfully.", "green")
     else:

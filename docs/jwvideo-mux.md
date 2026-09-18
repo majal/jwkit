@@ -18,6 +18,7 @@ It downloads a jw.org video and merges the language tracks you want into one fil
 - Can create single-stream audio/video files instead of merged ones, replacing the base track, which helps with platforms that play all audio streams simultaneously.
 - If you include a language in both `--video` and `--audio` (e.g., `--video E --audio E,TG`), the script is smart enough to download the MP4 exactly once and map its video and audio streams seamlessly.
 - **Sign Language:** If a language does not have an MP3 (common for sign languages), the script will automatically fall back to downloading its MP4 to use as the track source.
+- Carries over an embedded cover-art/thumbnail stream from the base video into the merged output, if it has one (common in jw.org's own MP4s) -- it would otherwise be silently dropped, since each language's video is normally mapped by its own first (real) video stream only.
 
 ## Supported Platforms
 
@@ -77,6 +78,12 @@ Pin an exact local file for one language instead of relying on filename auto-mat
 ./jwvideo-mux S-319-27v_FSL_01_r720P_rife.mp4 -v FSL -a HV=S-319-27v_HV_01_r240P.mp4
 ```
 
+A bare filename (no `CODE=` prefix) works too, as long as it follows the same `{prefix}_{CODE}_...` naming convention as the base file -- its language is inferred from the filename itself:
+
+```bash
+./jwvideo-mux S-319-27v_FSL_01_r720P_rife.mp4 -v FSL -a S-319-27v_HV_01_r240P.mp4
+```
+
 ## Important Behavior / Defaults
 
 Persistent mux preferences live in `~/.config/jwkit/jwvideo-mux/config.toml`. Use `jwvideo-mux config list|get|set|path|edit|reset|diff|check`; every persistent key also has a same-named per-run flag. Boolean preferences have positive and negative forms. The input identifier, manual evidence files, analysis actions, and overwrite decisions are deliberately one-run inputs rather than saved defaults.
@@ -85,6 +92,7 @@ Persistent mux preferences live in `~/.config/jwkit/jwvideo-mux/config.toml`. Us
 - `-a, --audio`: Comma-separated languages for audio tracks (default: `E,TG,CV,HV,SA`)
 - `-s, --subs`: Comma-separated languages for subtitles. If omitted, automatically fetches subtitles for all requested video and audio languages.
 - Any code in `-v`/`-a`/`-s` may instead be `CODE=path/to/file` to pin that exact local file to that language, bypassing filename auto-matching entirely for it (local file mode only). Use this when local-file-mode discovery can't tell two same-language files apart -- e.g. a RIFE-interpolated encode next to the original, or two different downloaded resolutions -- and it reports the candidates as ambiguous instead of guessing.
+- A code may also be a bare `path/to/file` with no `CODE=` prefix (again, local file mode only): its language is inferred from the filename by checking whether it shares the base video's own `{prefix}_{CODE}_...` naming convention. This is a convenience over the explicit form above, not a guess-at-all-costs feature -- a filename that doesn't share the base's prefix (or when the main input isn't a local file at all, so there's no base to compare against) is a clean error telling you to use `CODE=path` instead.
 - **Local file mode** (passing an existing video file as the input instead of a URL/docid): every other requested language's file is found by swapping the language token in the base filename, or, when no exact-name match exists, by a wildcard search in the base file's own folder (and, for the classic SCE one-subdirectory-per-language layout, the sibling per-language directory too). That wildcard search can turn up more than one file for the same language -- most often a `_rife` RIFE-interpolated encode alongside the plain original, or two different resolutions -- in which case it prefers whichever candidate matches the base file's own `_rife`-ness, then its resolution; if that still leaves more than one, it lists every remaining candidate and leaves that language unresolved rather than guessing. Pin the exact file you meant with the `CODE=path/to/file` form above to skip the heuristic entirely.
 - `-r, --res`: Target video resolution (default: `720p`)
 - `-c, --container`: Export container format, `mkv` or `mp4` (default: `mkv`). *Note: MKV is recommended for robust multi-track and native WebVTT subtitle support.*
