@@ -422,6 +422,104 @@ class VideoVariantPureLogicTest(unittest.TestCase):
             entry = self.module.find_manual_video_entry(overrides, "1-0 Orientation", "scei_E.mp4")
             self.assertEqual(entry["differences"][0]["fallback_ok"], True)
 
+    def test_parse_lang_tokens_plain_codes(self) -> None:
+        codes, overrides = self.module.parse_lang_tokens("E,TG,HV")
+        self.assertEqual(codes, ["E", "TG", "HV"])
+        self.assertEqual(overrides, {})
+
+    def test_parse_lang_tokens_explicit_file_override(self) -> None:
+        codes, overrides = self.module.parse_lang_tokens("E,HV=/tmp/some/HV_video.mp4")
+        self.assertEqual(codes, ["E", "HV"])
+        self.assertEqual(overrides, {"HV": Path("/tmp/some/HV_video.mp4")})
+
+    def test_parse_lang_tokens_lowercases_are_upcased_but_path_is_untouched(self) -> None:
+        codes, overrides = self.module.parse_lang_tokens("hv=/tmp/Mixed/Case/File.MP4")
+        self.assertEqual(codes, ["HV"])
+        self.assertEqual(overrides, {"HV": Path("/tmp/Mixed/Case/File.MP4")})
+
+    def test_parse_lang_tokens_empty_is_empty(self) -> None:
+        self.assertEqual(self.module.parse_lang_tokens(None), ([], {}))
+        self.assertEqual(self.module.parse_lang_tokens(""), ([], {}))
+
+    def test_lang_glob_pattern_plain_prefix(self) -> None:
+        pattern = self.module._lang_glob_pattern("S-319-27v_FSL_01_r720P_rife.mp4", "FSL", "HV")
+        self.assertEqual(pattern, "S-319-27v_HV_01_*.mp4")
+
+    def test_lang_glob_pattern_numbered_disambiguates(self) -> None:
+        pattern = self.module._lang_glob_pattern("tscv_E_18_r720P.mp4", "E", "TG")
+        self.assertEqual(pattern, "tscv_TG_18_*.mp4")
+
+    def test_lang_glob_pattern_none_when_no_delimited_lang_token(self) -> None:
+        self.assertIsNone(self.module._lang_glob_pattern("video_FSLnotdelimited.mp4", "FSL", "HV"))
+
+    def test_resolve_language_video_candidates_exact_name_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "video_FSL_720p.mp4"
+            base.touch()
+            (root / "video_HV_720p.mp4").touch()
+            resolved, ambiguous = self.module.resolve_language_video_candidates(base, "FSL", "HV", root)
+            self.assertEqual(resolved, root / "video_HV_720p.mp4")
+            self.assertEqual(ambiguous, [])
+
+    def test_resolve_language_video_candidates_flat_layout_mismatched_resolution(self) -> None:
+        # Reproduces a real report: a rife-interpolated 720p FSL anchor with only a plain
+        # (non-rife) 240p HV file available, both sitting in the same flat folder -- no exact
+        # filename swap exists, but exactly one HV candidate does once the resolution/rife
+        # tokens are allowed to differ.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "S-319-27v_FSL_01_r720P_rife.mp4"
+            base.touch()
+            (root / "S-319-27v_HV_01_r240P.mp4").touch()
+            resolved, ambiguous = self.module.resolve_language_video_candidates(base, "FSL", "HV", root)
+            self.assertEqual(resolved, root / "S-319-27v_HV_01_r240P.mp4")
+            self.assertEqual(ambiguous, [])
+
+    def test_resolve_language_video_candidates_prefers_matching_rife_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "S-319-27v_FSL_01_r720P_rife.mp4"
+            base.touch()
+            (root / "S-319-27v_HV_01_r240P.mp4").touch()
+            (root / "S-319-27v_HV_01_r240P_rife.mp4").touch()
+            resolved, ambiguous = self.module.resolve_language_video_candidates(base, "FSL", "HV", root)
+            self.assertEqual(resolved, root / "S-319-27v_HV_01_r240P_rife.mp4")
+            self.assertEqual(ambiguous, [])
+
+    def test_resolve_language_video_candidates_prefers_matching_resolution_when_rife_ties(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "S-319-27v_FSL_01_r720P.mp4"
+            base.touch()
+            (root / "S-319-27v_HV_01_r240P.mp4").touch()
+            (root / "S-319-27v_HV_01_r720P.mp4").touch()
+            resolved, ambiguous = self.module.resolve_language_video_candidates(base, "FSL", "HV", root)
+            self.assertEqual(resolved, root / "S-319-27v_HV_01_r720P.mp4")
+            self.assertEqual(ambiguous, [])
+
+    def test_resolve_language_video_candidates_reports_genuine_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "S-319-27v_FSL_01_r720P_rife.mp4"
+            base.touch()
+            candidate_a = root / "S-319-27v_HV_01_alt-cut.mp4"
+            candidate_b = root / "S-319-27v_HV_01_another-cut.mp4"
+            candidate_a.touch()
+            candidate_b.touch()
+            resolved, ambiguous = self.module.resolve_language_video_candidates(base, "FSL", "HV", root)
+            self.assertIsNone(resolved)
+            self.assertEqual(sorted(ambiguous), sorted([candidate_a, candidate_b]))
+
+    def test_resolve_language_video_candidates_no_match_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "S-319-27v_FSL_01_r720P_rife.mp4"
+            base.touch()
+            resolved, ambiguous = self.module.resolve_language_video_candidates(base, "FSL", "HV", root)
+            self.assertIsNone(resolved)
+            self.assertEqual(ambiguous, [])
+
 
 class _FfmpegFixtureCase(unittest.TestCase):
     """Shared synthetic-clip fixtures built once per test-class run via ffmpeg lavfi sources.
@@ -1246,6 +1344,80 @@ class AdaptiveLibraryFallsBackWhenNothingLocalizedTest(unittest.TestCase):
             )
             video_stream_count = len([l for l in probe.stdout.splitlines() if l.strip()])
             self.assertEqual(video_stream_count, 1, "expected exactly one shared video track, not one per language")
+
+
+@unittest.skipUnless(FFMPEG_AVAILABLE and FFPROBE_AVAILABLE, "ffmpeg/ffprobe not installed")
+class LocalFileModeMismatchedVariantTest(unittest.TestCase):
+    """Reproduces a real report: a rife-interpolated 720p base video and a same-language-group audio
+    language that was only ever downloaded at 240p (no _rife suffix), both in one flat folder. The old
+    exact-filename-swap-only lookup never found the 240p file and silently dropped that language;
+    resolve_language_video_candidates' wildcard fallback (see VideoVariantPureLogicTest) should let the
+    real CLI mux it in."""
+
+    JWVIDEOMUX = str(Path(__file__).resolve().parents[1] / "jwvideo-mux")
+
+    def _make_clip(self, path: Path, *, size: str) -> None:
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=10:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(path),
+        ], check=True)
+
+    def test_mismatched_resolution_and_rife_suffix_is_still_auto_matched(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jwvideo-mux-mismatch-") as tmp:
+            root = Path(tmp)
+            base = root / "S-319-27v_FSL_01_r720P_rife.mp4"
+            self._make_clip(base, size="1280x720")
+            self._make_clip(root / "S-319-27v_HV_01_r240P.mp4", size="424x240")
+
+            result = subprocess.run(
+                [sys.executable, self.JWVIDEOMUX, str(base), "-v", "FSL", "-a", "HV", "--force"],
+                cwd=root, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # No separate MP3 exists for HV, so (same as jw.org's own sign-language fallback) its
+            # video file is reused as the audio track's source -- "Found local: video" is correct;
+            # what matters is that HV was found at all, and an audio stream actually got muxed in.
+            self.assertIn("[HV] Found local: video", result.stdout)
+            mkvs = list(root.glob("*.mkv"))
+            self.assertEqual(len(mkvs), 1, result.stdout)
+
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type",
+                 "-of", "csv=p=0", str(mkvs[0])],
+                capture_output=True, text=True, check=True,
+            )
+            self.assertIn("audio", probe.stdout)
+
+    def test_explicit_file_override_disambiguates_a_mixed_up_pair(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jwvideo-mux-override-") as tmp:
+            root = Path(tmp)
+            base = root / "S-319-27v_FSL_01_r720P_rife.mp4"
+            self._make_clip(base, size="1280x720")
+            wanted = root / "S-319-27v_HV_01_alt-cut.mp4"
+            other = root / "S-319-27v_HV_01_another-cut.mp4"
+            self._make_clip(wanted, size="424x240")
+            self._make_clip(other, size="424x240")
+
+            # Without an override, this pair is genuinely ambiguous (see
+            # test_resolve_language_video_candidates_reports_genuine_ambiguity) and HV is dropped.
+            ambiguous_result = subprocess.run(
+                [sys.executable, self.JWVIDEOMUX, str(base), "-v", "FSL", "-a", "HV", "--force"],
+                cwd=root, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(ambiguous_result.returncode, 0, ambiguous_result.stderr)
+            self.assertIn("[HV] No matching local files found.", ambiguous_result.stdout)
+            for mkv in root.glob("*.mkv"):
+                mkv.unlink()
+
+            result = subprocess.run(
+                [sys.executable, self.JWVIDEOMUX, str(base), "-v", "FSL", "-a", f"HV={wanted}", "--force"],
+                cwd=root, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("[HV] Found local: audio", result.stdout)
 
 
 if __name__ == "__main__":
