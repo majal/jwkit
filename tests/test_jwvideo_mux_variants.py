@@ -423,23 +423,118 @@ class VideoVariantPureLogicTest(unittest.TestCase):
             self.assertEqual(entry["differences"][0]["fallback_ok"], True)
 
     def test_parse_lang_tokens_plain_codes(self) -> None:
-        codes, overrides = self.module.parse_lang_tokens("E,TG,HV")
+        codes, overrides, bare = self.module.parse_lang_tokens("E,TG,HV")
         self.assertEqual(codes, ["E", "TG", "HV"])
         self.assertEqual(overrides, {})
+        self.assertEqual(bare, {})
 
     def test_parse_lang_tokens_explicit_file_override(self) -> None:
-        codes, overrides = self.module.parse_lang_tokens("E,HV=/tmp/some/HV_video.mp4")
+        codes, overrides, bare = self.module.parse_lang_tokens("E,HV=/tmp/some/HV_video.mp4")
         self.assertEqual(codes, ["E", "HV"])
         self.assertEqual(overrides, {"HV": Path("/tmp/some/HV_video.mp4")})
+        self.assertEqual(bare, {})
 
     def test_parse_lang_tokens_lowercases_are_upcased_but_path_is_untouched(self) -> None:
-        codes, overrides = self.module.parse_lang_tokens("hv=/tmp/Mixed/Case/File.MP4")
+        codes, overrides, bare = self.module.parse_lang_tokens("hv=/tmp/Mixed/Case/File.MP4")
         self.assertEqual(codes, ["HV"])
         self.assertEqual(overrides, {"HV": Path("/tmp/Mixed/Case/File.MP4")})
+        self.assertEqual(bare, {})
 
     def test_parse_lang_tokens_empty_is_empty(self) -> None:
-        self.assertEqual(self.module.parse_lang_tokens(None), ([], {}))
-        self.assertEqual(self.module.parse_lang_tokens(""), ([], {}))
+        self.assertEqual(self.module.parse_lang_tokens(None), ([], {}, {}))
+        self.assertEqual(self.module.parse_lang_tokens(""), ([], {}, {}))
+
+    def test_parse_lang_tokens_bare_file_is_a_placeholder(self) -> None:
+        codes, overrides, bare = self.module.parse_lang_tokens("E,S-319-27v_HV_01_r240P.mp4")
+        self.assertEqual(codes, ["E", None])
+        self.assertEqual(overrides, {})
+        self.assertEqual(bare, {1: Path("S-319-27v_HV_01_r240P.mp4")})
+
+    def test_parse_lang_tokens_bare_file_with_directory_separator(self) -> None:
+        codes, overrides, bare = self.module.parse_lang_tokens("HV/video")
+        self.assertEqual(codes, [None])
+        self.assertEqual(bare, {0: Path("HV/video")})
+
+    def test_parse_lang_tokens_plain_code_without_dot_or_slash_is_not_bare(self) -> None:
+        # A code alone (no extension, no path separator) must never be misread as a filename,
+        # even if a same-named file happens to sit in the current directory (see
+        # _looks_like_local_file's docstring for why that's checked deliberately).
+        codes, overrides, bare = self.module.parse_lang_tokens("HV")
+        self.assertEqual(codes, ["HV"])
+        self.assertEqual(bare, {})
+
+    def test_infer_lang_code_from_filename_ignores_a_differing_tail(self) -> None:
+        base = Path("S-319-27v_FSL_01_r720P_rife.mp4")
+        bare = Path("S-319-27v_HV_01_r240P.mp4")
+        self.assertEqual(self.module.infer_lang_code_from_filename(bare, base, "FSL"), "HV")
+
+    def test_infer_lang_code_from_filename_numbered_convention(self) -> None:
+        base = Path("tscv_E_18_r720P.mp4")
+        bare = Path("tscv_TG_19_r720P.mp4")
+        self.assertEqual(self.module.infer_lang_code_from_filename(bare, base, "E"), "TG")
+
+    def test_infer_lang_code_from_filename_no_shared_prefix_returns_none(self) -> None:
+        base = Path("S-319-27v_FSL_01_r720P_rife.mp4")
+        bare = Path("totally_different_HV_clip.mp4")
+        self.assertIsNone(self.module.infer_lang_code_from_filename(bare, base, "FSL"))
+
+    def test_infer_lang_code_from_filename_no_convention_in_base_returns_none(self) -> None:
+        base = Path("video_FSLnotdelimited.mp4")
+        bare = Path("video_HV_01.mp4")
+        self.assertIsNone(self.module.infer_lang_code_from_filename(bare, base, "FSL"))
+
+    def test_resolve_bare_file_langs_fills_in_codes_and_overrides(self) -> None:
+        base = Path("S-319-27v_FSL_01_r720P_rife.mp4")
+        codes: list = ["FSL", None]
+        bare = {1: Path("S-319-27v_HV_01_r240P.mp4")}
+        overrides = self.module.resolve_bare_file_langs(codes, bare, base, "FSL", "-a")
+        self.assertEqual(codes, ["FSL", "HV"])
+        self.assertEqual(overrides, {"HV": Path("S-319-27v_HV_01_r240P.mp4")})
+
+    def test_resolve_bare_file_langs_exits_without_local_file_mode(self) -> None:
+        codes: list = [None]
+        bare = {0: Path("S-319-27v_HV_01_r240P.mp4")}
+        with self.assertRaises(SystemExit):
+            self.module.resolve_bare_file_langs(codes, bare, None, "E", "-a")
+
+    def test_resolve_bare_file_langs_exits_when_uninferrable(self) -> None:
+        base = Path("S-319-27v_FSL_01_r720P_rife.mp4")
+        codes: list = [None]
+        bare = {0: Path("unrelated_name.mp4")}
+        with self.assertRaises(SystemExit):
+            self.module.resolve_bare_file_langs(codes, bare, base, "FSL", "-a")
+
+    @unittest.skipUnless(FFMPEG_AVAILABLE and FFPROBE_AVAILABLE, "ffmpeg/ffprobe not installed")
+    def test_find_attached_picture_stream_none_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plain.mp4"
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=1",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(path),
+            ], check=True)
+            self.assertIsNone(self.module.find_attached_picture_stream(path))
+
+    @unittest.skipUnless(FFMPEG_AVAILABLE and FFPROBE_AVAILABLE, "ffmpeg/ffprobe not installed")
+    def test_find_attached_picture_stream_finds_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            main_vid = Path(tmp) / "main.mp4"
+            with_art = Path(tmp) / "with_art.mp4"
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=1",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(main_vid),
+            ], check=True)
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=red:size=64x64", "-frames:v", "1", "cover.jpg",
+            ], check=True, cwd=tmp)
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(main_vid),
+                "-i", str(Path(tmp) / "cover.jpg"), "-map", "0:v", "-map", "1:v", "-c:v:0", "copy",
+                "-c:v:1", "mjpeg", "-disposition:v:1", "attached_pic", str(with_art),
+            ], check=True)
+            self.assertEqual(self.module.find_attached_picture_stream(with_art), (1, "mjpeg"))
 
     def test_lang_glob_pattern_plain_prefix(self) -> None:
         pattern = self.module._lang_glob_pattern("S-319-27v_FSL_01_r720P_rife.mp4", "FSL", "HV")
@@ -1418,6 +1513,118 @@ class LocalFileModeMismatchedVariantTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("[HV] Found local: audio", result.stdout)
+
+    def test_bare_filename_infers_language_from_the_filename(self) -> None:
+        # The convenience form asked for on top of CODE=path: a plain filename with no CODE=
+        # prefix, with the language inferred from the same naming convention that
+        # resolve_language_video_candidates already relies on.
+        with tempfile.TemporaryDirectory(prefix="jwvideo-mux-bare-") as tmp:
+            root = Path(tmp)
+            base = root / "S-319-27v_FSL_01_r720P_rife.mp4"
+            self._make_clip(base, size="1280x720")
+            hv_file = root / "S-319-27v_HV_01_r240P.mp4"
+            self._make_clip(hv_file, size="424x240")
+
+            result = subprocess.run(
+                [sys.executable, self.JWVIDEOMUX, str(base), "-v", "FSL", "-a", str(hv_file), "--force"],
+                cwd=root, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Resolved via -a (an audio-track request), so it lands under 'audio' just like an
+            # explicit HV=path override would -- see test_explicit_file_override_... above.
+            self.assertIn("[HV] Found local: audio", result.stdout)
+
+    def test_bare_filename_uninferrable_is_a_clean_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jwvideo-mux-bare-fail-") as tmp:
+            root = Path(tmp)
+            base = root / "S-319-27v_FSL_01_r720P_rife.mp4"
+            self._make_clip(base, size="1280x720")
+            unrelated = root / "totally_unrelated_name.mp4"
+            self._make_clip(unrelated, size="424x240")
+
+            result = subprocess.run(
+                [sys.executable, self.JWVIDEOMUX, str(base), "-v", "FSL", "-a", str(unrelated), "--force"],
+                cwd=root, capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not infer a language code", result.stdout)
+
+    def test_bare_filename_in_api_mode_is_a_clean_error(self) -> None:
+        # No local-file-mode base to infer against when the main input isn't an existing file.
+        result = subprocess.run(
+            [sys.executable, self.JWVIDEOMUX, "502015752", "-v", "E", "-a", "video_HV_720p.mp4"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("needs local file mode", result.stdout)
+
+
+@unittest.skipUnless(FFMPEG_AVAILABLE and FFPROBE_AVAILABLE, "ffmpeg/ffprobe not installed")
+class CoverArtPreservedThroughMuxTest(unittest.TestCase):
+    """Reproduces a real report: jw.org's own MP4s commonly carry an embedded cover-art/
+    thumbnail stream (a video-type stream flagged disposition attached_pic), and the merged
+    output used to silently drop it -- the main mux path maps each language's video with an
+    explicit `-map idx:v:0` (its first, real-footage video stream), which never happens to also
+    pick up a later attached-pic stream."""
+
+    JWVIDEOMUX = str(Path(__file__).resolve().parents[1] / "jwvideo-mux")
+
+    def _make_base_with_art(self, path: Path) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cover = Path(tmp) / "cover.jpg"
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=red:size=64x64", "-frames:v", "1", str(cover),
+            ], check=True)
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=1",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-i", str(cover),
+                "-map", "0:v", "-map", "1:a", "-map", "2:v",
+                "-c:v:0", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", "-c:v:1", "mjpeg", "-disposition:v:1", "attached_pic",
+                str(path),
+            ], check=True)
+
+    def _has_attached_pic(self, path: Path) -> bool:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v",
+             "-show_entries", "stream_disposition=attached_pic", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        return "1" in probe.stdout.splitlines()
+
+    def test_cover_art_survives_mp4_output(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jwvideo-mux-art-mp4-") as tmp:
+            root = Path(tmp)
+            base = root / "video_E_720p.mp4"
+            self._make_base_with_art(base)
+
+            result = subprocess.run(
+                [sys.executable, self.JWVIDEOMUX, str(base), "-v", "E", "-a", "E",
+                 "-c", "mp4", "--force"],
+                cwd=root, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            mp4s = [p for p in root.glob("*.mp4") if p != base]
+            self.assertEqual(len(mp4s), 1, result.stdout)
+            self.assertTrue(self._has_attached_pic(mp4s[0]), "cover art should survive an mp4 remux")
+
+    def test_cover_art_survives_mkv_output(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jwvideo-mux-art-mkv-") as tmp:
+            root = Path(tmp)
+            base = root / "video_E_720p.mp4"
+            self._make_base_with_art(base)
+
+            result = subprocess.run(
+                [sys.executable, self.JWVIDEOMUX, str(base), "-v", "E", "-a", "E",
+                 "-c", "mkv", "--force"],
+                cwd=root, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            mkvs = list(root.glob("*.mkv"))
+            self.assertEqual(len(mkvs), 1, result.stdout)
+            self.assertTrue(self._has_attached_pic(mkvs[0]), "cover art should survive an mkv remux via -attach")
 
 
 if __name__ == "__main__":
