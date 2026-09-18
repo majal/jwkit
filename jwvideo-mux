@@ -1549,14 +1549,127 @@ def build_adaptive_library(
     return manifest
 
 
+_RIFE_SUFFIX_RE = re.compile(r"_rife$")
+_RESOLUTION_TOKEN_RE = re.compile(r"\br\d+[pP]\b")
+
+
+def parse_lang_tokens(raw: str | None) -> tuple[list[str], dict[str, Path]]:
+    """Parse a -v/-a/-s value into language codes, in order, plus any `CODE=path/to/file`
+    overrides. The override form lets a user pin an exact local file to a language code
+    instead of relying on filename-matching heuristics -- useful when local-file-mode
+    discovery would otherwise be ambiguous (e.g. a _rife and non-_rife encode, or two
+    different resolutions, of the same language sitting in the same folder)."""
+    codes: list[str] = []
+    overrides: dict[str, Path] = {}
+    if not raw:
+        return codes, overrides
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "=" in token:
+            code, _, path = token.partition("=")
+            code = code.strip().upper()
+            codes.append(code)
+            overrides[code] = Path(path.strip()).expanduser()
+        else:
+            codes.append(token.upper())
+    return codes, overrides
+
+
+def _lang_glob_pattern(base_name: str, base_lang: str, lang: str) -> str | None:
+    """Wildcard filename pattern for `lang`'s sibling of base_name (tagged `base_lang`).
+    None when base_name doesn't follow the `_LANG_`-delimited convention this relies on.
+
+    A number immediately after the language code (tscv_E_18_..., tscv_E_19_...) disambiguates
+    between multiple same-day videos sharing a base prefix and must stay part of the glob, or
+    e.g. "..._18_..." and "..._19_..." both match and get treated as ambiguous instead of
+    resolved -- see resolve_language_video_candidates.
+    """
+    numbered = re.match(rf"^(.*?)_{re.escape(base_lang)}_(\d+)_", base_name)
+    if numbered:
+        return f"{numbered.group(1)}_{lang}_{numbered.group(2)}_*.mp4"
+    if f"_{base_lang}_" not in base_name:
+        return None
+    prefix = base_name.split(f"_{base_lang}_", 1)[0]
+    return f"{prefix}_{lang}_*.mp4"
+
+
+def resolve_language_video_candidates(
+    base_vid_path: Path, base_lang: str, lang: str, out_dir: Path,
+) -> tuple[Path | None, list[Path]]:
+    """Find `lang`'s local video sibling of base_vid_path. Returns (resolved, ambiguous):
+    resolved is set only once disambiguation narrows the field to exactly one file;
+    ambiguous carries every remaining candidate otherwise, so the caller can point the user
+    at parse_lang_tokens' `CODE=path` override instead of silently guessing.
+
+    An exact-name match (swapping `_{base_lang}_` for `_{lang}_` in an otherwise identical
+    filename) is tried first and trusted outright -- it can't be ambiguous. Only when that
+    fails does this fall back to a wildcard search: in base_vid_path's own directory (a flat
+    layout, e.g. a talk's languages all downloaded into one folder -- which is exactly where
+    an exact-name match fails when the target language was only available at a different
+    resolution or without the same _rife suffix), and, for the classic SCE
+    one-subfolder-per-language layout, in the sibling `lang` directory too. That wildcard
+    search can turn up several files for the same language differing only in resolution or a
+    trailing _rife suffix (a RIFE frame-interpolated encode alongside the original); preferring
+    whichever matches base_vid_path's own _rife-ness, then its resolution token, narrows that
+    down before giving up and reporting every remaining candidate as ambiguous.
+    """
+    target_name = base_vid_path.name.replace(f"_{base_lang}_", f"_{lang}_")
+    if target_name == base_vid_path.name:
+        target_name = base_vid_path.name.replace(base_lang, lang)
+    target_path = out_dir / target_name
+    if target_path.exists():
+        return target_path, []
+
+    search_dirs = [base_vid_path.parent]
+    if base_vid_path.parent.name.upper() == base_lang:
+        sibling = base_vid_path.parent.parent / lang
+        if sibling.is_dir():
+            search_dirs.append(sibling)
+
+    pattern = _lang_glob_pattern(base_vid_path.name, base_lang, lang)
+    candidates: list[Path] = []
+    if pattern:
+        seen = set()
+        for directory in search_dirs:
+            if not directory.is_dir():
+                continue
+            for match in sorted(directory.glob(pattern)):
+                if match not in seen:
+                    seen.add(match)
+                    candidates.append(match)
+
+    if len(candidates) <= 1:
+        return (candidates[0] if candidates else None), []
+
+    base_is_rife = bool(_RIFE_SUFFIX_RE.search(base_vid_path.stem))
+    rife_matched = [c for c in candidates if bool(_RIFE_SUFFIX_RE.search(c.stem)) == base_is_rife]
+    if len(rife_matched) == 1:
+        return rife_matched[0], []
+    if rife_matched:
+        candidates = rife_matched
+
+    base_res_match = _RESOLUTION_TOKEN_RE.search(base_vid_path.name)
+    if base_res_match:
+        base_res = base_res_match.group(0).lower()
+        res_matched = [c for c in candidates if (m := _RESOLUTION_TOKEN_RE.search(c.name)) and m.group(0).lower() == base_res]
+        if len(res_matched) == 1:
+            return res_matched[0], []
+        if res_matched:
+            candidates = res_matched
+
+    return None, candidates
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         return run_config(sys.argv[2:])
     parser = argparse.ArgumentParser(description="jwvideo-mux: Merge videos, audio, and subtitles from jw.org")
     parser.add_argument("input", help="URL, docid, or local file pattern to process")
-    parser.add_argument("-v", "--video", help="Comma-separated language codes for video tracks")
-    parser.add_argument("-a", "--audio", help="Comma-separated language codes for audio tracks")
-    parser.add_argument("-s", "--subs", help="Comma-separated subtitle languages; empty uses video/audio languages")
+    parser.add_argument("-v", "--video", help="Comma-separated language codes for video tracks; a code may be CODE=path/to/file.mp4 to pin an exact local file instead of auto-matching one")
+    parser.add_argument("-a", "--audio", help="Comma-separated language codes for audio tracks; a code may be CODE=path/to/file to pin an exact local file instead of auto-matching one")
+    parser.add_argument("-s", "--subs", help="Comma-separated subtitle languages; empty uses video/audio languages; a code may be CODE=path/to/file.vtt to pin an exact local file")
     parser.add_argument("-r", "--res", "--resolution", dest="res", help="Target resolution")
     parser.add_argument("-c", "--container", choices=["mkv", "mp4"], help="Export container format")
     parser.add_argument("-S", "--single-streams", action=argparse.BooleanOptionalAction, default=None, help="Produce separate single-stream videos")
@@ -1596,18 +1709,19 @@ def main():
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     check_dependencies()
     
-    vid_langs = [l.strip().upper() for l in args.video.split(',')] if args.video and args.video.upper() != "NONE" else []
-    aud_langs = [l.strip().upper() for l in args.audio.split(',')] if args.audio and args.audio.upper() != "NONE" else []
-    sub_langs_explicit = [l.strip().upper() for l in args.subs.split(',')] if args.subs else []
-    
+    vid_langs, vid_overrides = parse_lang_tokens(args.video) if args.video and args.video.upper() != "NONE" else ([], {})
+    aud_langs, aud_overrides = parse_lang_tokens(args.audio) if args.audio and args.audio.upper() != "NONE" else ([], {})
+
     # If explicit subs is NONE, then sub_langs is empty.
     if args.subs and args.subs.upper() == "NONE":
-        sub_langs_explicit = []
+        sub_langs_explicit, sub_overrides = [], {}
         sub_langs = []
     elif not args.subs:
         # Default to all media langs if not specified
+        sub_langs_explicit, sub_overrides = [], {}
         sub_langs = list(dict.fromkeys(vid_langs + aud_langs))
     else:
+        sub_langs_explicit, sub_overrides = parse_lang_tokens(args.subs)
         sub_langs = sub_langs_explicit
         
     if not vid_langs and not aud_langs and not sub_langs:
@@ -1636,66 +1750,85 @@ def main():
         # Attempt to find a subtitle sidecar for the base video (same name, .vtt or .srt --
         # jw.org API downloads land as .vtt, but real SCE-layout sources are commonly .srt).
         if base_lang in sub_langs:
-            for suffix in ('.vtt', '.srt'):
-                base_sub = base_vid_path.with_suffix(suffix)
-                if base_sub.exists():
-                    local_files[base_lang]['sub'] = base_sub
-                    break
+            base_sub_override = sub_overrides.get(base_lang)
+            if base_sub_override is not None:
+                if not base_sub_override.is_file():
+                    color_print(f"  [{base_lang}] Explicit subtitle file not found: {base_sub_override}", "red")
+                    sys.exit(1)
+                local_files[base_lang]['sub'] = base_sub_override
+            else:
+                for suffix in ('.vtt', '.srt'):
+                    base_sub = base_vid_path.with_suffix(suffix)
+                    if base_sub.exists():
+                        local_files[base_lang]['sub'] = base_sub
+                        break
 
         for lang in all_langs:
             if lang == base_lang:
                 continue
 
-            # Replace base_lang with target lang in the filename (case-sensitive or insensitive)
-            # Example: "video_FSL_720p.mp4" -> "video_E_720p.mp4"
-            target_name_mp4 = base_vid_path.name.replace(f"_{base_lang}_", f"_{lang}_")
-            if target_name_mp4 == base_vid_path.name:
-                # Try without underscores
-                target_name_mp4 = base_vid_path.name.replace(base_lang, lang)
-
             local_files[lang] = {}
-            target_path_mp4 = out_dir / target_name_mp4
-            target_path_mp3 = target_path_mp4.with_suffix('.mp3')
-            # Resolved once the actual video path for this language is known below -- the subtitle
-            # sidecar sits next to THAT file, which for SCE-layout siblings is a different directory
-            # than out_dir (a bug: this used to always look for target_path_mp4's sidecar in out_dir,
-            # which is only right for the flat, non-SCE layout).
             resolved_video_path = None
 
-            if target_path_mp4.exists():
-                local_files[lang]['video'] = target_path_mp4
-                resolved_video_path = target_path_mp4
-            elif base_vid_path.parent.name.upper() == base_lang:
-                # Typical SCE layout: one sibling directory per language, with
-                # descriptive filename tails that differ by translation.
-                # A number immediately after the language code (tscv_E_18_..., tscv_E_19_...)
-                # disambiguates between multiple same-day videos sharing a base prefix -- it must
-                # stay part of the glob, or e.g. "..._18_..." and "..._19_..." both match and the
-                # len(candidates) == 1 guard below correctly refuses to pick either (safe, but it
-                # means neither video can be resolved at all without this).
-                numbered = re.match(rf"^(.*?)_{re.escape(base_lang)}_(\d+)_", base_vid_path.name)
-                if numbered:
-                    glob_pattern = f"{numbered.group(1)}_{lang}_{numbered.group(2)}_*.mp4"
-                else:
-                    prefix = base_vid_path.name.split(f"_{base_lang}_", 1)[0]
-                    glob_pattern = f"{prefix}_{lang}_*.mp4"
-                sibling = base_vid_path.parent.parent / lang
-                candidates = sorted(sibling.glob(glob_pattern)) if sibling.is_dir() else []
-                if len(candidates) == 1:
-                    local_files[lang]['video'] = candidates[0]
-                    resolved_video_path = candidates[0]
-            if target_path_mp3.exists() and lang not in vid_langs:
-                # If MP3 exists and we aren't explicitly needing video for this lang, prefer audio
-                local_files[lang]['audio'] = target_path_mp3
-                if 'video' in local_files[lang]:
-                    del local_files[lang]['video']
+            video_override = vid_overrides.get(lang)
+            if video_override is not None:
+                if not video_override.is_file():
+                    color_print(f"  [{lang}] Explicit video file not found: {video_override}", "red")
+                    sys.exit(1)
+                local_files[lang]['video'] = video_override
+                resolved_video_path = video_override
+            else:
+                resolved_video_path, ambiguous_candidates = resolve_language_video_candidates(
+                    base_vid_path, base_lang, lang, out_dir,
+                )
+                if resolved_video_path is not None:
+                    local_files[lang]['video'] = resolved_video_path
+                elif ambiguous_candidates:
+                    flag = "-v" if lang in vid_langs else "-a"
+                    color_print(
+                        f"  [{lang}] {len(ambiguous_candidates)} local files match but none is "
+                        f"clearly preferred -- pin one explicitly, e.g. {flag} {lang}="
+                        f"{ambiguous_candidates[0]}", "yellow",
+                    )
+                    for candidate in ambiguous_candidates:
+                        color_print(f"      {candidate}", "yellow")
 
-            if lang in sub_langs and resolved_video_path is not None:
-                for suffix in ('.vtt', '.srt'):
-                    target_sub = resolved_video_path.with_suffix(suffix)
-                    if target_sub.exists():
-                        local_files[lang]['sub'] = target_sub
-                        break
+            audio_override = aud_overrides.get(lang)
+            if audio_override is not None:
+                if not audio_override.is_file():
+                    color_print(f"  [{lang}] Explicit audio file not found: {audio_override}", "red")
+                    sys.exit(1)
+                local_files[lang]['audio'] = audio_override
+                if 'video' in local_files[lang] and lang not in vid_langs:
+                    del local_files[lang]['video']
+            else:
+                # Replace base_lang with target lang in the filename (case-sensitive or insensitive)
+                # Example: "video_FSL_720p.mp4" -> "video_E_720p.mp4"
+                target_name_mp4 = base_vid_path.name.replace(f"_{base_lang}_", f"_{lang}_")
+                if target_name_mp4 == base_vid_path.name:
+                    target_name_mp4 = base_vid_path.name.replace(base_lang, lang)
+                target_path_mp3 = (out_dir / target_name_mp4).with_suffix('.mp3')
+                if target_path_mp3.exists() and lang not in vid_langs:
+                    # If MP3 exists and we aren't explicitly needing video for this lang, prefer audio
+                    local_files[lang]['audio'] = target_path_mp3
+                    if 'video' in local_files[lang]:
+                        del local_files[lang]['video']
+
+            if lang in sub_langs:
+                sub_override = sub_overrides.get(lang)
+                if sub_override is not None:
+                    if not sub_override.is_file():
+                        color_print(f"  [{lang}] Explicit subtitle file not found: {sub_override}", "red")
+                        sys.exit(1)
+                    local_files[lang]['sub'] = sub_override
+                elif resolved_video_path is not None:
+                    # The subtitle sidecar sits next to the resolved video file, which for
+                    # SCE-layout siblings is a different directory than out_dir.
+                    for suffix in ('.vtt', '.srt'):
+                        target_sub = resolved_video_path.with_suffix(suffix)
+                        if target_sub.exists():
+                            local_files[lang]['sub'] = target_sub
+                            break
 
             if local_files[lang]:
                 color_print(f"  [{lang}] Found local: {', '.join(local_files[lang].keys())}", "green")
