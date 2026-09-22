@@ -33,6 +33,30 @@ class JwplTest(unittest.TestCase):
         settings = {**module.DEFAULTS, "include": ["*.jpg"], "exclude": ["ignore*"]}
         self.assertEqual([p.name for p in module.discover_media(self.root, settings)], ["1.jpg", "2.jpg", "10.jpg"])
 
+    def test_discover_media_explicit_files_bypass_scan_and_filters_and_keep_order(self):
+        for name in ("10.jpg", "2.jpg", "1.jpg", "ignore.png"):
+            (self.root / name).write_bytes(b"x")
+        # Deliberately out of natural-sort order, and one path would be
+        # dropped by include/exclude if those were applied.
+        settings = {**module.DEFAULTS, "include": ["*.mp4"], "exclude": ["*"], "files": ["10.jpg", "ignore.png", "1.jpg"]}
+        self.assertEqual(
+            [p.name for p in module.discover_media(self.root, settings)],
+            ["10.jpg", "ignore.png", "1.jpg"],
+        )
+
+    def test_discover_media_explicit_files_resolve_relative_to_directory(self):
+        (self.root / "sub").mkdir()
+        (self.root / "sub" / "clip.mp4").write_bytes(b"x")
+        settings = {**module.DEFAULTS, "files": ["sub/clip.mp4"]}
+        self.assertEqual(module.discover_media(self.root, settings), [self.root / "sub" / "clip.mp4"])
+
+    def test_discover_media_missing_explicit_file_raises_value_error(self):
+        (self.root / "present.jpg").write_bytes(b"x")
+        settings = {**module.DEFAULTS, "files": ["present.jpg", "missing.jpg"]}
+        with self.assertRaises(ValueError) as ctx:
+            module.discover_media(self.root, settings)
+        self.assertIn("missing.jpg", str(ctx.exception))
+
     def test_create_archive_has_valid_manifest_schema_and_order(self):
         for name in ("02 second.jpg", "01 first.jpg"):
             (self.root / name).write_bytes(b"image")

@@ -53,6 +53,13 @@ jwpl create "/path/to/media" \
   --exclude "*FSL-TG_*" --exclude "*FSL-CV_*" --exclude "*FSL-HV_*"
 ```
 
+Select exactly two files out of a larger directory, in the order given,
+skipping the scan and `--include`/`--exclude` entirely:
+
+```bash
+jwpl create "/path/to/media" --file "01 opening.jpg" --file "03 closing.mp4"
+```
+
 Inspect an existing or generated archive:
 
 ```bash
@@ -139,6 +146,12 @@ Every setting has a matching `create` flag:
 
 `name` and `output` may also be set in the directory TOML and overridden with
 `--name` and `--output`.
+
+`--file PATH` (repeatable, `create`-only) is a one-shot selection override,
+not a persisted setting: pass it one or more times to use exactly those
+files, in the order given, instead of scanning `DIRECTORY`. A relative
+`PATH` resolves against `DIRECTORY`. `--include`/`--exclude` are ignored
+when `--file` is present.
 
 ## Notes / Caveats
 

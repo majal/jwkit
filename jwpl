@@ -295,6 +295,19 @@ def _matches(relative: str, patterns: list[str]) -> bool:
 
 
 def discover_media(directory: Path, settings: dict[str, Any]) -> list[Path]:
+    files = settings.get("files")
+    if files:
+        resolved = []
+        for raw in files:
+            path = Path(raw)
+            if not path.is_absolute():
+                path = directory / path
+            if not path.is_file():
+                raise ValueError(f"--file not found: {path}")
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                raise ValueError(f"--file has an unsupported extension: {path}")
+            resolved.append(path)
+        return resolved
     iterator = directory.rglob("*") if settings["recursive"] else directory.iterdir()
     found = []
     for path in iterator:
@@ -480,6 +493,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--output", type=Path, help="output archive (default: DIRECTORY/DIRECTORY.jwlplaylist)")
     create.add_argument("--config", type=Path, help="use this per-directory TOML file")
     create.add_argument("--no-directory-config", action="store_true")
+    create.add_argument(
+        "--file", dest="files", action="append", metavar="PATH",
+        help="use exactly this file instead of scanning DIRECTORY; repeatable, order preserved, bypasses --include/--exclude",
+    )
     create.add_argument("--dry-run", action="store_true", help="show selected media without writing")
     create.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     create.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
@@ -524,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
             if not directory.is_dir():
                 raise ValueError(f"not a directory: {directory}")
             settings = _resolved_settings(args, directory)
+            if args.files:
+                settings["files"] = args.files
             directory_config = _read_toml(Path(args.config) if args.config else directory / DIRECTORY_CONFIG) if not args.no_directory_config else {}
             name = args.name or directory_config.get("name") or directory.name
             output_value = args.output or directory_config.get("output")
@@ -544,7 +563,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.dry_run:
                 print(f"Playlist: {name}\nSelected {len(media)} item(s):")
                 for item, label in zip(media, presentation_labels(media, settings)):
-                    print(f"{item.relative_to(directory)}  ->  {label}")
+                    # An explicit --file may live outside directory's tree,
+                    # which relative_to() cannot express.
+                    try:
+                        shown = item.relative_to(directory)
+                    except ValueError:
+                        shown = item
+                    print(f"{shown}  ->  {label}")
             else:
                 print(color.green(f"Created {output} ({len(media)} items)"))
             return 0
