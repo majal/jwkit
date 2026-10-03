@@ -2393,3 +2393,43 @@ class FfrifeStreamingEncodeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FfrifeProvenanceTest(unittest.TestCase):
+    """A standalone ffrife output gets a `.jwkit.json` sidecar naming its
+    source, the source's MD5 (jw.org publishes MD5s), and the exact run."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_sidecar_records_source_checksum_window_and_rebuild_command(self) -> None:
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "lmd_FSL_07_r720P.mp4"
+            source.write_bytes(b"source bytes")
+            output = Path(tmp) / "lmd_FSL_07_r720P_rife.mp4"
+            output.write_bytes(b"output bytes")
+            config = dict(self.ffrife.DEFAULT_CONFIG, rife_binary_path="/x/rife-build/rife-ncnn-vulkan")
+            self.ffrife.write_run_provenance(str(source), str(output), config, start=126.693, end=160.46, fps=60)
+            record = self.ffrife._jwkit_common.read_provenance(output)
+        self.assertEqual(record["tool"], "ffrife")
+        self.assertEqual(record["source"]["checksum"], hashlib.md5(b"source bytes").hexdigest())
+        self.assertEqual(record["source"]["jw_org"], {"publication": "lmd", "language": "FSL", "track": 7, "resolution": "720p"})
+        self.assertEqual(record["source"]["window_seconds"], [126.693, 160.46])
+        self.assertIn("--start 126.693 --end 160.46", record["rebuild"]["command"])
+        self.assertEqual(record["interpolation"]["rife_build"], "rife-build")
+        self.assertEqual(record["settings"]["scene_detection"], "true")
+
+    def test_no_sidecar_for_a_url_input_or_a_missing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "out.mp4"
+            output.write_bytes(b"x")
+            self.ffrife.write_run_provenance("https://example.com/a.mp4", str(output), dict(self.ffrife.DEFAULT_CONFIG))
+            self.assertFalse(self.ffrife._jwkit_common.provenance_path(output).exists())
+
+    def test_jw_org_name_pattern_handles_numbered_and_prefixed_names(self) -> None:
+        match = self.ffrife._JW_MEDIA_NAME.match
+        self.assertEqual(match("00 Opening song - sjj_FSL_161_r720P.mp4")["track"], "161")
+        self.assertEqual(match("S-319-27v_FSL_01_r720P.mp4")["pub"], "S-319-27v")
+        self.assertIsNone(match("home movie.mp4"))
