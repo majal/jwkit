@@ -48,6 +48,7 @@ import glob
 import hashlib
 import json
 import math
+import operator
 import os
 import platform
 import re
@@ -126,7 +127,10 @@ DEFAULT_CONFIG = {
     "scene_threshold": "3.0",  # spike multiplier over recent motion; lower is more sensitive
     "scene_floor": "0.05",  # absolute pixel-change floor below which nothing can be a hard cut
     "scene_revert_fraction": "0.5",  # neighbor magnitude vs. spike's own size to count as isolated
-    "gradual_transition_detection": "true",
+    "scene_histogram_check": "true",  # colour-histogram second opinion rescuing cuts the pixel test misses
+    "scene_histogram_floor": "0.15",  # histogram distance a rescued cut must clear (above ordinary motion's ~0.135 99.9th pct)
+    "gradual_transition_detection": "false",  # off: interpolating through a dissolve beats holding it at source rate
+    "transition_blend_tolerance": "0.25",  # max blend-fit residual (vs. endpoint change) for a run to count as a dissolve
     "transition_min_duration": "0.25",  # seconds of baseline lookback, not a minimum run length
     "transition_sensitivity": "1.35",  # change magnitude relative to recent motion
     "transition_alignment": "0.80",  # successive pixel-change vector cosine similarity
@@ -172,7 +176,10 @@ CONFIG_HELP = {
     "scene_threshold": "Spike multiplier over recent motion needed to flag a hard cut; lower is more sensitive",
     "scene_floor": "Absolute pixel-change floor below which nothing can be flagged as a hard cut",
     "scene_revert_fraction": "How much a neighboring frame's motion must fall relative to a spike's own size to still count it as an isolated cut",
-    "gradual_transition_detection": "Also detect fades/dissolves, not just hard cuts",
+    "scene_histogram_check": "Second-opinion colour-histogram test that rescues cuts the pixel test misses (low-contrast, partial-frame, or busy-motion cuts)",
+    "scene_histogram_floor": "Histogram distance (0-1) a cut rescued by the histogram check must clear",
+    "gradual_transition_detection": "Also detect verified fades/dissolves and hold them at source rate instead of interpolating",
+    "transition_blend_tolerance": "Largest residual (relative to the endpoint change) a candidate run may leave when fitted as a cross-fade of its endpoints",
     "transition_min_duration": "Seconds of baseline lookback used to judge a gradual transition (not a minimum transition length)",
     "transition_sensitivity": "Change magnitude relative to recent motion needed to flag a gradual transition",
     "transition_alignment": "Required cosine similarity between successive pixel-change vectors for a gradual transition",
@@ -299,9 +306,18 @@ def load_config():
     return config
 
 def save_config(config):
+    """Persist only what differs from DEFAULT_CONFIG. Writing every key
+    pinned each default as it stood on the day the file was first saved, so
+    an improved default (a retuned threshold, a feature turned off) never
+    reached an existing install. Keys ffrife doesn't know are kept as-is
+    for `config check` to report rather than silently dropped."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         for k, v in config.items():
+            if k.startswith("_") or k == "resolved_rife_profile":
+                continue
+            if k in DEFAULT_CONFIG and str(v) == str(DEFAULT_CONFIG[k]):
+                continue
             f.write(f'{k} = "{v}"\n')
 
 # --- System / binaries ---
@@ -567,7 +583,11 @@ def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, sl
         if not re.fullmatch(r"(?:-1|\d+)", gpu_id):
             raise ValueError("rife_gpu must be auto, cpu, or a numeric GPU id")
         cmd += ["-g", gpu_id]
-    proc = subprocess.Popen(cmd)
+    # rife-ncnn-vulkan prints its GPU/device banner on every launch - once
+    # per chunk on a long run. Keep it out of the terminal, but surface it
+    # when the binary actually fails, since that's where its errors go too.
+    log = tempfile.TemporaryFile()
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
     start = time.time()
     shown = False
     eta_estimator = _jwkit_common.ProgressETA(target_count)
@@ -597,7 +617,13 @@ def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, sl
         print_count_progress(target_count, target_count, label="RIFE", done=True)
         print()
     if proc.returncode != 0:
+        log.seek(0)
+        tail = log.read().decode(errors="replace").strip().splitlines()[-15:]
+        log.close()
+        if tail:
+            print("rife-ncnn-vulkan output:\n  " + "\n  ".join(tail))
         raise subprocess.CalledProcessError(proc.returncode, [rife_path])
+    log.close()
 
 def run_rife_chunk(rife_path, chunk_in, chunk_out, chunk_target, model_path, threads, gpu, label):
     """run_rife wrapper for the per-chunk loops in _render_rife_chunks:
@@ -1378,50 +1404,199 @@ def _write_json_atomic(path, payload):
     temp.write_text(json.dumps(payload, indent=2, sort_keys=True))
     temp.replace(path)
 
-def suppress_scene_cut_interpolation_range(in_frames, out_frames, input_count, target_count, cuts,
-                                            range_start=0, range_end=None, index_offset=0, source_offset=0):
-    """Replace output samples strictly between each cut's real endpoints,
-    restricted to the global output-index window [range_start, range_end).
+# --- Output timeline -----------------------------------------------------
+#
+# Output frame j of a run stands for source position j * N / T (N source
+# frames in, T output frames out, zero-based), the same start-aligned grid
+# rife-ncnn-vulkan itself uses for `-n`: it places output k of a directory
+# of `in` frames at fx = k * in / n, interpolating frames floor(fx) and
+# floor(fx) + 1 at timestep fx - floor(fx), and clamps anything past the
+# last input to a copy of it. Every place that needs to know which source
+# moment an output frame shows goes through rife_position, so the cut
+# handling below and the chunk seams agree with what RIFE actually
+# rendered. (The previous end-aligned assumption, (in - 1) / (n - 1), drifted
+# up to 0.6 source frames behind RIFE across each chunk: cut handling then
+# replaced the wrong frames - leaving roughly 40% of detected cuts with a
+# visible morph - and every chunk seam froze for a frame or two.)
+# Bumped whenever chunk planning or frame timing changes meaning, so resume
+# data rendered under the old rules is never stitched onto new ones.
+RENDER_LAYOUT_VERSION = 2
+RenderChunk = collections.namedtuple("RenderChunk", "start end own_end first_output outputs request")
+RenderChunk.__doc__ = """One RIFE invocation: source frames [start, end) go in, `request` frames
+come out, and the first `outputs` of them are kept as global output frames
+first_output.. . `own_end` is where the source time this chunk is
+responsible for ends: the next chunk's start (end - 1 when the two overlap by
+one frame so RIFE sees across the seam, `end` itself when the seam sits on a
+cut), or the clip's frame count for the last chunk."""
 
-    `out_frames` is written using LOCAL 1-based filenames, offset from the
-    global zero-based output index by `index_offset` (pass range_start for
-    a chunk directory that only holds that chunk's own frames). The default
-    arguments (range_end=None -> target_count, index_offset=0) cover the
-    whole clip in one call, identical to this function's prior whole-clip-
-    only behavior - see _render_rife_chunks for the per-chunk caller, which
-    narrows the window instead so each chunk can be encoded and freed
-    without waiting for the rest of the clip.
+RIFE_TIMESTEP_CONVENTIONS = ("start", "endpoint")
+RIFE_TIMESTEP_CACHE = CONFIG_DIR / "rife-timestep.json"
 
-    `source_offset` is the same idea for the *input* side: under windowed
-    extraction (see WindowedFrameProvider) `in_frames` holds only one
-    chunk's own source frames, also numbered from 1, so the global
-    zero-based source index of a cut has to be rebased the same way."""
-    if range_end is None:
-        range_end = target_count
-    if input_count < 2 or target_count < 2:
+
+def rife_position(k, input_count, request, convention="start"):
+    """Exact (Fraction) chunk-local source position of RIFE output k when
+    `input_count` frames produce `request` outputs."""
+    if convention == "endpoint":
+        return Fraction(k * (input_count - 1), request - 1) if request > 1 else Fraction(0)
+    return Fraction(k * input_count, request)
+
+
+def _ceil_div(numerator, denominator):
+    return -(-numerator // denominator)
+
+
+def plan_render_chunks(frame_count, target_count, chunk_frames, cuts=(), convention="start"):
+    """Split a run into RenderChunks that tile the output timeline exactly.
+
+    With chunking on, a boundary is snapped onto the latest cut in the last
+    quarter of a chunk whenever there is one: a seam on a cut needs no
+    overlap frame (there is nothing to interpolate across it anyway), and
+    the sub-frame phase reset every seam carries - RIFE always starts a
+    chunk exactly on its first frame - becomes invisible there. Otherwise
+    the chunk ends `chunk_frames` in and the next one starts on its last
+    frame, so RIFE still sees across the seam.
+
+    Each chunk keeps the outputs whose global position falls inside
+    [start, own_end), and asks RIFE for the count whose spacing best matches
+    the global frame interval under `convention` (never fewer than it
+    keeps). The kept counts sum to exactly `target_count`."""
+    if chunk_frames == 1:
+        raise ValueError("chunk_frames must be 0 (disabled) or at least 2")
+    if frame_count < 1:
+        return []
+    spans = []  # (start, own_end, overlap)
+    if chunk_frames <= 0 or frame_count <= chunk_frames:
+        spans.append((0, frame_count, False))
+    else:
+        cut_list = sorted(c for c in set(cuts or ()) if 0 < c < frame_count)
+        start = 0
+        while frame_count - start > chunk_frames:
+            limit = start + chunk_frames
+            earliest = start + max(2, chunk_frames * 3 // 4)
+            snapped = [c for c in cut_list if earliest <= c <= limit]
+            if snapped:
+                spans.append((start, snapped[-1], False))
+                start = snapped[-1]
+            else:
+                spans.append((start, limit - 1, True))
+                start = limit - 1
+        spans.append((start, frame_count, False))
+    chunks = []
+    for start, own_end, overlap in spans:
+        end = own_end + 1 if overlap else own_end
+        first = _ceil_div(start * target_count, frame_count)
+        last = _ceil_div(own_end * target_count, frame_count)
+        outputs = last - first
+        input_count = end - start
+        if convention == "endpoint":
+            ideal = round((input_count - 1) * target_count / frame_count) + 1
+        else:
+            ideal = round(input_count * target_count / frame_count)
+        request = max(outputs, ideal, 1) if outputs else 0
+        chunks.append(RenderChunk(start, end, own_end, first, outputs, request))
+    return chunks
+
+
+def hold_boundary_frames(chunk_out, source_dir, source_offset, chunk, boundaries, convention="start"):
+    """Replace every kept output of `chunk` that RIFE synthesized across a
+    boundary with a held copy of the real frame before it.
+
+    A boundary b (a cut's first frame, or any step inside a protected
+    transition) means source frames b - 1 and b must never be blended, so
+    every output whose exact position lies strictly between them shows
+    frame b - 1 - which is also what the source itself shows until the
+    moment the cut happens. An output landing exactly on b is overwritten
+    with frame b, so float rounding inside RIFE can never leak a morph
+    either. `chunk_out` holds RIFE's own numbering (00000001.png...);
+    `source_dir`/`source_offset` locate global source frame i at
+    ``source_dir / f"{i + 1 - source_offset:08d}.png"``. Returns how many
+    outputs were held."""
+    if not boundaries or not chunk.outputs:
         return 0
-    scale = (target_count - 1) / (input_count - 1)
-    replaced = 0
-    for cut in cuts:
-        if not 0 < cut < input_count:
+    input_count = chunk.end - chunk.start
+    held = 0
+    for k in range(chunk.outputs):
+        position = chunk.start + rife_position(k, input_count, chunk.request, convention)
+        whole = math.floor(position)
+        if position != whole and whole + 1 in boundaries:
+            source_index = whole
+            held += 1
+        elif position == whole and whole in boundaries:
+            source_index = whole
+        else:
             continue
-        first = math.floor((cut - 1) * scale) + 1
-        last = math.ceil(cut * scale) - 1
-        # `cut` is the zero-based index of the shot's first frame; frame
-        # files are one-based, so the post-cut source is at `cut + 1`.
-        source = Path(in_frames) / f"{cut + 1 - source_offset:08d}.png"
-        if not source.exists():
-            continue  # a cut belonging to a neighbouring chunk's own window
-        for output_zero_index in range(max(first, range_start), min(last, range_end - 1) + 1):
-            destination = Path(out_frames) / f"{output_zero_index - index_offset + 1:08d}.png"
-            if destination.exists():
-                shutil.copy2(source, destination)
-                replaced += 1
-    return replaced
+        source = Path(source_dir) / f"{source_index + 1 - source_offset:08d}.png"
+        destination = Path(chunk_out) / f"{k + 1:08d}.png"
+        if source.exists():
+            destination.unlink(missing_ok=True)
+            _link_or_copy(source, destination)
+    return held
 
-def suppress_scene_cut_interpolation(in_frames, out_frames, input_count, target_count, cuts):
-    """Whole-clip convenience wrapper - see suppress_scene_cut_interpolation_range."""
-    return suppress_scene_cut_interpolation_range(in_frames, out_frames, input_count, target_count, cuts)
+
+def _probe_rife_timestep_convention(rife_path, model_path):
+    """Render 3 flat gray frames (0, 120, 240) to 7 outputs and look at
+    output 6: rife-ncnn-vulkan's start-aligned grid puts it at position
+    2.14, past the last input, so it is an exact copy of frame 3; an
+    end-aligned grid would put it at 1.67, a blend. Returns the convention,
+    or None if the probe could not run."""
+    with tempfile.TemporaryDirectory(prefix="ffrife-timestep-") as tmp_dir:
+        in_frames, out_frames = Path(tmp_dir) / "in", Path(tmp_dir) / "out"
+        in_frames.mkdir()
+        out_frames.mkdir()
+        for index, value in enumerate((0, 120, 240), start=1):
+            subprocess.run(
+                [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                 "-i", f"color=c=0x{value:02x}{value:02x}{value:02x}:s=64x64", "-frames:v", "1",
+                 str(in_frames / f"{index:08d}.png")],
+                check=True, timeout=15, capture_output=True)
+        cmd = [str(rife_path), "-i", str(in_frames), "-o", str(out_frames), "-n", "7"]
+        if model_path:
+            cmd += ["-m", str(model_path)]
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        sixth = out_frames / "00000006.png"
+        if result.returncode != 0 or not sixth.exists():
+            return None
+        gray = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-i", str(sixth),
+             "-vf", "crop=8:8:28:28,format=gray", "-f", "rawvideo", "-"],
+            capture_output=True, timeout=15, check=True).stdout
+        if not gray:
+            return None
+        return "start" if sum(gray) / len(gray) >= 237 else "endpoint"
+
+
+def rife_timestep_convention(rife_path, model_path=None):
+    """Which grid this rife binary+model places `-n` outputs on (see the
+    timeline notes above), probed once per binary/model and cached in
+    RIFE_TIMESTEP_CACHE. Falls back to "start" - upstream rife-ncnn-vulkan's
+    behavior - when the probe can't run (and doesn't cache that guess)."""
+    try:
+        binary = Path(shutil.which(str(rife_path)) or rife_path).resolve()
+        info = binary.stat()
+        key = f"{binary}|{info.st_size}|{info.st_mtime_ns}|{Path(model_path).name if model_path else ''}"
+    except (OSError, TypeError):
+        return "start"
+    try:
+        cache = json.loads(RIFE_TIMESTEP_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    if cache.get(key) in RIFE_TIMESTEP_CONVENTIONS:
+        return cache[key]
+    try:
+        convention = _probe_rife_timestep_convention(binary, model_path)
+    except (subprocess.SubprocessError, OSError):
+        convention = None
+    if convention is None:
+        return "start"
+    if convention != "start":
+        print(f"Note: {binary.name} places interpolated frames on an end-aligned grid; adjusting cut handling to match.")
+    try:
+        RIFE_TIMESTEP_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(RIFE_TIMESTEP_CACHE, {key: convention})
+    except OSError:
+        pass
+    return convention
+
 
 def _tiny_frame_stream(input_args, pre_vf, width, height):
     """ffmpeg command streaming `input_args` as raw width x height rgb24
@@ -1479,11 +1654,125 @@ def count_decoded_frames(input_args, pre_vf=None):
     return count
 
 
+# Detection works on two tiny renditions of every frame, decoded together in
+# one ffmpeg pass (stacked vertically, see _detection_frame_stream): a 32x18
+# image for the pixel-change signal, and a 64x36 one for colour histograms,
+# which need more samples than 576 pixels to be stable.
+DETECT_PIXEL_SIZE = (32, 18)
+DETECT_HIST_SIZE = (64, 36)
+HIST_BINS = 16
+_HIST_BIN_TABLE = bytes(value * HIST_BINS // 256 for value in range(256))
+_HIST_BIN_KEYS = [bytes([index]) for index in range(HIST_BINS)]
+# A histogram-rescued cut must stand at least this far above both of its
+# neighbours' histogram change (calibrated on a 26-minute drama with 350
+# cuts: every rescued cut cleared 2.6x, ordinary motion and splashes did not)...
+HISTOGRAM_ISOLATION = 2.5
+# ...and still move a real share of the pixels. Coarse bins make a small
+# global brightness shift on a flat frame jump bins; it moves almost no
+# pixel value, so this keeps that bin-edge artifact from reading as a cut.
+HISTOGRAM_MIN_PIXEL_SHARE = 0.4
+# How far a dissolve's blend weight may step back toward the outgoing shot
+# between frames before the run stops looking like one monotonic cross-fade.
+BLEND_MONOTONIC_SLACK = 0.15
+# Smallest share of the minority shot some middle frame must carry.
+BLEND_MIN_MIX = 0.15
+
+
+def _detection_frame_stream(input_args, pre_vf):
+    """ffmpeg command streaming every frame of `input_args` as one raw rgb24
+    image: the DETECT_HIST_SIZE rendition on top, the DETECT_PIXEL_SIZE one
+    below it (left-aligned, black-padded to the same width). One decode pass
+    feeds both detection signals. See _tiny_frame_stream for why
+    ``format=rgb24`` comes before any scaling."""
+    pixel_w, pixel_h = DETECT_PIXEL_SIZE
+    hist_w, hist_h = DETECT_HIST_SIZE
+    graph = (f"format=rgb24,split=2[full][small];[full]scale={hist_w}:{hist_h}[hist];"
+             f"[small]scale={pixel_w}:{pixel_h},pad={hist_w}:{pixel_h}[pix];[hist][pix]vstack")
+    return [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", *input_args,
+            "-vf", f"{pre_vf},{graph}" if pre_vf else graph,
+            "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+
+
+def _detection_frame_bytes():
+    hist_w, hist_h = DETECT_HIST_SIZE
+    return hist_w * (hist_h + DETECT_PIXEL_SIZE[1]) * 3
+
+
+def _split_detection_frame(frame):
+    """(histogram image bytes, pixel image bytes) from one stacked frame."""
+    hist_w, hist_h = DETECT_HIST_SIZE
+    pixel_w, pixel_h = DETECT_PIXEL_SIZE
+    top = hist_w * hist_h * 3
+    row, keep = hist_w * 3, pixel_w * 3
+    pixels = b"".join(frame[top + r * row:top + r * row + keep] for r in range(pixel_h))
+    return frame[:top], pixels
+
+
+def _colour_histogram(image):
+    """Per-channel HIST_BINS-bin RGB histogram, each channel normalized to 1.
+    bytes.translate/count keep this in C - pure-Python pixel loops would
+    dominate the detection pass."""
+    binned = image.translate(_HIST_BIN_TABLE)
+    count = max(1, len(binned) // 3)
+    return [[binned[channel::3].count(key) / count for key in _HIST_BIN_KEYS] for channel in range(3)]
+
+
+def _histogram_distance(left, right):
+    """1 - histogram intersection, averaged over channels: 0 for identical
+    colour distributions, 1 for disjoint ones."""
+    overlap = sum(sum(map(min, a, b)) for a, b in zip(left, right)) / len(left)
+    return max(0.0, 1.0 - overlap)
+
+
+def _is_cross_fade(frames, first, last, floor, tolerance):
+    """Whether frames first..last look like one cross-fade from frame
+    `first` to frame `last`: every frame between them must be close to a
+    blend ``a*first + (1-a)*last`` (residual at most `tolerance` times the
+    endpoints' own difference), with `a` falling monotonically and at least
+    one frame genuinely mixed (BLEND_MIN_MIX), and the endpoints must differ
+    by at least `floor`.
+
+    This is what separates a real dissolve from the far more common thing
+    the elevated-and-aligned candidate test also matches: smooth camera
+    motion (pans, zooms), whose consecutive changes point the same way
+    frame after frame but whose middle frames are no blend of its ends.
+    Measured on a 26-minute drama: the candidate test alone flagged 495
+    ranges (11% of all frames), of which about 21 actually were blends."""
+    outgoing, incoming = frames.get(first), frames.get(last)
+    if outgoing is None or incoming is None or last - first < 2:
+        return False
+    diff = list(map(operator.sub, outgoing, incoming))
+    energy = sum(map(operator.mul, diff, diff))
+    endpoint_change = sum(map(abs, diff)) / (len(diff) * 255)
+    if not energy or endpoint_change < floor:
+        return False
+    limit = tolerance * endpoint_change * len(diff) * 255
+    previous_alpha = 1.0
+    mixed = 0.0
+    for index in range(first + 1, last):
+        frame = frames.get(index)
+        if frame is None:
+            return False
+        offset = list(map(operator.sub, frame, incoming))
+        alpha = min(1.0, max(0.0, sum(map(operator.mul, diff, offset)) / energy))
+        if sum(abs(o - alpha * d) for o, d in zip(offset, diff)) > limit:
+            return False
+        if alpha > previous_alpha + BLEND_MONOTONIC_SLACK:
+            return False
+        previous_alpha = alpha
+        mixed = max(mixed, min(alpha, 1.0 - alpha))
+    # A dissolve has at least one frame that is genuinely both shots; a short
+    # run whose middle frames all equal one endpoint is a hard cut instead,
+    # and belongs to the cut test, not here.
+    return mixed >= BLEND_MIN_MIX
+
+
 def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.05,
                         revert_fraction=0.5, min_duration=0.25,
-                        sensitivity=1.35, alignment=0.80, detect_gradual=True,
-                        input_args=None, pre_vf=None):
-    """Single-pass detection of hard cuts and gradual transitions.
+                        sensitivity=1.35, alignment=0.80, detect_gradual=False,
+                        histogram_check=True, histogram_floor=0.15, blend_tolerance=0.25,
+                        input_args=None, pre_vf=None, stats=None):
+    """Single-pass detection of hard cuts and (optionally) gradual transitions.
 
     `input_args` overrides the default "read the extracted PNG sequence in
     `in_frames`" input with any other ffmpeg input (windowed extraction
@@ -1491,137 +1780,174 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
     sequence to read); `pre_vf` is then the run's own filter chain, applied
     before the downscale so both paths see the identical frame sequence.
 
-    Tiny RGB frames (32x18, cheap enough to hold in memory for the whole
-    clip) make this cheap, and colour - not just luma - matters: a cut
-    between two shots that happen to share the same average brightness but
-    differ in hue is invisible to a grayscale-only metric.
+    Colour - not just luma - matters throughout: a cut between two shots
+    that share the same average brightness but differ in hue is invisible to
+    a grayscale-only metric.
 
-    Every frame-to-frame step gets a magnitude (how much changed) and an
-    alignment (cosine similarity with the previous step's change vector).
-    The two transition types share the same signal but differ in shape:
+    Every frame-to-frame step gets a pixel magnitude (mean absolute RGB
+    change of the 32x18 rendition), an alignment (cosine similarity with
+    the previous step's change vector), and a colour-histogram distance
+    (of the 64x36 rendition).
 
     - A hard cut is an isolated impulse: magnitude clears both ``cut_floor``
       (an absolute pixel-change amount - keeps near-silent clips from
       treating tiny noise as a cut) and ``cut_sensitivity`` times the
-      clip's recent baseline, is unaligned with the motion before it (the
-      incoming shot's content has no relationship to the outgoing shot's
-      direction of change), and both neighbors are below ``revert_fraction``
-      of the spike itself - far smaller, not just smaller. That last,
-      *relative* part matters - comparing the neighbors only to the
-      pre-spike baseline would also flag whip pans (which sustain elevated,
-      poorly-aligned magnitude across several frames) and would miss a cut
-      into a shot that itself opens with brisk motion (whose first real
-      frame reads as "elevated" against the calmer outgoing shot).
-      Comparing each neighbor to the spike's own size instead - not the
-      baseline - tells "steep both ways" (a cut) apart from "ramps up,
-      ramps down" (real camera motion) or "elevated throughout" (a busy new
-      shot), even when every individual frame of a whip pan clears the
-      baseline-relative bar on its own.
-    - A gradual transition is the same signature sustained: elevated
-      magnitude that stays aligned with itself frame after frame, which is
-      what a monotonic fade/dissolve looks like (linear alpha blending
-      produces a near-constant per-pixel change direction for its whole
-      duration). ``min_duration`` only sizes the baseline lookback window
-      (how far back to search for the clip's normal motion level before
-      judging a run elevated) - it is not a minimum run length. Quick
-      dissolves (a handful of frames) are common and are protected the
-      same as long ones; the magnitude/alignment gates already reject
-      one-off motion spikes.
+      clip's recent baseline, is unaligned with the motion before it, and
+      both neighbours are below ``revert_fraction`` of the spike itself.
+      Comparing each neighbour to the spike's own size - not the baseline -
+      tells "steep both ways" (a cut) apart from "ramps up, ramps down"
+      (real camera motion) or "elevated throughout" (a busy new shot).
+    - ``histogram_check`` adds a second opinion for the cuts that test is
+      structurally blind to: a change confined to part of the frame (a
+      background cut behind a composited presenter), a low-contrast cut
+      between two similar-brightness shots that never clears
+      ``cut_floor``, and a cut inside fast motion (a time-lapse montage)
+      whose neighbours are themselves too large to look isolated. A step
+      is accepted as a cut when its histogram distance clears
+      ``histogram_floor`` and stands HISTOGRAM_ISOLATION times above both
+      neighbours' histogram change, while its pixel change is still the
+      local maximum and at least HISTOGRAM_MIN_PIXEL_SHARE of
+      ``cut_floor``. It only ever adds cuts: a missed cut leaves a visible
+      morph, while a spurious one costs a single held source frame.
+    - A gradual transition (``detect_gradual``) starts as a run of elevated
+      changes that stay aligned with themselves frame after frame, and is
+      kept only if _is_cross_fade confirms its middle frames really are a
+      blend of its endpoints (within ``blend_tolerance``). Candidates are
+      verified as soon as each run closes, so only the open run's frames
+      are ever held in memory. ``min_duration`` only sizes the baseline
+      lookback window, not a minimum run length.
 
     Returns ``(cuts, transitions, frame_count)``: ``cuts`` is a sorted list
     of zero-based indices of frames that begin a new shot; ``transitions``
-    is a list of zero-based ``(start, end)`` frame ranges for sustained
+    is a list of zero-based ``(start, end)`` frame ranges for verified
     fades/dissolves; ``frame_count`` is how many frames this pass actually
     saw, which windowed extraction uses as the clip's authoritative source
-    frame count (it has no extracted sequence to count instead).
+    frame count. A ``stats`` dict, when given, receives
+    ``histogram_rescued`` and ``gradual_candidates`` counts.
     """
-    width, height = 32, 18
-    cmd = _tiny_frame_stream(input_args or frames_input_args(in_frames, source_fps), pre_vf, width, height)
-    size = width * height * 3
+    size = _detection_frame_bytes()
     minimum = max(3, round(float(min_duration) * float(source_fps)))
+    cmd = _detection_frame_stream(input_args or frames_input_args(in_frames, source_fps), pre_vf)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    previous_frame = previous_delta = None
+    previous_pixels = previous_delta = previous_hist = None
+    previous_energy = 0
     frame_count = 0
-    magnitudes = []
-    cosines = {}
-    while True:
-        frame = proc.stdout.read(size)
-        if len(frame) != size:
-            break
-        frame_count += 1
-        if previous_frame is not None:
-            delta = [b - a for a, b in zip(previous_frame, frame)]
-            magnitude = sum(abs(value) for value in delta) / (size * 255)
-            magnitudes.append(magnitude)
-            if previous_delta is not None:
-                index = len(magnitudes) - 1
-                left_energy = sum(value * value for value in previous_delta)
-                right_energy = sum(value * value for value in delta)
-                cosines[index] = (sum(a * b for a, b in zip(previous_delta, delta)) /
-                                  math.sqrt(left_energy * right_energy) if left_energy and right_energy else 0.0)
-            previous_delta = delta
-        previous_frame = frame
-    proc.stdout.close()
-    if proc.wait() != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
-    if frame_count < 3:
-        return [], [], frame_count
+    magnitudes, hist_distances, cosines = [], [], {}
 
     def baseline_at(index):
         history_end = max(1, index - minimum)
         history = magnitudes[max(0, history_end - max(24, minimum * 3)):history_end]
         return statistics.median(history) if history else magnitudes[index - 1]
 
+    # Online gradual-candidate tracking (same state machine as a post-pass,
+    # one step behind the stream): `run` is [start, previous, gaps].
     transitions = []
+    candidate_count = 0
+    kept_frames = {}
+    run = None
+    pixel_floor = 0.003
+
+    def close_run():
+        nonlocal candidate_count
+        start_frame, last_frame = run[0], run[1]
+        range_start = max(0, start_frame - 1)
+        range_end = min(frame_count - 1, last_frame + 1)
+        candidate_count += 1
+        # Verify from one frame before the range: the candidate test only
+        # fires once the second aligned step arrives, so range_start itself
+        # is already one step into the fade.
+        if _is_cross_fade(kept_frames, max(0, range_start - 1), range_end, cut_floor, blend_tolerance):
+            transitions.append((range_start, range_end))
+
+    def step_candidate(frame_index, begins, continues):
+        nonlocal run
+        accepted = begins if run is None else continues
+        if accepted:
+            if run is None:
+                run = [frame_index, frame_index, 0]
+            run[1], run[2] = frame_index, 0
+            return
+        if run is not None:
+            run[2] += 1
+            if run[2] > 1:
+                close_run()
+                run = None
+
+    while True:
+        frame = proc.stdout.read(size)
+        if len(frame) != size:
+            break
+        frame_count += 1
+        hist_image, pixels = _split_detection_frame(frame)
+        histogram = _colour_histogram(hist_image) if histogram_check else None
+        if detect_gradual:
+            kept_frames[frame_count - 1] = pixels
+        if previous_pixels is not None:
+            delta = list(map(operator.sub, pixels, previous_pixels))
+            energy = sum(map(operator.mul, delta, delta))
+            magnitudes.append(sum(map(abs, delta)) / (len(delta) * 255))
+            hist_distances.append(_histogram_distance(previous_hist, histogram) if histogram_check else 0.0)
+            index = len(magnitudes) - 1
+            if previous_delta is not None:
+                cosines[index] = (sum(map(operator.mul, previous_delta, delta)) /
+                                  math.sqrt(previous_energy * energy) if previous_energy and energy else 0.0)
+                if detect_gradual:
+                    magnitude, cosine = magnitudes[index], cosines[index]
+                    active = magnitude >= max(pixel_floor, baseline_at(index) * float(sensitivity))
+                    step_candidate(index + 1, active and cosine >= float(alignment),
+                                   magnitude >= pixel_floor and cosine >= float(alignment))
+            previous_delta, previous_energy = delta, energy
+        if detect_gradual:
+            # Keep only what an open (or about-to-open) run can still need.
+            oldest = (run[0] - 2) if run is not None else frame_count - 3
+            for stale in [key for key in kept_frames if key < oldest]:
+                del kept_frames[stale]
+        previous_pixels, previous_hist = pixels, histogram
+    proc.stdout.close()
+    if proc.wait() != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
     if detect_gradual:
-        candidates = []
-        for index in range(1, len(magnitudes)):
-            if index not in cosines:
-                continue
-            cosine = cosines[index]
-            magnitude = magnitudes[index]
-            baseline = baseline_at(index)
-            active = magnitude >= max(0.003, baseline * float(sensitivity))
-            candidates.append((index + 1, active and cosine >= float(alignment),
-                               magnitude >= 0.003 and cosine >= float(alignment)))
-        start = previous = None
-        gaps = 0
-        for frame_index, begins, continues in candidates + [(frame_count, False, False), (frame_count + 1, False, False)]:
-            accepted = begins if start is None else continues
-            if accepted:
-                start = frame_index if start is None else start
-                previous = frame_index
-                gaps = 0
-                continue
-            if start is not None:
-                gaps += 1
-                if gaps <= 1:
-                    continue
-                transitions.append((max(0, start - 1), min(frame_count - 1, previous + 1)))
-                start = previous = None
-                gaps = 0
+        step_candidate(frame_count, False, False)
+        step_candidate(frame_count + 1, False, False)
+    if frame_count < 3:
+        return [], [], frame_count
 
     protected = set()
     for start_frame, end_frame in transitions:
         protected.update(range(start_frame, end_frame + 1))
 
     cuts = []
+    rescued = 0
     for index in range(len(magnitudes)):
         frame_index = index + 1  # zero-based index of the frame that just arrived
         if frame_index in protected:
             continue
         magnitude = magnitudes[index]
-        baseline = baseline_at(index) if index >= 1 else magnitude
-        if magnitude < max(float(cut_floor), baseline * float(cut_sensitivity)):
-            continue
-        if cosines.get(index, 0.0) >= float(alignment):
-            continue  # coherent with recent motion direction - not a discontinuity
         previous_magnitude = magnitudes[index - 1] if index >= 1 else 0.0
         next_magnitude = magnitudes[index + 1] if index + 1 < len(magnitudes) else 0.0
-        if (previous_magnitude >= magnitude * float(revert_fraction) or
-                next_magnitude >= magnitude * float(revert_fraction)):
-            continue  # part of a sustained burst (e.g. a whip pan), not a one-off cut
-        cuts.append(frame_index)
+        baseline = baseline_at(index) if index >= 1 else magnitude
+        pixel_cut = (magnitude >= max(float(cut_floor), baseline * float(cut_sensitivity))
+                     and cosines.get(index, 0.0) < float(alignment)
+                     and previous_magnitude < magnitude * float(revert_fraction)
+                     and next_magnitude < magnitude * float(revert_fraction))
+        if pixel_cut:
+            cuts.append(frame_index)
+            continue
+        if not histogram_check:
+            continue
+        distance = hist_distances[index]
+        previous_distance = hist_distances[index - 1] if index >= 1 else 0.0
+        next_distance = hist_distances[index + 1] if index + 1 < len(hist_distances) else 0.0
+        if (distance >= float(histogram_floor)
+                and previous_distance * HISTOGRAM_ISOLATION <= distance
+                and next_distance * HISTOGRAM_ISOLATION <= distance
+                and magnitude >= float(cut_floor) * HISTOGRAM_MIN_PIXEL_SHARE
+                and magnitude >= previous_magnitude and magnitude >= next_magnitude):
+            cuts.append(frame_index)
+            rescued += 1
+    if stats is not None:
+        stats["histogram_rescued"] = rescued
+        stats["gradual_candidates"] = candidate_count
     return sorted(set(cuts)), transitions, frame_count
 
 def parse_transition_ranges(value, source_fps, input_count):
@@ -1677,13 +2003,13 @@ def _chunk_ranges(frame_count, chunk_frames):
 
 def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config, input_args=None, pre_vf=None):
     """Returns (cuts, transition_count, frame_count): cuts is a sorted,
-    deduped list of global zero-based hard-cut frame indices (explicit
-    --transition-ranges plus anything scene_detection found), or None if
-    scene_detection is off. Split out of render_rife_frames because the
-    streaming-encode branch below needs this resolved *before* RIFE runs (so
-    each chunk can suppress its own cut-adjacent frames as it's generated),
-    while the plain branch keeps doing it after, exactly as before - see
-    _render_rife_chunks' ``encode`` parameter.
+    deduped list of global zero-based "boundary" frame indices - frames
+    that must not be interpolated *into* from the frame before them
+    (detected hard cuts, plus every step inside a verified dissolve or an
+    explicit --transition-ranges interval) - or None if scene_detection is
+    off. Always resolved before any RIFE runs, because chunk planning snaps
+    chunk boundaries onto cuts and every chunk holds its own cut-adjacent
+    frames as soon as it is generated (see hold_boundary_frames).
 
     `input_args`/`pre_vf` let windowed extraction run the same detection
     straight off the source video, since it deliberately never has the whole
@@ -1697,7 +2023,11 @@ def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config, input_
     if scene_threshold <= 0:
         raise ValueError("scene_threshold must be greater than 0")
     explicit_transitions = parse_transition_ranges(config.get("transition_ranges", ""), source_fps, input_frame_count)
-    print(f"Detecting scene cuts and transitions (sensitivity={scene_threshold:g})...")
+    gradual = config_bool(config, "gradual_transition_detection", False)
+    histogram = config_bool(config, "scene_histogram_check", True)
+    print(f"Detecting scene cuts{' and dissolves' if gradual else ''} (sensitivity={scene_threshold:g}"
+          f"{', histogram check' if histogram else ''})...")
+    stats = {}
     cuts, transitions, frame_count = detect_transitions(
         in_frames, source_fps,
         cut_sensitivity=scene_threshold,
@@ -1706,9 +2036,20 @@ def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config, input_
         min_duration=config_float(config, "transition_min_duration", 0.25),
         sensitivity=config_float(config, "transition_sensitivity", 1.35),
         alignment=config_float(config, "transition_alignment", 0.80),
-        detect_gradual=config_bool(config, "gradual_transition_detection", True),
-        input_args=input_args, pre_vf=pre_vf,
+        detect_gradual=gradual,
+        histogram_check=histogram,
+        histogram_floor=config_float(config, "scene_histogram_floor", 0.15),
+        blend_tolerance=config_float(config, "transition_blend_tolerance", 0.25),
+        input_args=input_args, pre_vf=pre_vf, stats=stats,
     )
+    summary = f"Scene detection: {len(cuts)} hard cut(s)"
+    if histogram:
+        summary += f" ({stats.get('histogram_rescued', 0)} found by the histogram check)"
+    if gradual:
+        summary += f", {len(transitions)} verified dissolve(s) of {stats.get('gradual_candidates', 0)} candidate(s)"
+    if explicit_transitions:
+        summary += f", {len(explicit_transitions)} explicit range(s)"
+    print(summary + ".")
     transitions = list(explicit_transitions) + transitions
     for start_frame, end_frame in transitions:
         cuts.extend(range(start_frame + 1, end_frame + 1))
@@ -1830,9 +2171,10 @@ class WindowedFrameProvider:
       first was wrong by exactly that one duplicated frame, and every chunk
       became byte-exact with passthrough on.
     * Every chunk is then verified anyway: it must produce exactly the
-      frames requested, and - because _chunk_ranges deliberately overlaps
-      one source frame between neighbours - its first frame must be
-      byte-identical to the previous chunk's last. A VFR source, a bad fps
+      frames requested, and the frame at the seam must be byte-identical to
+      the previous chunk's last - its own first frame when the chunks
+      overlap by one, or one extra frame decoded just ahead of it when the
+      seam sits on a cut (see plan_render_chunks). A VFR source, a bad fps
       probe, or an ffmpeg quirk none of the above anticipated fails that
       check and falls back to upfront extraction, rather than silently
       shifting a chunk by a frame."""
@@ -1845,29 +2187,39 @@ class WindowedFrameProvider:
         self.source_fps = float(source_fps)
         self.window_start = float(window_start or 0.0)
         self.vf = vf
-        self._seam_digest = None
+        self._seam = None  # (global index, digest) of the last frame materialized
 
     def materialize(self, start, end, chunk_in):
         chunk_in = Path(chunk_in)
+        # A seam either overlaps one frame (the previous chunk's last frame
+        # IS this chunk's first) or sits on a cut (it is the frame right
+        # before this chunk's first). Decode that one extra frame in the
+        # second case, as 00000000.png, purely to check the seam against.
+        seam = self._seam is not None and self._seam[0] in (start, start - 1)
+        lead = 1 if seam and self._seam[0] == start - 1 else 0
+        first = start - lead
         # Half a frame early: accurate seek keeps frames at or after the
-        # seek time, so aiming at (start - 0.5)/fps lands on `start` itself
+        # seek time, so aiming at (first - 0.5)/fps lands on `first` itself
         # for any rounding within half a frame either way.
-        seek = self.window_start + max(0.0, start - 0.5) / self.source_fps
+        seek = self.window_start + max(0.0, first - 0.5) / self.source_fps
         cmd = ["-ss", f"{seek:.6f}", "-i", str(self.source)]
         if self.vf:
             cmd += ["-vf", self.vf]
-        cmd += passthrough_fps_args() + ["-frames:v", str(end - start), f"{chunk_in}/%08d.png"]
+        cmd += passthrough_fps_args() + ["-frames:v", str(end - first), "-start_number", str(1 - lead),
+                                         f"{chunk_in}/%08d.png"]
         run_ffmpeg(cmd, label=f"Extracting source frames {start + 1}-{end}")
         frames = sorted(chunk_in.glob("*.png"))
-        if len(frames) != end - start:
+        if len(frames) != end - first:
             raise WindowedExtractionError(
                 f"on-demand extraction of source frames {start + 1}-{end} produced "
-                f"{len(frames)} frame(s), not {end - start}")
-        if self._seam_digest is not None and _file_digest(frames[0]) != self._seam_digest:
+                f"{len(frames) - lead} frame(s), not {end - start}")
+        if seam and _file_digest(frames[0]) != self._seam[1]:
             raise WindowedExtractionError(
-                f"on-demand extraction of source frames {start + 1}-{end} did not resume "
-                f"from the previous chunk's last frame - the source's timing can't be seeked reliably")
-        self._seam_digest = _file_digest(frames[-1])
+                f"on-demand extraction of source frames {start + 1}-{end} did not line up with "
+                f"the previous chunk's last frame - the source's timing can't be seeked reliably")
+        if lead:
+            frames[0].unlink()
+        self._seam = (end - 1, _file_digest(frames[-1]))
         return chunk_in, start
 
 
@@ -1875,110 +2227,144 @@ def _file_digest(path):
     return hashlib.md5(Path(path).read_bytes()).hexdigest()
 
 
+def _render_one_chunk(rife_path, provider, chunk, chunk_in, chunk_out, model_path, config, boundaries,
+                      convention, label):
+    """Materialize one RenderChunk's source frames, render its RIFE outputs
+    into `chunk_out`, and hold its boundary-crossing frames. Returns how
+    many outputs were held. `chunk_in` is left in place: under windowed
+    extraction it is the only copy of these source frames, and the caller
+    frees it once it no longer needs them."""
+    shutil.rmtree(chunk_in, ignore_errors=True)
+    shutil.rmtree(chunk_out, ignore_errors=True)
+    Path(chunk_in).mkdir(parents=True)
+    Path(chunk_out).mkdir(parents=True)
+    source_dir, source_offset = provider.materialize(chunk.start, chunk.end, chunk_in)
+    if not chunk.request:
+        return 0
+    if chunk.end - chunk.start < 2 or chunk.request < 2:
+        # Nothing to interpolate between: a lone frame (a one-frame shot at
+        # the clip's end) or a single kept output is just that frame held.
+        source = Path(source_dir) / f"{chunk.start + 1 - source_offset:08d}.png"
+        for k in range(chunk.request):
+            _link_or_copy(source, Path(chunk_out) / f"{k + 1:08d}.png")
+        return 0
+    print(f"{label} ({chunk.end - chunk.start} source frames)...")
+    run_rife_chunk(rife_path, chunk_in, chunk_out, chunk.request, model_path,
+                   config.get("rife_threads"), config.get("rife_gpu"), label=label)
+    return hold_boundary_frames(chunk_out, source_dir, source_offset, chunk, boundaries, convention)
+
+
+def _kept_chunk_frames(chunk_out, chunk):
+    return sorted(Path(chunk_out).glob("*.png"))[:chunk.outputs]
+
+
 def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, config, state_path,
-                         cuts=None, input_count=None, encode=None):
+                         cuts=None, input_count=None, encode=None, convention="start"):
     """Run RIFE over `in_frames` in resumable chunks (see docs/ffrife.md).
 
-    With ``encode=None`` (the default, used by every caller except
-    interpolate()'s own RIFE branch below): unchanged prior behavior -
-    every chunk's interpolated PNGs are kept under `state_path`'s "chunks"
-    directory until every chunk is done, then hardlinked into a single flat
-    `out_frames` sequence for the caller's own single final encode. This is
-    what render_rife_frames' public frames-directory contract (used
-    directly by slverse's encode_rife_frame_sections, which concatenates
-    multiple sections before one shared encode) depends on, so it can't
-    change here.
+    Chunks come from plan_render_chunks, which snaps seams onto `cuts` (the
+    boundary list from _resolve_scene_cuts) when it can and tiles the output
+    timeline exactly; each chunk holds its own boundary-crossing frames as
+    soon as RIFE produces it (hold_boundary_frames), so no later whole-clip
+    pass is needed. `convention` is the binary's timestep grid
+    (rife_timestep_convention). The chunk layout is recorded in
+    `state_path`; resume data from a different layout is discarded rather
+    than stitched onto the wrong frames.
+
+    With ``encode=None`` (the default): every chunk's kept PNGs are kept
+    under `state_path`'s "chunks" directory until every chunk is done, then
+    hardlinked into a single flat `out_frames` sequence for the caller's own
+    single final encode. render_rife_frames' public frames-directory
+    contract (used directly by slverse's encode_rife_frame_sections, which
+    concatenates multiple sections before one shared encode) depends on
+    this.
 
     With ``encode`` given - a dict of {"segment_chunks", "fps", "output_vf",
-    "encode_args"} - "Streaming encode" mode instead: `cuts` (from
-    _resolve_scene_cuts) and `input_count` let each chunk suppress its own
-    cut-adjacent frames as soon as RIFE produces it (suppress_scene_cut_
-    interpolation_range, scoped to that chunk's own output window - the
-    whole-clip pass can no longer wait for every chunk to exist at once).
-    Every `encode["segment_chunks"]` completed chunks are hardlinked into a
-    flat temp directory and encoded directly to their own small AV1 segment
-    via a plain ffmpeg call (same shape as the non-streaming path's own
-    final encode, just scoped to a batch of chunks) - only THEN are those
-    chunks marked complete in `state_path` and their PNGs freed, bounding
-    peak disk to about one segment's worth of interpolated frames instead
-    of the whole clip. A segment is trusted only once ffmpeg has actually
-    returned success for it (`state_path` is written afterward, via the
-    same atomic-rename `_write_json_atomic` already uses elsewhere), so an
-    interruption can only cost the batch that was still in progress, not
-    the whole run - see docs/ffrife.md's "Streaming encode" section.
-    `out_frames`/`target_count`'s frame-file contract is unused in this
-    mode; the return value is the finalized segment video paths instead.
+    "encode_args"} - "Streaming encode" mode instead: every
+    `encode["segment_chunks"]` completed chunks are hardlinked into a flat
+    temp directory and encoded directly to their own small segment - only
+    THEN are those chunks marked complete in `state_path` and their PNGs
+    freed, bounding peak disk to about one segment's worth of interpolated
+    frames instead of the whole clip. A segment is trusted only once ffmpeg
+    has actually returned success for it (`state_path` is written
+    afterward, via the atomic-rename `_write_json_atomic`), so an
+    interruption can only cost the batch that was still in progress - see
+    docs/ffrife.md's "Streaming encode" section. The return value is then
+    the finalized segment video paths.
 
     `in_frames` is either a directory of already-extracted source frames
-    (wrapped in a FullFrameProvider, the historical shape) or a provider
-    that materializes one chunk's frames at a time - see
-    WindowedFrameProvider, which never needs the whole source set on disk."""
+    (wrapped in a FullFrameProvider) or a provider that materializes one
+    chunk's frames at a time - see WindowedFrameProvider, which never needs
+    the whole source set on disk. `input_count` is accepted for
+    compatibility; the provider's own count is authoritative."""
     provider = in_frames if hasattr(in_frames, "materialize") else FullFrameProvider(in_frames)
-    ranges = _chunk_ranges(provider.count, config_int(config, "chunk_frames", 0))
+    boundaries = set(cuts or ())
+    chunks = plan_render_chunks(provider.count, target_count, config_int(config, "chunk_frames", 0),
+                                boundaries, convention)
+    layout = [list(chunk) for chunk in chunks]
+    chunks_root = state_path.parent / "chunks"
+    segments_dir = state_path.parent / "segments"
     state = {}
     if state_path.exists():
         try:
             state = json.loads(state_path.read_text())
         except (OSError, ValueError):
             state = {}
+    if state and state.get("layout") != layout:
+        print("Resume data was planned for a different chunk layout; starting the RIFE pass fresh.")
+        shutil.rmtree(chunks_root, ignore_errors=True)
+        shutil.rmtree(segments_dir, ignore_errors=True)
+        state = {}
     completed = set(state.get("completed_chunks", []))
-    total_intervals = max(1, provider.count - 1)
-    target_intervals = max(0, target_count - 1)
+    chunks_root.mkdir(parents=True, exist_ok=True)
+    cooldown = config_float(config, "cooldown_seconds", 0)
+    held_total = 0
+
+    def save_state(**extra):
+        _write_json_atomic(state_path, {"layout": layout, "completed_chunks": sorted(completed, key=int), **extra})
+
+    def chunk_dirs(index):
+        root = chunks_root / f"{index:06d}"
+        return root / "in", root / "out", root / "complete.json"
+
+    def rest(index):
+        if cooldown and index + 1 < len(chunks):
+            print(f"Cooling down for {cooldown}s before the next chunk (Ctrl-C is safe; resume later)...")
+            time.sleep(cooldown)
 
     if encode is None:
-        chunks_root = state_path.parent / "chunks"
-        chunks_root.mkdir(parents=True, exist_ok=True)
-        for index, (start, end) in enumerate(ranges):
-            chunk_key = str(index)
-            chunk_out = chunks_root / f"{index:06d}" / "out"
-            marker = chunk_out.parent / "complete.json"
-            if chunk_key in completed and marker.exists():
+        for index, chunk in enumerate(chunks):
+            chunk_in, chunk_out, marker = chunk_dirs(index)
+            if str(index) in completed and marker.exists():
                 try:
-                    expected = int(json.loads(marker.read_text())["target_count"])
+                    expected = int(json.loads(marker.read_text())["request"])
                 except (OSError, ValueError, KeyError, TypeError):
                     expected = -1
                 if len(list(chunk_out.glob("*.png"))) == expected:
-                    print(f"Resuming: chunk {index + 1}/{len(ranges)} already complete.")
+                    print(f"Resuming: chunk {index + 1}/{len(chunks)} already complete.")
                     continue
                 print(f"Resume data for chunk {index + 1} is incomplete; rebuilding it.")
-            chunk_in = chunks_root / f"{index:06d}" / "in"
+            held_total += _render_one_chunk(rife_path, provider, chunk, chunk_in, chunk_out, model_path, config,
+                                            boundaries, convention, f"RIFE chunk {index + 1}/{len(chunks)}")
             shutil.rmtree(chunk_in, ignore_errors=True)
-            shutil.rmtree(chunk_out, ignore_errors=True)
-            chunk_in.mkdir(parents=True); chunk_out.mkdir(parents=True)
-            provider.materialize(start, end, chunk_in)
-            first_interval = round(start * target_intervals / total_intervals)
-            last_interval = round((end - 1) * target_intervals / total_intervals)
-            chunk_target = max(2, last_interval - first_interval + 1)
-            print(f"RIFE chunk {index + 1}/{len(ranges)} ({end - start} source frames)...")
-            run_rife_chunk(rife_path, chunk_in, chunk_out, chunk_target, model_path,
-                           config.get("rife_threads"), config.get("rife_gpu"),
-                           label=f"RIFE chunk {index + 1}/{len(ranges)}")
-            _write_json_atomic(marker, {"target_count": chunk_target})
-            completed.add(chunk_key)
-            _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int)})
-            shutil.rmtree(chunk_in, ignore_errors=True)
-            cooldown = config_float(config, "cooldown_seconds", 0)
-            if cooldown and index + 1 < len(ranges):
-                print(f"Cooling down for {cooldown}s before the next chunk (Ctrl-C is safe; resume later)...")
-                time.sleep(cooldown)
+            _write_json_atomic(marker, {"request": chunk.request})
+            completed.add(str(index))
+            save_state()
+            rest(index)
         shutil.rmtree(out_frames, ignore_errors=True)
         Path(out_frames).mkdir(parents=True)
         output_index = 1
-        for index in range(len(ranges)):
-            frames = sorted((chunks_root / f"{index:06d}" / "out").glob("*.png"))
-            if index:
-                frames = frames[1:]  # overlapped endpoint was emitted by prior chunk
-            for frame in frames:
+        for index, chunk in enumerate(chunks):
+            for frame in _kept_chunk_frames(chunk_dirs(index)[1], chunk):
                 _link_or_copy(frame, Path(out_frames) / f"{output_index:08d}.png")
                 output_index += 1
         if output_index - 1 != target_count:
             raise RuntimeError(f"chunk assembly produced {output_index - 1} frames; expected {target_count}")
+        if boundaries:
+            print(f"Cut handling: {held_total} interpolated frame(s) held at scene boundaries.")
         return None
 
     # --- Streaming encode mode ---
-    chunks_root = state_path.parent / "chunks"
-    chunks_root.mkdir(parents=True, exist_ok=True)
-    segments_dir = state_path.parent / "segments"
     segments_dir.mkdir(parents=True, exist_ok=True)
     segments = state.get("segments", [])
     # Never trust a trailing segment state.json doesn't already have a
@@ -1992,13 +2378,12 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         (segments_dir / last["file"]).unlink(missing_ok=True)
         completed -= set(last["chunks"])
         segments = segments[:-1]
-    _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int), "segments": segments})
+    save_state(segments=segments)
 
     segment_chunks = max(1, int(encode["segment_chunks"]))
-    replaced_total = 0
     pending_batch = []
 
-    def _finalize_segment():
+    def finalize_segment():
         if not pending_batch:
             return
         segment_index = len(segments)
@@ -2008,10 +2393,7 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         flat.mkdir(parents=True)
         output_index = 1
         for chunk_index in pending_batch:
-            frames = sorted((chunks_root / f"{chunk_index:06d}" / "out").glob("*.png"))
-            if chunk_index:
-                frames = frames[1:]  # overlapped endpoint was emitted by the prior chunk
-            for frame in frames:
+            for frame in _kept_chunk_frames(chunk_dirs(chunk_index)[1], chunks[chunk_index]):
                 _link_or_copy(frame, flat / f"{output_index:08d}.png")
                 output_index += 1
         cmd = ["-r", str(encode["fps"]), "-i", f"{flat}/%08d.png"]
@@ -2025,52 +2407,28 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         # silently match nothing against completed's own string keys.
         segments.append({"file": segment_file, "chunks": [str(c) for c in pending_batch]})
         completed.update(str(c) for c in pending_batch)
-        _write_json_atomic(state_path, {"completed_chunks": sorted(completed, key=int), "segments": segments})
+        save_state(segments=segments)
         for chunk_index in pending_batch:
             shutil.rmtree(chunks_root / f"{chunk_index:06d}", ignore_errors=True)
         shutil.rmtree(flat, ignore_errors=True)
         pending_batch.clear()
 
-    for index, (start, end) in enumerate(ranges):
-        chunk_key = str(index)
-        if chunk_key in completed:
+    for index, chunk in enumerate(chunks):
+        if str(index) in completed:
             continue  # only ever set once that chunk's segment was finalized - see above
-        chunk_out = chunks_root / f"{index:06d}" / "out"
-        chunk_in = chunks_root / f"{index:06d}" / "in"
-        shutil.rmtree(chunk_in, ignore_errors=True)
-        shutil.rmtree(chunk_out, ignore_errors=True)
-        chunk_in.mkdir(parents=True); chunk_out.mkdir(parents=True)
-        cut_source, cut_source_offset = provider.materialize(start, end, chunk_in)
-        first_interval = round(start * target_intervals / total_intervals)
-        last_interval = round((end - 1) * target_intervals / total_intervals)
-        chunk_target = max(2, last_interval - first_interval + 1)
-        print(f"RIFE chunk {index + 1}/{len(ranges)} ({end - start} source frames)...")
-        run_rife_chunk(rife_path, chunk_in, chunk_out, chunk_target, model_path,
-                       config.get("rife_threads"), config.get("rife_gpu"),
-                       label=f"RIFE chunk {index + 1}/{len(ranges)}")
-        if cuts:
-            # Before chunk_in goes away, not after: under windowed
-            # extraction those frames ARE the only copy of this chunk's
-            # source, and cut suppression reads them to replace RIFE's
-            # hybrids with real held frames.
-            replaced_total += suppress_scene_cut_interpolation_range(
-                cut_source, chunk_out, input_count, target_count, cuts,
-                range_start=first_interval, range_end=last_interval + 1, index_offset=first_interval,
-                source_offset=cut_source_offset,
-            )
+        chunk_in, chunk_out, _ = chunk_dirs(index)
+        held_total += _render_one_chunk(rife_path, provider, chunk, chunk_in, chunk_out, model_path, config,
+                                        boundaries, convention, f"RIFE chunk {index + 1}/{len(chunks)}")
         shutil.rmtree(chunk_in, ignore_errors=True)
         pending_batch.append(index)
-        if len(pending_batch) >= segment_chunks or index + 1 == len(ranges):
-            _finalize_segment()
-        cooldown = config_float(config, "cooldown_seconds", 0)
-        if cooldown and index + 1 < len(ranges):
-            print(f"Cooling down for {cooldown}s before the next chunk (Ctrl-C is safe; resume later)...")
-            time.sleep(cooldown)
+        if len(pending_batch) >= segment_chunks or index + 1 == len(chunks):
+            finalize_segment()
+        rest(index)
 
-    if len(completed) != len(ranges):
-        raise RuntimeError(f"chunk assembly produced {len(completed)} completed chunks; expected {len(ranges)}")
-    if replaced_total or cuts:
-        print(f"Transitions: {replaced_total} interpolated frame(s) replaced across cut/transition boundaries.")
+    if len(completed) != len(chunks):
+        raise RuntimeError(f"chunk assembly produced {len(completed)} completed chunks; expected {len(chunks)}")
+    if boundaries:
+        print(f"Cut handling: {held_total} interpolated frame(s) held at scene boundaries.")
     return [segments_dir / seg["file"] for seg in segments]
 
 def _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration):
@@ -2181,12 +2539,19 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         target_count = round(input_frame_count * fps / source_fps / speed_factor)
         model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
         _check_disk_space(frames_root, in_frames, target_count, config)
-        run_rife(rife_path, in_frames, out_frames, target_count=target_count, model_path=model_path)
-        cuts, transition_count, _ = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
-        if cuts is not None:
-            replaced = suppress_scene_cut_interpolation(in_frames, out_frames, input_frame_count, target_count, cuts)
-            print(f"Transitions: {transition_count} gradual interval(s), {len(cuts)} protected boundary/boundaries; "
-                  f"{replaced} interpolated frame(s) replaced.")
+        cuts, _, _ = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
+        convention = rife_timestep_convention(rife_path, model_path)
+        chunk = plan_render_chunks(input_frame_count, target_count, 0, convention=convention)[0]
+        shutil.rmtree(out_frames, ignore_errors=True)
+        out_frames.mkdir(parents=True)
+        if input_frame_count < 2 or chunk.request < 2:
+            for k in range(chunk.request):
+                _link_or_copy(in_frames / "00000001.png", out_frames / f"{k + 1:08d}.png")
+        else:
+            run_rife(rife_path, in_frames, out_frames, target_count=chunk.request, model_path=model_path)
+            if cuts:
+                held = hold_boundary_frames(out_frames, in_frames, 0, chunk, set(cuts), convention)
+                print(f"Cut handling: {held} interpolated frame(s) held at scene boundaries.")
         return out_frames, fps, retimed_duration(duration, speed)
 
     source_fps = float(source_fps) if source_fps is not None else probe_source_fps(source)
@@ -2258,13 +2623,10 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         count = _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration)
         if count == 0:
             return None, None, 0, 0
-        cuts, transition_count = None, 0
-        if plan.stream:
-            # Cuts must be known before any chunk runs, not after every
-            # chunk exists, so each one can suppress its own cut-adjacent
-            # frames as soon as it's generated - see _render_rife_chunks'
-            # "Streaming encode" mode.
-            cuts, transition_count, _ = _resolve_scene_cuts(in_frames, source_fps, count, config)
+        # Cuts must be known before any chunk runs: chunk seams snap onto
+        # them, and each chunk holds its own boundary frames as soon as it's
+        # generated - see _render_rife_chunks.
+        cuts, transition_count, _ = _resolve_scene_cuts(in_frames, source_fps, count, config)
         return FullFrameProvider(in_frames, count), cuts, transition_count, count
 
     def _execute(plan):
@@ -2294,21 +2656,18 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         _check_disk_space(frames_root, in_frames, target_count, config,
                           peak_frames=pending_source + resident_interp, avg_bytes=measured_bytes)
 
+        convention = rife_timestep_convention(rife_path, model_path)
         if not final.stream:
             _render_rife_chunks(rife_path, provider, out_frames, target_count, model_path, run_config,
-                                frames_root / "rife-state.json")
-            cuts, transition_count, _ = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
-            if cuts is not None:
-                replaced = suppress_scene_cut_interpolation(in_frames, out_frames, input_frame_count, target_count, cuts)
-                print(f"Transitions: {transition_count} gradual interval(s), {len(cuts)} protected boundary/boundaries; "
-                      f"{replaced} interpolated frame(s) replaced.")
+                                frames_root / "rife-state.json", cuts=cuts, convention=convention)
             return out_frames, fps, retimed_duration(duration, speed)
 
         encode = {"segment_chunks": final.segment_chunks, "fps": fps,
                   "output_vf": output_vf, "encode_args": build_encode_args(config)}
         segments = _render_rife_chunks(rife_path, provider, out_frames, target_count, model_path, run_config,
                                        frames_root / "rife-state.json",
-                                       cuts=cuts, input_count=input_frame_count, encode=encode)
+                                       cuts=cuts, input_count=input_frame_count, encode=encode,
+                                       convention=convention)
         _concat_video_segments(segments, joined_video)
         return joined_video, fps, retimed_duration(duration, speed)
 
@@ -2447,15 +2806,11 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
                "gpu": config.get("rife_gpu"), "profile": config.get("rife_profile"),
                "chunk_frames": config.get("chunk_frames"), "long_run_frames": config.get("long_run_frames"),
                "batch": bool(config.get("_batch_mode")),
-               "scene_detection": config.get("scene_detection"),
-               "scene_threshold": config.get("scene_threshold"),
-               "scene_floor": config.get("scene_floor"),
-               "scene_revert_fraction": config.get("scene_revert_fraction"),
-               "gradual_transition_detection": config.get("gradual_transition_detection"),
-               "transition_min_duration": config.get("transition_min_duration"),
-               "transition_sensitivity": config.get("transition_sensitivity"),
-               "transition_alignment": config.get("transition_alignment"),
-               "transition_ranges": config.get("transition_ranges")}
+               "render_layout": RENDER_LAYOUT_VERSION}
+    # Every detection setting changes which frames get held, so any of them
+    # changing must start fresh work rather than reuse held chunks.
+    options.update({key: config.get(key) for key in DEFAULT_CONFIG
+                    if key.startswith(("scene_", "transition_", "gradual_"))})
     signature = _job_signature(source, output_file, options)
     durable = config_bool(config, "resume", False)
     work_path = _work_dir_for(output_file, signature, config) if durable else Path(tempfile.mkdtemp(prefix="ffrife-"))
@@ -2720,7 +3075,7 @@ def cmd_config(args, config):
 # GENERIC_OVERRIDE_EXCLUDED_KEYS for the same pattern).
 GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset",
                                   "rife_profile", "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds",
-                                  "resume", "keep_work", "scene_detection", "gradual_transition_detection",
+                                  "resume", "keep_work", "scene_detection", "gradual_transition_detection", "scene_histogram_check",
                                   "container", "keep_subtitles", "keep_chapters", "keep_extra_audio_tracks",
                                   "keep_attachments", "keep_thumbnail", "keep_source_metadata", "space_check",
                                   "stream_segment_chunks", "pipeline_mode", "disk_budget_fraction", "extraction_mode"}
@@ -2819,6 +3174,8 @@ def apply_run_overrides(args, config):
         config["scene_detection"] = args.scene_detection
     if getattr(args, "gradual_transition_detection", None) is not None:
         config["gradual_transition_detection"] = args.gradual_transition_detection
+    if getattr(args, "scene_histogram_check", None) is not None:
+        config["scene_histogram_check"] = args.scene_histogram_check
     for key in EXTRAS_OVERRIDE_KEYS:
         value = getattr(args, key, None)
         if value is not None:
@@ -2891,9 +3248,12 @@ def add_processing_arguments(parser, include_trim=True):
     add_bool_flag(parser, "scene_detection", "scene-detection",
                  help_on="Detect hard cuts and replace RIFE hybrids (default)",
                  help_off="Skip scene-cut detection and postprocessing")
+    add_bool_flag(parser, "scene_histogram_check", "scene-histogram-check",
+                 help_on="Rescue cuts the pixel test misses with a colour-histogram second opinion (default)",
+                 help_off="Use the pixel-change cut test alone")
     add_bool_flag(parser, "gradual_transition_detection", "gradual-transition-detection",
-                 help_on="Detect fades/dissolves as well as hard cuts (default)",
-                 help_off="Protect hard cuts only")
+                 help_on="Also hold verified fades/dissolves at source rate instead of interpolating them",
+                 help_off="Protect hard cuts only (default)")
     # Everything below carries over from the source by default (see
     # carry_over_source_extras). --start/--end clips and rebases the
     # time-sensitive streams; --speed drops those streams because arbitrary

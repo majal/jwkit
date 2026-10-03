@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import math
 import os
 import tempfile
 import unittest
@@ -11,10 +12,36 @@ from unittest.mock import MagicMock, patch
 from tests.support import load_script_module
 
 
+def detection_frame(pixel_value, hist_value=None):
+    """One stacked detection frame (see ffrife._detection_frame_stream): a
+    flat 64x36 histogram rendition on top, a flat 32x18 pixel rendition
+    below it, black-padded to 64 wide."""
+    hist = bytes([pixel_value if hist_value is None else hist_value] * (64 * 36 * 3))
+    row = bytes([pixel_value] * (32 * 3)) + bytes(32 * 3)
+    return hist + row * 18
+
+
+def detection_stream(frames):
+    process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
+    process.wait.return_value = 0
+    return process
+
+
 class FfrifeConfigTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.ffrife = load_script_module("ffrife")
+
+    def test_save_config_persists_only_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config_file = Path(td) / "config.toml"
+            config = dict(self.ffrife.DEFAULT_CONFIG)
+            config.update({"scene_threshold": "2.5", "custom_key": "kept", "_batch_mode": True,
+                           "resolved_rife_profile": "balanced"})
+            with patch.object(self.ffrife, "CONFIG_DIR", Path(td)), \
+                 patch.object(self.ffrife, "CONFIG_FILE", config_file):
+                self.ffrife.save_config(config)
+            self.assertEqual(config_file.read_text(), 'scene_threshold = "2.5"\ncustom_key = "kept"\n')
 
     def test_save_and_load_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -431,14 +458,15 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         # RIFE installed/configured -> the PNG-extract-then-RIFE-then-merge
         # path. RIFE should generate the retimed count directly, without a
         # setpts filter that would duplicate frames in the merge.
-        config = {"rife_binary_path": "/fake/rife"}
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
         calls = []
         target_counts = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
             calls.append(cmd)
             if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
-                (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
+                for index in (1, 2):
+                    (Path(cmd[-1]).parent / f"{index:08d}.png").write_bytes(b"\x89PNG")
 
         def fake_run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
             target_counts.append(target_count)
@@ -457,7 +485,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         merge_cmd = calls[-1]
         self.assertNotIn("-vf", merge_cmd)
-        self.assertEqual(target_counts, [4])  # one 30fps input frame -> 60fps, then 2x duration
+        self.assertEqual(target_counts, [8])  # two 30fps input frames -> 60fps, then 2x duration
 
     def test_rife_target_count_matches_a_non_2x_ratio(self) -> None:
         # 24fps source -> 60fps target is a 2.5x ratio, not RIFE's implicit
@@ -487,12 +515,14 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         self.assertEqual(target_count, 60)  # 24 frames * 60/24
 
     def test_rife_model_path_derives_from_rife_binary_directory(self) -> None:
-        config = {"rife_binary_path": "/fake/bin/rife-ncnn-vulkan", "rife_model": "rife-v4.6"}
+        config = {"rife_binary_path": "/fake/bin/rife-ncnn-vulkan", "rife_model": "rife-v4.6",
+                  "scene_detection": "false"}
         rife_calls = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
             if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
-                (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
+                for index in (1, 2):
+                    (Path(cmd[-1]).parent / f"{index:08d}.png").write_bytes(b"\x89PNG")
 
         def fake_run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
             rife_calls.append(model_path)
@@ -838,7 +868,7 @@ class FfrifeLongRunTest(unittest.TestCase):
             return {**cfg, "resolved_rife_profile": "performance", "rife_threads": "auto",
                     "chunk_frames": "0", "cooldown_seconds": "0"}
 
-        def fake_render_chunks(_rife_path, _in_frames, out_frames, _target_count, _model_path, _cfg, _state_path):
+        def fake_render_chunks(_rife_path, _in_frames, out_frames, _target_count, _model_path, _cfg, _state_path, **_kwargs):
             Path(out_frames).mkdir(parents=True, exist_ok=True)
             (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
 
@@ -870,7 +900,7 @@ class FfrifeLongRunTest(unittest.TestCase):
             return {**cfg, "resolved_rife_profile": "performance", "rife_threads": "auto",
                     "chunk_frames": "0", "cooldown_seconds": "0"}
 
-        def fake_render_chunks(_rife_path, _in_frames, out_frames, _target_count, _model_path, _cfg, _state_path):
+        def fake_render_chunks(_rife_path, _in_frames, out_frames, _target_count, _model_path, _cfg, _state_path, **_kwargs):
             Path(out_frames).mkdir(parents=True, exist_ok=True)
             (Path(out_frames) / "00000001.png").write_bytes(b"\x89PNG")
 
@@ -908,11 +938,9 @@ class FfrifeLongRunTest(unittest.TestCase):
         # color that holds - an isolated, unaligned, non-reverting spike is
         # exactly a hard cut. Mocked rawvideo keeps this independent of an
         # ffmpeg installation.
-        frames = [bytes([50] * (32 * 18 * 3)) for _ in range(6)]
-        frames += [bytes([200] * (32 * 18 * 3)) for _ in range(4)]
-        process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
-        process.wait.return_value = 0
-        with patch.object(self.ffrife.subprocess, "Popen", return_value=process) as popen:
+        frames = [detection_frame(50) for _ in range(6)]
+        frames += [detection_frame(200) for _ in range(4)]
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)) as popen:
             cuts, transitions, _ = self.ffrife.detect_transitions("frames", source_fps=24)
         self.assertEqual(cuts, [6])
         self.assertEqual(transitions, [])
@@ -926,14 +954,11 @@ class FfrifeLongRunTest(unittest.TestCase):
         # lowering it below the spike's own magnitude reveals the cut - and
         # a revert_fraction of 0 (nothing ever "reverts enough") suppresses
         # it again regardless of floor, proving both knobs are load-bearing.
-        frames = [bytes([50] * (32 * 18 * 3)) for _ in range(6)]
-        frames += [bytes([60] * (32 * 18 * 3)) for _ in range(4)]
-        raw = b"".join(frames)
+        frames = [detection_frame(50) for _ in range(6)]
+        frames += [detection_frame(60) for _ in range(4)]
 
         def run(**kwargs):
-            process = MagicMock(stdout=io.BytesIO(raw), returncode=0)
-            process.wait.return_value = 0
-            with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
+            with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
                 return self.ffrife.detect_transitions("frames", source_fps=24, **kwargs)
 
         cuts_default, _, _ = run()
@@ -952,30 +977,10 @@ class FfrifeLongRunTest(unittest.TestCase):
         # comparing each neighbor to the spike's *own* size - unchanged
         # here, since nothing settles back down - correctly rejects it.
         values = [50, 51, 52, 220, 40, 230, 30, 210, 60, 55, 56, 57]
-        frames = [bytes([v] * (32 * 18 * 3)) for v in values]
-        process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
-        process.wait.return_value = 0
-        with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
+        frames = [detection_frame(v) for v in values]
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
             cuts, transitions, _ = self.ffrife.detect_transitions("frames", source_fps=24)
         self.assertEqual(cuts, [])
-
-    def test_scene_cut_replacement_maps_arbitrary_target_rate(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            incoming, outgoing = root / "in", root / "out"
-            incoming.mkdir(); outgoing.mkdir()
-            for index in range(1, 4):
-                (incoming / f"{index:08d}.png").write_text(f"source-{index}")
-            for index in range(1, 6):
-                (outgoing / f"{index:08d}.png").write_text(f"rife-{index}")
-            replaced = self.ffrife.suppress_scene_cut_interpolation(
-                incoming, outgoing, input_count=3, target_count=5, cuts=[1]
-            )
-            self.assertEqual(replaced, 1)
-            # cut=1 is the zero-based index of the shot's first frame, so the
-            # replacement must come from file 2 (source-2), not file 1.
-            self.assertEqual((outgoing / "00000002.png").read_text(), "source-2")
-            self.assertEqual((outgoing / "00000003.png").read_text(), "rife-3")
 
     def test_scene_detection_cli_defaults_and_overrides(self) -> None:
         parser = self.ffrife.build_parser()
@@ -990,13 +995,11 @@ class FfrifeLongRunTest(unittest.TestCase):
     def test_gradual_transition_detector_finds_aligned_elevated_changes(self) -> None:
         # 12 tiny RGB frames: still, then a linear fade. Mock rawvideo keeps
         # this unit test independent of an ffmpeg installation.
-        frames = [bytes([20] * (32 * 18 * 3)) for _ in range(5)]
-        frames += [bytes([value] * (32 * 18 * 3)) for value in (30, 40, 50, 60, 70, 80, 90)]
-        process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
-        process.wait.return_value = 0
-        with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
+        frames = [detection_frame(20) for _ in range(5)]
+        frames += [detection_frame(value) for value in (30, 40, 50, 60, 70, 80, 90)]
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
             cuts, transitions, _ = self.ffrife.detect_transitions(
-                "frames", source_fps=10, min_duration=0.3, sensitivity=1.2, alignment=0.8
+                "frames", source_fps=10, min_duration=0.3, sensitivity=1.2, alignment=0.8, detect_gradual=True
             )
         self.assertEqual(transitions, [(5, 11)])
         self.assertEqual(cuts, [])
@@ -1007,33 +1010,90 @@ class FfrifeLongRunTest(unittest.TestCase):
         # minimum-run-length gate, leaving quick dissolves unprotected. The
         # gate is gone - min_duration only sizes the baseline lookback now -
         # so this 4-frame ramp must still be reported.
-        frames = [bytes([20] * (32 * 18 * 3)) for _ in range(6)]
-        frames += [bytes([value] * (32 * 18 * 3)) for value in (30, 50, 70, 90)]
-        frames += [bytes([90] * (32 * 18 * 3)) for _ in range(3)]
-        process = MagicMock(stdout=io.BytesIO(b"".join(frames)), returncode=0)
-        process.wait.return_value = 0
-        with patch.object(self.ffrife.subprocess, "Popen", return_value=process):
+        frames = [detection_frame(20) for _ in range(6)]
+        frames += [detection_frame(value) for value in (30, 50, 70, 90)]
+        frames += [detection_frame(90) for _ in range(3)]
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
             cuts, transitions, _ = self.ffrife.detect_transitions(
-                "frames", source_fps=24, min_duration=0.25, sensitivity=1.2, alignment=0.8
+                "frames", source_fps=24, min_duration=0.25, sensitivity=1.2, alignment=0.8, detect_gradual=True
             )
         self.assertNotEqual(transitions, [])
 
-    def test_scene_cut_replacement_uses_the_post_cut_frame(self) -> None:
-        # Regression: the replacement source must be the shot that begins at
-        # `cut` (zero-based), not the frame immediately before it - copying
-        # the wrong side silently extends the outgoing shot instead of
-        # cleanly starting the incoming one.
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            incoming, outgoing = root / "in", root / "out"
-            incoming.mkdir(); outgoing.mkdir()
-            (incoming / "00000001.png").write_text("old-shot")
-            (incoming / "00000002.png").write_text("new-shot")
-            (outgoing / "00000002.png").write_text("rife-hybrid")
-            self.ffrife.suppress_scene_cut_interpolation(
-                incoming, outgoing, input_count=2, target_count=3, cuts=[1]
-            )
-            self.assertEqual((outgoing / "00000002.png").read_text(), "new-shot")
+    def test_histogram_check_rescues_a_partial_frame_cut(self) -> None:
+        # A background cut behind a composited presenter moves only part of
+        # the frame: the pixel change (100 -> 108, ~0.03) stays under
+        # cut_floor, but the colour distribution jumps bins outright. The
+        # histogram second opinion must catch it - and only it.
+        frames = [detection_frame(100, 100) for _ in range(6)]
+        frames += [detection_frame(108, 170) for _ in range(5)]
+
+        def run(**kwargs):
+            with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
+                stats = {}
+                cuts, _, _ = self.ffrife.detect_transitions("frames", source_fps=24, stats=stats, **kwargs)
+                return cuts, stats
+
+        cuts, stats = run()
+        self.assertEqual(cuts, [6])
+        self.assertEqual(stats["histogram_rescued"], 1)
+        self.assertEqual(run(histogram_check=False)[0], [])
+        self.assertEqual(run(histogram_floor=1.01)[0], [])
+
+    def test_histogram_check_ignores_sustained_colour_churn(self) -> None:
+        # Every step changes the histogram about as much as its neighbours
+        # (a flickering or fast-changing shot): nothing stands out, so the
+        # histogram path must not invent cuts there.
+        values = [(100, 40), (104, 170), (100, 40), (104, 170), (100, 40), (104, 170), (100, 40), (104, 170)]
+        frames = [detection_frame(p, h) for p, h in values]
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
+            cuts, _, _ = self.ffrife.detect_transitions("frames", source_fps=24)
+        self.assertEqual(cuts, [])
+
+    def test_gradual_detection_rejects_aligned_motion_that_is_no_blend(self) -> None:
+        # A textured pattern drifting sideways: successive changes stay
+        # aligned (the old candidate test fired on exactly this, e.g. every
+        # slow pan), but the middle frames are no cross-fade of the ends.
+        def drifting(offset):
+            hist = bytes([90] * (64 * 36 * 3))
+            row = bytes(int(128 + 100 * math.sin(2 * math.pi * (x - offset) / 8)) for x in range(32) for _ in range(3))
+            return hist + (row + bytes(32 * 3)) * 18
+
+        frames = [drifting(0) for _ in range(8)] + [drifting(0.6 * step) for step in range(1, 13)]
+        frames += [drifting(7.2) for _ in range(4)]
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
+            stats = {}
+            _, transitions, _ = self.ffrife.detect_transitions(
+                "frames", source_fps=24, detect_gradual=True, sensitivity=1.2, stats=stats)
+        self.assertGreater(stats["gradual_candidates"], 0)
+        self.assertEqual(transitions, [])
+
+    def test_gradual_detection_is_off_by_default(self) -> None:
+        frames = [detection_frame(20) for _ in range(5)]
+        frames += [detection_frame(value) for value in (30, 40, 50, 60, 70, 80, 90)]
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
+            _, transitions, _ = self.ffrife.detect_transitions(
+                "frames", source_fps=10, min_duration=0.3, sensitivity=1.2, alignment=0.8)
+        self.assertEqual(transitions, [])
+
+    def test_cross_fade_check_needs_a_genuinely_mixed_frame(self) -> None:
+        # A three-frame run whose middle frame equals one endpoint is a hard
+        # cut, not a dissolve - blend weight 1.0 fits it perfectly, so only
+        # the mixed-frame requirement keeps it out of the dissolve path.
+        frames = {0: bytes([20] * 30), 1: bytes([20] * 30), 2: bytes([200] * 30)}
+        self.assertFalse(self.ffrife._is_cross_fade(frames, 0, 2, 0.05, 0.25))
+        frames[1] = bytes([110] * 30)
+        self.assertTrue(self.ffrife._is_cross_fade(frames, 0, 2, 0.05, 0.25))
+
+    def test_histogram_check_cli_flags(self) -> None:
+        parser = self.ffrife.build_parser()
+        args = parser.parse_args(["run", "in", "-o", "out", "--no-scene-histogram-check",
+                                  "--scene-histogram-floor", "0.2"])
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        self.ffrife.apply_run_overrides(args, config)
+        self.ffrife.apply_generic_config_overrides(args, config)
+        self.assertEqual(config["scene_histogram_check"], "false")
+        self.assertEqual(config["scene_histogram_floor"], "0.2")
+        self.assertEqual(self.ffrife.DEFAULT_CONFIG["gradual_transition_detection"], "false")
 
     def test_explicit_transition_ranges_are_seconds(self) -> None:
         self.assertEqual(self.ffrife.parse_transition_ranges("1.0:1.5, 3:4", 30, 200),
@@ -1167,12 +1227,13 @@ class FfrifeInterpolateFpsResolutionTest(unittest.TestCase):
         cls.ffrife = load_script_module("ffrife")
 
     def test_relative_fps_spec_probes_source_and_resolves_before_rife(self) -> None:
-        config = {"rife_binary_path": "/fake/rife"}
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
         rife_calls = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
             if cmd and str(cmd[-1]).endswith("%08d.png") and str(Path(cmd[-1]).parent).endswith("/in"):
-                (Path(cmd[-1]).parent / "00000001.png").write_bytes(b"\x89PNG")
+                for index in (1, 2):
+                    (Path(cmd[-1]).parent / f"{index:08d}.png").write_bytes(b"\x89PNG")
 
         def fake_run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, slow_after=4.0):
             rife_calls.append(target_count)
@@ -1185,8 +1246,8 @@ class FfrifeInterpolateFpsResolutionTest(unittest.TestCase):
              patch.object(self.ffrife.subprocess, "run"):
             self.ffrife.interpolate("in.mp4", "out.mp4", config, fps="2x")
 
-        # 1 input frame * (2x of 24 = 48fps) / 24fps source = target_count 2
-        self.assertEqual(rife_calls, [2])
+        # 2 input frames * (2x of 24 = 48fps) / 24fps source = target_count 4
+        self.assertEqual(rife_calls, [4])
 
 
 class FfrifeOldBinaryCapabilityProbeTest(unittest.TestCase):
@@ -1413,6 +1474,37 @@ class FfrifeFrameProviderTest(unittest.TestCase):
                 with self.assertRaises(self.ffrife.WindowedExtractionError):
                     provider.materialize(8, 13, shifted)
 
+    def test_windowed_provider_checks_a_cut_seam_with_one_lead_frame(self) -> None:
+        # A seam on a cut has no overlap frame, so the provider decodes the
+        # frame just before the chunk as 00000000.png, checks it against the
+        # previous chunk's last frame, and drops it.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            provider = self.ffrife.WindowedFrameProvider("src.mp4", 100, 30.0)
+            shift = {"value": 0}
+
+            def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
+                target = Path(cmd[-1]).parent
+                count = int(cmd[cmd.index("-frames:v") + 1])
+                first_number = int(cmd[cmd.index("-start_number") + 1])
+                seek_frame = round(float(cmd[cmd.index("-ss") + 1]) * 30 + 0.5)
+                for offset in range(count):
+                    (target / f"{first_number + offset:08d}.png").write_text(f"g{seek_frame + offset + shift['value']}")
+
+            with patch.object(self.ffrife, "run_ffmpeg", fake_run_ffmpeg), \
+                 patch.object(self.ffrife, "passthrough_fps_args", lambda: []):
+                first = root / "c0"; first.mkdir()
+                provider.materialize(0, 5, first)
+                second = root / "c1"; second.mkdir()
+                provider.materialize(5, 9, second)  # seam on a cut at frame 5
+                self.assertEqual(sorted(p.name for p in second.glob("*.png"))[0], "00000001.png")
+                self.assertEqual((second / "00000001.png").read_text(), "g5")
+                self.assertEqual(len(list(second.glob("*.png"))), 4)
+                shift["value"] = 1
+                third = root / "c2"; third.mkdir()
+                with self.assertRaises(self.ffrife.WindowedExtractionError):
+                    provider.materialize(9, 12, third)
+
     def test_windowed_provider_seeks_half_a_frame_early_with_passthrough(self) -> None:
         # Both details are load-bearing: accurate seek keeps frames at or
         # after the seek time (so aim early), and without passthrough ffmpeg
@@ -1436,27 +1528,161 @@ class FfrifeFrameProviderTest(unittest.TestCase):
             self.assertAlmostEqual(float(cmd[cmd.index("-ss") + 1]), 2.0 + 59.5 / 30.0, places=5)
             self.assertEqual(cmd[cmd.index("-frames:v") + 1], "3")
 
-    def test_suppression_rebases_source_frames_for_a_windowed_chunk(self) -> None:
-        # Under windowed extraction in_frames holds only this chunk's own
-        # source frames, numbered from 1, so a cut's global source index has
-        # to be rebased the same way the output index already is.
+
+
+class FfrifeOutputTimelineTest(unittest.TestCase):
+    """The output timeline: which source moment each RIFE output shows, how
+    chunks tile it, and how boundary frames are held - see the "Output
+    timeline" notes in ffrife."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_rife_position_matches_upstream_start_aligned_grid(self) -> None:
+        # Measured against rife-ncnn-vulkan 20221029: 3 inputs -> 7 outputs
+        # put outputs 6 and 7 past the last input (exact copies of it).
+        positions = [self.ffrife.rife_position(k, 3, 7) for k in range(7)]
+        self.assertEqual(positions[3], self.ffrife.Fraction(9, 7))
+        self.assertGreater(positions[5], 2)
+        self.assertEqual(self.ffrife.rife_position(3, 3, 7, "endpoint"), 1)
+
+    def test_plan_tiles_the_output_timeline_exactly(self) -> None:
+        for frames, target, chunk_frames, cuts in ((50, 125, 12, [7, 23, 30]), (37547, 93961, 240, range(5, 37547, 97)),
+                                                   (10, 25, 0, []), (9, 5, 4, [3]), (100, 100, 7, [])):
+            chunks = self.ffrife.plan_render_chunks(frames, target, chunk_frames, cuts)
+            self.assertEqual(sum(c.outputs for c in chunks), target)
+            self.assertEqual(chunks[0].start, 0)
+            self.assertEqual(chunks[-1].own_end, frames)
+            for before, after in zip(chunks, chunks[1:]):
+                self.assertEqual(before.own_end, after.start)
+                self.assertEqual(before.first_output + before.outputs, after.first_output)
+                self.assertIn(before.end - before.own_end, (0, 1))
+            for chunk in chunks:
+                self.assertGreaterEqual(chunk.request, chunk.outputs)
+
+    def test_plan_snaps_seams_onto_cuts_without_overlap(self) -> None:
+        chunks = self.ffrife.plan_render_chunks(50, 125, 12, cuts=[10])
+        self.assertEqual((chunks[0].start, chunks[0].end, chunks[0].own_end), (0, 10, 10))
+        self.assertEqual(chunks[1].start, 10)
+        # No cut in the next window: plain one-frame overlap.
+        self.assertEqual((chunks[1].end, chunks[1].own_end), (22, 21))
+
+    def _simulate(self, frames, target, chunk_frames, cuts, convention):
+        """Render a fake clip through _render_rife_chunks with a stand-in
+        RIFE that follows `convention`'s grid and labels every output with
+        what it shows, then return the assembled labels in order."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            chunk_in = root / "in"; chunk_in.mkdir()
-            # Local file N holds global zero-based frame N + 1 here
-            # (source_offset=2), and the whole-clip convention names global
-            # frame g's content "src{g+1}" - so local 1 is "src3".
-            for local in range(1, 5):  # global zero-based 2..5
-                (chunk_in / f"{local:08d}.png").write_bytes(f"src{local + 2}".encode())
-            chunk_out = root / "out"; chunk_out.mkdir()
-            for i in range(1, 5):
-                (chunk_out / f"{i:08d}.png").write_bytes(b"interp")
-            replaced = self.ffrife.suppress_scene_cut_interpolation_range(
-                chunk_in, chunk_out, 5, 9, [2], range_start=2, range_end=6,
-                index_offset=2, source_offset=2,
-            )
-            self.assertEqual(replaced, 1)
-            self.assertEqual((chunk_out / "00000002.png").read_bytes(), b"src3")
+            incoming, outgoing = root / "in", root / "out"
+            incoming.mkdir()
+            for index in range(frames):
+                (incoming / f"{index + 1:08d}.png").write_text(f"src:{index}")
+
+            def fake_rife(_binary, chunk_in, chunk_out, target_count, **_kwargs):
+                sources = [int(p.read_text().split(":")[1]) for p in sorted(Path(chunk_in).glob("*.png"))]
+                for k in range(target_count):
+                    fx = self.ffrife.rife_position(k, len(sources), target_count, convention)
+                    x0 = min(int(fx), len(sources) - 1)
+                    t = fx - int(fx) if int(fx) < len(sources) - 1 else 0
+                    label = f"src:{sources[x0]}" if not t else f"blend:{sources[x0]}:{sources[x0 + 1]}:{float(t)}"
+                    (Path(chunk_out) / f"{k + 1:08d}.png").write_text(label)
+
+            config = {"chunk_frames": str(chunk_frames), "cooldown_seconds": "0"}
+            with patch.object(self.ffrife, "run_rife", fake_rife):
+                self.ffrife._render_rife_chunks("rife", incoming, outgoing, target, "model", config,
+                                                root / "state.json", cuts=cuts, convention=convention)
+            return [p.read_text() for p in sorted(outgoing.glob("*.png"))]
+
+    def _assert_clean(self, labels, frames, target, cuts):
+        self.assertEqual(len(labels), target)
+        step = frames / target
+        for j, label in enumerate(labels):
+            ideal = j * step
+            parts = label.split(":")
+            if parts[0] == "blend":
+                left, right, t = int(parts[1]), int(parts[2]), float(parts[3])
+                self.assertNotIn(right, cuts, f"output {j} blends across the cut at {right}")
+                shown = left + t
+            else:
+                # A held or exact frame shows the frame at or just before its moment.
+                shown = int(parts[1])
+                self.assertLess(abs(shown - ideal), 1 + 1e-9, f"output {j} holds frame {shown}")
+                continue
+            # Within one output interval of the global grid, seams included.
+            self.assertLessEqual(abs(shown - ideal), step + 1e-9, f"output {j} shows {shown}, ideal {ideal}")
+
+    def test_chunked_render_never_blends_across_a_cut_and_keeps_timing(self) -> None:
+        cuts = [7, 23, 24, 30, 41]
+        for chunk_frames in (0, 12, 5):
+            labels = self._simulate(50, 125, chunk_frames, cuts, "start")
+            self._assert_clean(labels, 50, 125, cuts)
+        # 24 -> 60 fps, the ratio that leaked morphs before the timeline fix.
+        labels = self._simulate(96, 240, 20, [13, 50, 77], "start")
+        self._assert_clean(labels, 96, 240, [13, 50, 77])
+
+    def test_chunked_render_follows_an_end_aligned_binary_too(self) -> None:
+        labels = self._simulate(50, 125, 12, [7, 23, 30], "endpoint")
+        self.assertEqual(len(labels), 125)
+        for label in labels:
+            parts = label.split(":")
+            if parts[0] == "blend":
+                self.assertNotIn(int(parts[2]), [7, 23, 30])
+
+    def test_hold_rebases_source_frames_for_a_windowed_chunk(self) -> None:
+        # Under windowed extraction a chunk's source dir holds only its own
+        # frames, numbered from 1 (source_offset = chunk start).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chunk_in, chunk_out = root / "in", root / "out"
+            chunk_in.mkdir(); chunk_out.mkdir()
+            for local in range(1, 5):  # global frames 10..13
+                (chunk_in / f"{local:08d}.png").write_text(f"src:{local + 9}")
+            chunk = self.ffrife.RenderChunk(10, 14, 14, 25, 10, 10)
+            for k in range(1, 11):
+                (chunk_out / f"{k:08d}.png").write_text("rife")
+            held = self.ffrife.hold_boundary_frames(chunk_out, chunk_in, 10, chunk, {12})
+            # Outputs at 10.4*... positions 11.2 and 11.6 sit between 11 and 12.
+            self.assertEqual(held, 2)
+            self.assertEqual((chunk_out / "00000004.png").read_text(), "src:11")
+            self.assertEqual((chunk_out / "00000005.png").read_text(), "src:11")
+            self.assertEqual((chunk_out / "00000006.png").read_text(), "src:12")  # exactly on the cut
+            self.assertEqual((chunk_out / "00000003.png").read_text(), "rife")
+
+    def test_resume_discards_state_planned_for_another_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            incoming, outgoing = root / "in", root / "out"
+            incoming.mkdir()
+            for index in range(10):
+                (incoming / f"{index + 1:08d}.png").write_bytes(b"png")
+            calls = []
+
+            def fake_run(_binary, _input, output, target_count, **_kwargs):
+                calls.append(target_count)
+                for index in range(target_count):
+                    (Path(output) / f"{index + 1:08d}.png").write_bytes(b"png")
+
+            config = {"chunk_frames": "4", "cooldown_seconds": "0"}
+            self.ffrife._write_json_atomic(root / "state.json", {"completed_chunks": ["0", "1", "2"]})
+            with patch.object(self.ffrife, "run_rife", fake_run):
+                self.ffrife._render_rife_chunks("rife", incoming, outgoing, 25, "model", config, root / "state.json")
+            self.assertEqual(len(calls), 3)  # legacy state had no layout, so nothing was trusted
+
+    def test_timestep_convention_is_cached_per_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "rife"
+            binary.write_text("bin")
+            cache = Path(td) / "cache.json"
+            with patch.object(self.ffrife, "RIFE_TIMESTEP_CACHE", cache), \
+                 patch.object(self.ffrife, "_probe_rife_timestep_convention", return_value="endpoint") as probe:
+                self.assertEqual(self.ffrife.rife_timestep_convention(binary, "rife-v4.6"), "endpoint")
+                self.assertEqual(self.ffrife.rife_timestep_convention(binary, "rife-v4.6"), "endpoint")
+            probe.assert_called_once()
+            with patch.object(self.ffrife, "RIFE_TIMESTEP_CACHE", Path(td) / "other.json"), \
+                 patch.object(self.ffrife, "_probe_rife_timestep_convention", return_value=None):
+                self.assertEqual(self.ffrife.rife_timestep_convention(binary, "rife-v4.6"), "start")
+                self.assertFalse((Path(td) / "other.json").exists())
 
 
 class FfrifeDetectionInputTest(unittest.TestCase):
@@ -1522,51 +1748,6 @@ class FfrifeStreamingEncodeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.ffrife = load_script_module("ffrife")
-
-    def test_suppress_scene_cut_range_matches_whole_clip_content_with_offset(self) -> None:
-        # 5 input frames -> 9 output frames is a 2x-ish ratio (scale=2.0),
-        # so cut=2 (zero-based) replaces exactly output_zero_index=3 with
-        # in_frames' post-cut frame (index 3, one-based). A chunk covering
-        # global range [2, 6) with index_offset=2 should replace the SAME
-        # source content, just at the chunk-local filename (3-2+1=2).
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            in_frames = root / "in"; in_frames.mkdir()
-            for i in range(1, 6):
-                (in_frames / f"{i:08d}.png").write_bytes(f"src{i}".encode())
-
-            whole_out = root / "whole"; whole_out.mkdir()
-            for i in range(1, 10):
-                (whole_out / f"{i:08d}.png").write_bytes(b"interp")
-            whole_replaced = self.ffrife.suppress_scene_cut_interpolation(in_frames, whole_out, 5, 9, [2])
-            self.assertEqual(whole_replaced, 1)
-            self.assertEqual((whole_out / "00000004.png").read_bytes(), b"src3")
-
-            chunk_out = root / "chunk"; chunk_out.mkdir()
-            for i in range(1, 5):  # local frames covering global zero-indices 2..5
-                (chunk_out / f"{i:08d}.png").write_bytes(b"interp")
-            chunk_replaced = self.ffrife.suppress_scene_cut_interpolation_range(
-                in_frames, chunk_out, 5, 9, [2], range_start=2, range_end=6, index_offset=2,
-            )
-            self.assertEqual(chunk_replaced, 1)
-            self.assertEqual((chunk_out / "00000002.png").read_bytes(), b"src3")
-
-    def test_suppress_scene_cut_range_ignores_cuts_outside_its_window(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            in_frames = root / "in"; in_frames.mkdir()
-            for i in range(1, 6):
-                (in_frames / f"{i:08d}.png").write_bytes(f"src{i}".encode())
-            chunk_out = root / "chunk"; chunk_out.mkdir()
-            for i in range(1, 3):
-                (chunk_out / f"{i:08d}.png").write_bytes(b"interp")
-            # Same cut=2 as above, but this chunk only covers global range
-            # [6, 9) - well past output_zero_index=3 - so nothing replaces.
-            replaced = self.ffrife.suppress_scene_cut_interpolation_range(
-                in_frames, chunk_out, 5, 9, [2], range_start=6, range_end=9, index_offset=6,
-            )
-            self.assertEqual(replaced, 0)
-            self.assertEqual((chunk_out / "00000001.png").read_bytes(), b"interp")
 
     def test_validate_media_file_checks_existence_size_and_decode(self) -> None:
         with tempfile.TemporaryDirectory() as td:
