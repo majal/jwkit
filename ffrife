@@ -53,11 +53,13 @@ import os
 import platform
 import re
 import shutil
+import signal
 import stat
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -108,7 +110,12 @@ DEFAULT_CONFIG = {
     "rife_gpu": "auto",  # auto, cpu, or a numeric GPU id
     "rife_threads": "auto",  # auto preserves upstream's 1:2:2 default
     "chunk_frames": "auto",  # profile-selected; 0 disables chunking
-    "cooldown_seconds": "auto",  # profile-selected pause between chunks
+    "cooldown_seconds": "auto",  # profile-selected pause between chunks (pacing=fixed, the cool profile, or when set explicitly)
+    "pacing": "adaptive",  # adaptive: full speed when idle, headroom while someone works, eases off under heat; fixed: cooldown rests only
+    "pacing_idle_seconds": "120",  # no keyboard/mouse input for this long counts as nobody at the machine
+    "pacing_shared_duty": "0.5",  # share of each second RIFE runs while someone is using the machine
+    "pacing_background_priority": "true",  # also lower CPU/IO priority of RIFE/ffmpeg while someone works or under heat
+    "rife_tta": "none",  # none, temporal (~1.9x RIFE time, measurably closer frames), spatial (~7x), both
     "long_run_frames": "3600",  # auto switches to balanced at roughly 2m of 30fps->60fps 640x360 input;
                                  # rescaled by actual resolution and target/source fps ratio (see
                                  # REFERENCE_PIXELS/REFERENCE_FPS_RATIO/resolve_rife_policy), so a higher-
@@ -161,7 +168,12 @@ CONFIG_HELP = {
     "rife_gpu": "auto, cpu, or a numeric GPU id",
     "rife_threads": "RIFE load:process:save threads; auto lets the profile choose",
     "chunk_frames": "Source frames per resumable chunk; auto uses the profile's own value, 0 disables chunking",
-    "cooldown_seconds": "Seconds to rest between chunks; auto uses the profile's own value",
+    "cooldown_seconds": "Seconds to rest between chunks; auto uses the profile's own value (applied under pacing=fixed, the cool profile, or when set explicitly)",
+    "pacing": "adaptive (full speed when nobody is at the machine, headroom while someone works, eases off under thermal pressure) or fixed (cooldown rests only)",
+    "pacing_idle_seconds": "Seconds without keyboard/mouse input after which adaptive pacing treats the machine as idle and runs at full speed",
+    "pacing_shared_duty": "Share of each second RIFE runs while someone is using the machine (0.2-1.0)",
+    "pacing_background_priority": "Lower RIFE/ffmpeg CPU and I/O priority while someone is working or the machine is under thermal pressure",
+    "rife_tta": "RIFE test-time augmentation: none, temporal (~1.9x time, slightly sharper), spatial (~7x), or both",
     "long_run_frames": "Source frame count (at reference resolution/fps-ratio) above which rife_profile=auto picks balanced instead of performance",
     "resume": "Keep and reuse durable per-output work state so an interrupted run can pick back up",
     "keep_work": "Retain completed work state (extracted/interpolated frames) after a successful run, for inspection",
@@ -272,6 +284,8 @@ def resolve_rife_policy(config, input_frame_count, workload_scale=1.0):
         if configured != "auto":
             effective[key] = config.get(key)  # explicit override always wins, unscaled
             continue
+        if key == "cooldown_seconds":
+            effective["_cooldown_from_profile"] = True  # adaptive pacing replaces profile rests - see fixed_rest_seconds
         if key == "chunk_frames" and profile_value != "0" and workload_scale > 0 and workload_scale != 1.0:
             # A profile's chunk_frames is a source-frame count tuned at
             # workload_scale==1 (reference resolution/fps-ratio); rescale it
@@ -312,12 +326,9 @@ def save_config(config):
     reached an existing install. Keys ffrife doesn't know are kept as-is
     for `config check` to report rather than silently dropped."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    overrides = _jwkit_common.config_overrides(config, DEFAULT_CONFIG, skip={"resolved_rife_profile"})
     with open(CONFIG_FILE, "w") as f:
-        for k, v in config.items():
-            if k.startswith("_") or k == "resolved_rife_profile":
-                continue
-            if k in DEFAULT_CONFIG and str(v) == str(DEFAULT_CONFIG[k]):
-                continue
+        for k, v in overrides.items():
             f.write(f'{k} = "{v}"\n')
 
 # --- System / binaries ---
@@ -454,6 +465,317 @@ def videotoolbox_quality_from_crf(crf):
 def build_encode_args(config, notice=True):
     return _jwkit_common.build_encode_args(FFMPEG_BIN, config, notice=notice)
 
+# --- Adaptive pacing -------------------------------------------------------
+#
+# Fixed cooldowns guess at two things the machine can simply be asked about:
+# whether someone is using it, and whether it is running hot. With
+# pacing=adaptive (the default) a governor thread watches both while each
+# heavy child process (RIFE, the extraction/encode ffmpeg) runs:
+#
+#   nobody at the keyboard   full speed, normal priority, no rests - an
+#   (or a headless host)     unattended render should use the whole machine
+#   someone is working       background priority (nice 10 / BELOW_NORMAL)
+#                            and RIFE duty-cycled to
+#                            pacing_shared_duty: paused and resumed within
+#                            every second, because priority alone gives the
+#                            GPU no headroom - there is no GPU "nice"
+#   thermal pressure         RIFE capped harder (moderate 60%, heavy 25%);
+#                            from the OS's own thermal-pressure signal, or,
+#                            where the OS gives none, from this run's RIFE
+#                            throughput sagging well below its own baseline
+#
+# pacing=fixed keeps the old behavior: profile/configured cooldown_seconds
+# rests between chunks and nothing else.
+PACING_MODES = ("adaptive", "fixed")
+_REAL_POPEN = subprocess.Popen  # captured at import, so a test's patched Popen is never governed
+PACING_SLICE = 1.0  # seconds per run+pause cycle while duty-cycling
+PACING_SAMPLE_EVERY = 5.0  # seconds between activity/heat samples
+PACING_MIN_DUTY = 0.2
+PACING_HEAT_DUTY = {1: 0.6, 2: 0.25}  # duty cap per thermal pressure level
+PACING_SAG_RATIO = 0.7  # throughput below this share of baseline reads as heat...
+PACING_SAG_SECONDS = 60.0  # ...once it has lasted this long at full duty
+PACING_SAG_BACKOFF = 120.0  # seconds to ease off before probing full speed again
+_PACING = {"mode": "adaptive", "idle_seconds": 120.0, "shared_duty": 0.5, "background_priority": True,
+           "rife_tta": "none"}
+_PACING_ANNOUNCED = [None]  # last (reason, share) printed, shared by every governed process
+RIFE_TTA_FLAGS = {"none": [], "temporal": ["-z"], "spatial": ["-x"], "both": ["-x", "-z"]}
+
+
+def configure_pacing(config):
+    """Load this run's pacing settings (see the notes above) into _PACING,
+    which every governed child process reads."""
+    mode = str(config.get("pacing", DEFAULT_CONFIG["pacing"])).strip().lower()
+    if mode not in PACING_MODES:
+        raise ValueError("pacing must be adaptive or fixed")
+    _PACING.update(
+        mode=mode,
+        idle_seconds=config_float(config, "pacing_idle_seconds", 120.0),
+        shared_duty=min(1.0, max(PACING_MIN_DUTY, config_float(config, "pacing_shared_duty", 0.5))),
+        background_priority=config_bool(config, "pacing_background_priority", True),
+        rife_tta=str(config.get("rife_tta", "none")).strip().lower() or "none",
+    )
+
+
+def user_idle_seconds():
+    """Seconds since the last keyboard/mouse input at this machine's own
+    console, or None when there is no local user session to protect (a
+    headless server) or the platform can't say."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            out = subprocess.run(["ioreg", "-c", "IOHIDSystem", "-d", "4", "-r", "-k", "HIDIdleTime"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            match = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
+            return int(match.group(1)) / 1e9 if match else None
+        if system == "Windows":
+            import ctypes
+
+            class LastInputInfo(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+            info = LastInputInfo()
+            info.cbSize = ctypes.sizeof(info)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                return None
+            return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+        if os.environ.get("DISPLAY") and shutil.which("xprintidle"):
+            out = subprocess.run(["xprintidle"], capture_output=True, text=True, timeout=5).stdout.strip()
+            return int(out) / 1000.0
+        if shutil.which("loginctl"):
+            # logind only flips IdleHint after the desktop's own idle delay,
+            # so this is coarser than the timers above - but it is what a
+            # Wayland/console session exposes without extra tools.
+            listing = subprocess.run(["loginctl", "list-sessions", "--no-legend"],
+                                     capture_output=True, text=True, timeout=5).stdout
+            local = False
+            for line in listing.splitlines():
+                if not line.split():
+                    continue
+                props = dict(item.split("=", 1) for item in subprocess.run(
+                    ["loginctl", "show-session", line.split()[0], "-p", "Remote", "-p", "Active",
+                     "-p", "IdleHint", "-p", "Type"],
+                    capture_output=True, text=True, timeout=5).stdout.split() if "=" in item)
+                if props.get("Remote") == "no" and props.get("Active") == "yes" and \
+                        props.get("Type") in {"x11", "wayland", "mir", "tty"}:
+                    local = True
+                    if props.get("IdleHint") == "no":
+                        return 0.0
+            return float("inf") if local else None
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return None
+    return None
+
+
+def thermal_pressure():
+    """0 nominal, 1 moderate, 2 heavy or worse - or None when the platform
+    doesn't say (then the governor falls back to watching throughput)."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            out = subprocess.run(["notifyutil", "-g", "com.apple.system.thermalpressurelevel"],
+                                 capture_output=True, text=True, timeout=5).stdout.split()
+            return min(2, int(out[-1])) if out else None
+        if system == "Linux":
+            level = None
+            for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+                temp = int((zone / "temp").read_text()) / 1000.0
+                trips = {}
+                for trip in zone.glob("trip_point_*_type"):
+                    kind = trip.read_text().strip()
+                    trips.setdefault(kind, int(trip.with_name(trip.name.replace("_type", "_temp")).read_text()) / 1000.0)
+                limit = trips.get("passive") or (trips["critical"] - 15 if "critical" in trips else None)
+                if not limit or limit <= 0:
+                    continue
+                zone_level = 2 if temp >= limit else 1 if temp >= limit - 10 else 0
+                level = max(level or 0, zone_level)
+            return level
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError, KeyError):
+        return None
+    return None
+
+
+def pacing_decision(idle_seconds, pressure, sagging, settings=None):
+    """Pure policy: (duty, background, reason) for one sample. `duty` is the
+    share of each slice RIFE may run; `background` lowers CPU/IO priority."""
+    settings = settings or _PACING
+    shared = idle_seconds is not None and idle_seconds < settings["idle_seconds"]
+    duty, reasons = 1.0, []
+    if shared:
+        duty = settings["shared_duty"]
+        reasons.append("someone is using this machine")
+    heat = pressure if pressure is not None else (1 if sagging else 0)
+    if heat:
+        duty = min(duty, PACING_HEAT_DUTY[min(2, heat)])
+        reasons.append("thermal pressure" if pressure is not None else "throughput sagging (heat)")
+    background = settings["background_priority"] and (shared or heat >= 1)
+    if not reasons:
+        reasons.append("machine idle" if idle_seconds is not None else "no local user session")
+    return max(PACING_MIN_DUTY, duty), background, ", ".join(reasons)
+
+
+def _set_background_priority(proc, background):
+    """Best effort: nice 10 on macOS/Linux, BELOW_NORMAL on Windows.
+
+    Deliberately not macOS's PRIO_DARWIN_BG (taskpolicy -b): that pins work
+    to the efficiency cores and throttles disk I/O, which starves RIFE's
+    PNG load/save threads - measured 4x slower (50s vs 13s for 250 frames)
+    even on an otherwise idle machine. A nice value only yields when
+    something else actually wants the CPU (12.5s, i.e. free), so it costs
+    nothing once the person stops working - which is why it's fine that
+    POSIX can't raise priority back without privileges: a reniced child
+    simply keeps a priority that no longer matters, for the rest of its
+    (per-chunk or per-encode) life. Windows can restore its class."""
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+            ctypes.windll.kernel32.SetPriorityClass(int(proc._handle), 0x4000 if background else 0x20)
+        elif background:
+            os.setpriority(os.PRIO_PROCESS, proc.pid, 10)
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+class PacingGovernor:
+    """Applies the adaptive policy to one running child process. Use as a
+    context manager around the child's lifetime; `progress` (optional)
+    returns how many units of work the child has finished, for the
+    throughput-based heat fallback. Only `duty_cycle` children (RIFE) are
+    paused; others just get their priority adjusted. Duty-cycling needs
+    SIGSTOP/SIGCONT, so on Windows it degrades to priority alone."""
+
+    def __init__(self, proc, label, duty_cycle=False, progress=None):
+        self.proc, self.label, self.progress = proc, label, progress
+        self.duty_cycle = duty_cycle and hasattr(signal, "SIGSTOP")
+        # Only real child processes: a stand-in object has no pid to signal.
+        self.enabled = _PACING["mode"] == "adaptive" and isinstance(proc, _REAL_POPEN)
+        self._stop = threading.Event()
+        self._thread = None
+        self.duty, self.background, self.reason = 1.0, False, None
+        self._paused = False
+
+    def __enter__(self):
+        if self.enabled:
+            self._thread = threading.Thread(target=self._run, name=f"pacing:{self.label}", daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self.stop()
+        return False
+
+    def stop(self):
+        """Stop governing and make sure the child is left running - a
+        stopped child would ignore SIGTERM and hang its caller."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+        self._resume()
+
+    def _signal(self, sig):
+        if self.proc.poll() is None:
+            try:
+                os.kill(self.proc.pid, sig)
+            except OSError:
+                pass
+
+    def _pause(self):
+        if not self._paused:
+            self._signal(signal.SIGSTOP)
+            self._paused = True
+
+    def _resume(self):
+        if self._paused:
+            self._signal(signal.SIGCONT)
+            self._paused = False
+
+    def _announce(self, duty, background, reason):
+        if not self.duty_cycle:
+            share = "background priority" if background else "full speed"
+        else:
+            share = "full speed" if duty >= 1 else f"RIFE at {duty:.0%}" + (", background priority" if background else "")
+        if _PACING_ANNOUNCED[0] == (reason, share):
+            return
+        _PACING_ANNOUNCED[0] = (reason, share)
+        print(f"\nPacing: {reason} - {share}.", flush=True)
+
+    def _run(self):
+        rates = collections.deque()  # (time, progress)
+        baseline = 0.0
+        sag_since = backoff_until = None
+        next_sample = 0.0
+        while not self._stop.is_set() and self.proc.poll() is None:
+            now = time.monotonic()
+            if now >= next_sample:
+                next_sample = now + PACING_SAMPLE_EVERY
+                pressure = thermal_pressure()
+                sagging = False
+                if self.progress is not None and pressure is None:
+                    rates.append((now, self.progress()))
+                    while rates and now - rates[0][0] > 30:
+                        rates.popleft()
+                    if len(rates) >= 3 and self.duty >= 1:
+                        rate = (rates[-1][1] - rates[0][1]) / max(1e-6, rates[-1][0] - rates[0][0])
+                        baseline = max(baseline, rate)
+                        if baseline and rate < baseline * PACING_SAG_RATIO:
+                            sag_since = sag_since or now
+                        else:
+                            sag_since = None
+                    if sag_since and now - sag_since >= PACING_SAG_SECONDS:
+                        backoff_until, sag_since = now + PACING_SAG_BACKOFF, None
+                        rates.clear()
+                    sagging = backoff_until is not None and now < backoff_until
+                duty, background, reason = pacing_decision(user_idle_seconds(), pressure, sagging)
+                if not self.duty_cycle:
+                    duty = 1.0
+                self._announce(duty, background, reason)
+                if background != self.background:
+                    _set_background_priority(self.proc, background)
+                self.duty, self.background, self.reason = duty, background, reason
+            if self.duty >= 1:
+                self._resume()
+                self._stop.wait(min(PACING_SLICE, max(0.05, next_sample - time.monotonic())))
+                continue
+            self._resume()
+            self._stop.wait(PACING_SLICE * self.duty)
+            if self._stop.is_set() or self.proc.poll() is not None:
+                break
+            self._pause()
+            self._stop.wait(PACING_SLICE * (1 - self.duty))
+        self._resume()
+
+
+def pacing_rest(seconds, label="Cooling down"):
+    """Rest between chunks/files. Under adaptive pacing a configured fixed
+    rest still applies (an explicit cooldown_seconds, or the cool profile),
+    and in addition the rest extends while the OS reports thermal pressure,
+    up to two minutes - instead of always waiting a guessed amount."""
+    if seconds:
+        print(f"{label} for {seconds:g}s before the next chunk (Ctrl-C is safe; resume later)...")
+        time.sleep(seconds)
+    if _PACING["mode"] != "adaptive":
+        return
+    deadline = time.monotonic() + 120
+    announced = False
+    while (thermal_pressure() or 0) >= 2 and time.monotonic() < deadline:
+        if not announced:
+            print("Heavy thermal pressure - letting the machine cool before the next chunk...")
+            announced = True
+        time.sleep(5)
+
+
+def fixed_rest_seconds(config):
+    """The fixed rest to take between chunks/files. Adaptive pacing replaces
+    a profile's built-in rest (balanced's 15s) with real activity/heat
+    signals, but keeps one that was asked for explicitly - a configured
+    cooldown_seconds, or the cool profile, whose whole point is resting."""
+    seconds = config_float(config, "cooldown_seconds", 0)
+    if (_PACING["mode"] == "adaptive" and config.get("_cooldown_from_profile")
+            and config.get("resolved_rife_profile") != "cool"):
+        return 0.0
+    return seconds
+
+
 def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     base = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y"]
     print()
@@ -461,11 +783,16 @@ def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
     print(f"Running: {' '.join(base + args)}")
 
     if not duration:
-        subprocess.run(base + args, check=True)
+        proc = subprocess.Popen(base + args)
+        with PacingGovernor(proc, label):
+            proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, base + args)
         return
 
     cmd = base + ["-progress", "pipe:1", "-nostats"] + args
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    governor = PacingGovernor(proc, label).__enter__()
     start = time.time()
     shown = False
     eta_estimator = _jwkit_common.ProgressETA(duration)
@@ -487,6 +814,7 @@ def run_ffmpeg(args, duration=None, slow_after=4.0, label="Encoding"):
             last_print = now
     proc.stdout.close()
     proc.wait()
+    governor.stop()
     if shown:
         print_time_progress(duration, duration, label=label, done=True)
         print()
@@ -578,6 +906,10 @@ def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, sl
         if any(int(value) < 1 for value in str(threads).split(":")):
             raise ValueError("every rife_threads value must be at least 1")
         cmd += ["-j", str(threads)]
+    tta = str(_PACING.get("rife_tta", "none")).strip().lower()
+    if tta not in RIFE_TTA_FLAGS:
+        raise ValueError("rife_tta must be none, temporal, spatial, or both")
+    cmd += RIFE_TTA_FLAGS[tta]
     if gpu is not None and str(gpu).lower() != "auto":
         gpu_id = "-1" if str(gpu).lower() == "cpu" else str(gpu)
         if not re.fullmatch(r"(?:-1|\d+)", gpu_id):
@@ -588,6 +920,8 @@ def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, sl
     # when the binary actually fails, since that's where its errors go too.
     log = tempfile.TemporaryFile()
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+    governor = PacingGovernor(proc, "RIFE", duty_cycle=True,
+                              progress=lambda: len(list(Path(out_frames).glob("*.png")))).__enter__()
     start = time.time()
     shown = False
     eta_estimator = _jwkit_common.ProgressETA(target_count)
@@ -606,6 +940,7 @@ def run_rife(rife_path, in_frames, out_frames, target_count, model_path=None, sl
                     print_count_progress(current, target_count, label="RIFE", eta_seconds=eta_display)
                     last_print = now
     finally:
+        governor.stop()  # resumes a paused child, so it can actually receive SIGTERM
         if proc.poll() is None:
             proc.terminate()
             try:
@@ -2317,7 +2652,7 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         state = {}
     completed = set(state.get("completed_chunks", []))
     chunks_root.mkdir(parents=True, exist_ok=True)
-    cooldown = config_float(config, "cooldown_seconds", 0)
+    cooldown = fixed_rest_seconds(config)
     held_total = 0
 
     def save_state(**extra):
@@ -2328,9 +2663,8 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         return root / "in", root / "out", root / "complete.json"
 
     def rest(index):
-        if cooldown and index + 1 < len(chunks):
-            print(f"Cooling down for {cooldown}s before the next chunk (Ctrl-C is safe; resume later)...")
-            time.sleep(cooldown)
+        if index + 1 < len(chunks):
+            pacing_rest(cooldown)
 
     if encode is None:
         for index, chunk in enumerate(chunks):
@@ -2508,6 +2842,7 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     rife_path = config.get("rife_binary_path")
     if not rife_path or not command_exists(rife_path):
         return None
+    configure_pacing(config)
 
     print()
     print(COLOR.header("Interpolating using rife-ncnn-vulkan..."))
@@ -2732,6 +3067,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         fps = resolve_target_fps(fps, probe_source_fps(source))
     else:
         fps = float(fps)
+    configure_pacing(config)
     duration = (end - start) if (start is not None and end is not None) else None
     trim_args = source_window_args(start, end)
     speed_vf = f"setpts=PTS/{speed:.6g}" if speed and speed != 1 else None
@@ -2805,7 +3141,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
                "model": config.get("rife_model"), "threads": config.get("rife_threads"),
                "gpu": config.get("rife_gpu"), "profile": config.get("rife_profile"),
                "chunk_frames": config.get("chunk_frames"), "long_run_frames": config.get("long_run_frames"),
-               "batch": bool(config.get("_batch_mode")),
+               "batch": bool(config.get("_batch_mode")), "rife_tta": config.get("rife_tta"),
                "render_layout": RENDER_LAYOUT_VERSION}
     # Every detection setting changes which frames get held, so any of them
     # changing must start fresh work rather than reuse held chunks.
@@ -3046,6 +3382,14 @@ def cmd_benchmark(args, config):
 
 def cmd_config(args, config):
     def parse_value(key, raw):
+        choices = {"pacing": PACING_MODES, "rife_tta": tuple(RIFE_TTA_FLAGS)}
+        if key in choices:
+            value = str(raw).strip().lower()
+            if value not in choices[key]:
+                raise ValueError(f"{key} must be one of: {', '.join(choices[key])}")
+            return value
+        if key == "pacing_shared_duty" and not 0.2 <= float(raw) <= 1.0:
+            raise ValueError("pacing_shared_duty must be between 0.2 and 1.0")
         if key == "cooldown_seconds":
             return _jwkit_common.parse_auto_time_seconds(raw)
         if key == "transition_min_duration":
@@ -3076,6 +3420,7 @@ def cmd_config(args, config):
 GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset",
                                   "rife_profile", "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds",
                                   "resume", "keep_work", "scene_detection", "gradual_transition_detection", "scene_histogram_check",
+                                  "pacing", "rife_tta", "pacing_background_priority",
                                   "container", "keep_subtitles", "keep_chapters", "keep_extra_audio_tracks",
                                   "keep_attachments", "keep_thumbnail", "keep_source_metadata", "space_check",
                                   "stream_segment_chunks", "pipeline_mode", "disk_budget_fraction", "extraction_mode"}
@@ -3176,6 +3521,9 @@ def apply_run_overrides(args, config):
         config["gradual_transition_detection"] = args.gradual_transition_detection
     if getattr(args, "scene_histogram_check", None) is not None:
         config["scene_histogram_check"] = args.scene_histogram_check
+    for key in ("pacing", "rife_tta", "pacing_background_priority"):
+        if getattr(args, key, None) is not None:
+            config[key] = getattr(args, key)
     for key in EXTRAS_OVERRIDE_KEYS:
         value = getattr(args, key, None)
         if value is not None:
@@ -3248,6 +3596,14 @@ def add_processing_arguments(parser, include_trim=True):
     add_bool_flag(parser, "scene_detection", "scene-detection",
                  help_on="Detect hard cuts and replace RIFE hybrids (default)",
                  help_off="Skip scene-cut detection and postprocessing")
+    parser.add_argument("--pacing", choices=PACING_MODES,
+                        help="adaptive (default): full speed when nobody is at the machine, headroom while someone works, "
+                             "eases off under heat; fixed: cooldown rests only")
+    parser.add_argument("--rife-tta", dest="rife_tta", choices=sorted(RIFE_TTA_FLAGS),
+                        help="RIFE test-time augmentation: temporal is ~1.9x slower and slightly sharper; spatial ~7x")
+    add_bool_flag(parser, "pacing_background_priority", "background-priority",
+                 help_on="Lower RIFE/ffmpeg priority while someone works or under heat (default)",
+                 help_off="Keep normal priority; adaptive pacing still duty-cycles RIFE")
     add_bool_flag(parser, "scene_histogram_check", "scene-histogram-check",
                  help_on="Rescue cuts the pixel test misses with a colour-histogram second opinion (default)",
                  help_off="Use the pixel-change cut test alone")
@@ -3391,7 +3747,8 @@ def main():
         # matters when rife_profile=auto, and auto always resolves to
         # balanced in batch mode (_batch_mode=True short-circuits the size
         # check in resolve_rife_policy) regardless of what's passed.
-        batch_pause = config_float(resolve_rife_policy(config, 2), "cooldown_seconds", 0)
+        configure_pacing(config)
+        batch_pause = fixed_rest_seconds(resolve_rife_policy(config, 2))
         print(f"Batch: {len(sources)} file(s), processed sequentially to limit sustained load.")
         for index, source in enumerate(sources, 1):
             print(f"\n[{index}/{len(sources)}] {source}")
@@ -3413,9 +3770,8 @@ def main():
                 print(f"Failed: {exc}", file=sys.stderr)
                 if args.fail_fast:
                     break
-            if batch_pause and index < len(sources):
-                print(f"Cooling down for {batch_pause}s before the next file (Ctrl-C is safe)...")
-                time.sleep(batch_pause)
+            if index < len(sources):
+                pacing_rest(batch_pause, label="Cooling down before the next file")
         print(f"\nBatch summary: {completed} completed, {skipped} skipped, {len(failures)} failed.")
         for source, error in failures:
             print(f"  FAILED {source}: {error}")

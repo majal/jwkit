@@ -1685,6 +1685,109 @@ class FfrifeOutputTimelineTest(unittest.TestCase):
                 self.assertFalse((Path(td) / "other.json").exists())
 
 
+class FfrifePacingTest(unittest.TestCase):
+    """Adaptive pacing: who is at the machine and how hot it runs decide how
+    hard RIFE/ffmpeg may push - see the "Adaptive pacing" notes in ffrife."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def settings(self, **overrides):
+        base = {"mode": "adaptive", "idle_seconds": 120.0, "shared_duty": 0.5, "background_priority": True}
+        base.update(overrides)
+        return base
+
+    def test_idle_or_headless_machine_runs_full_speed(self) -> None:
+        decide = self.ffrife.pacing_decision
+        self.assertEqual(decide(600, 0, False, self.settings())[:2], (1.0, False))
+        self.assertEqual(decide(None, None, False, self.settings())[:2], (1.0, False))
+
+    def test_someone_working_gets_headroom(self) -> None:
+        duty, background, reason = self.ffrife.pacing_decision(3, 0, False, self.settings())
+        self.assertEqual((duty, background), (0.5, True))
+        self.assertIn("using this machine", reason)
+        self.assertFalse(self.ffrife.pacing_decision(3, 0, False, self.settings(background_priority=False))[1])
+
+    def test_heat_caps_duty_even_when_idle(self) -> None:
+        decide = self.ffrife.pacing_decision
+        self.assertEqual(decide(600, 1, False, self.settings())[:2], (0.6, True))
+        self.assertEqual(decide(600, 2, False, self.settings())[0], 0.25)
+        self.assertEqual(decide(3, 1, False, self.settings())[0], 0.5)  # the stricter cap wins
+        # No OS heat signal: a sustained throughput sag stands in for it.
+        duty, _, reason = decide(600, None, True, self.settings())
+        self.assertEqual(duty, 0.6)
+        self.assertIn("sagging", reason)
+
+    def test_profile_rest_is_replaced_but_explicit_rests_stay(self) -> None:
+        rest = self.ffrife.fixed_rest_seconds
+        config = dict(self.ffrife.DEFAULT_CONFIG, rife_profile="balanced")
+        with patch.dict(self.ffrife._PACING, mode="adaptive"):
+            self.assertEqual(rest(self.ffrife.resolve_rife_policy(config, 10)), 0)
+            self.assertEqual(rest(self.ffrife.resolve_rife_policy(dict(config, cooldown_seconds="7"), 10)), 7)
+            self.assertEqual(rest(self.ffrife.resolve_rife_policy(dict(config, rife_profile="cool"), 10)), 15)
+            self.assertEqual(rest({"cooldown_seconds": "3"}), 3)  # library callers pass their own value
+        with patch.dict(self.ffrife._PACING, mode="fixed"):
+            self.assertEqual(rest(self.ffrife.resolve_rife_policy(config, 10)), 15)
+
+    def test_configure_pacing_validates_and_cli_overrides(self) -> None:
+        with self.assertRaises(ValueError):
+            self.ffrife.configure_pacing({"pacing": "turbo"})
+        parser = self.ffrife.build_parser()
+        args = parser.parse_args(["run", "in", "-o", "out", "--pacing", "fixed", "--no-background-priority",
+                                  "--rife-tta", "temporal", "--pacing-shared-duty", "0.3"])
+        config = dict(self.ffrife.DEFAULT_CONFIG)
+        self.ffrife.apply_run_overrides(args, config)
+        self.ffrife.apply_generic_config_overrides(args, config)
+        self.assertEqual((config["pacing"], config["pacing_background_priority"], config["rife_tta"],
+                          config["pacing_shared_duty"]), ("fixed", "false", "temporal", "0.3"))
+
+    def test_rife_tta_flags_reach_the_binary(self) -> None:
+        process = MagicMock()
+        process.poll.side_effect = [0, 0]
+        process.returncode = 0
+        with patch.dict(self.ffrife._PACING, rife_tta="temporal"), \
+             patch.object(self.ffrife.subprocess, "Popen", return_value=process) as popen:
+            self.ffrife.run_rife("rife", "in", "out", 12)
+        self.assertIn("-z", popen.call_args.args[0])
+        with patch.dict(self.ffrife._PACING, rife_tta="sideways"):
+            with self.assertRaises(ValueError):
+                self.ffrife.run_rife("rife", "in", "out", 12)
+
+    @unittest.skipUnless(hasattr(__import__("signal"), "SIGSTOP"), "duty-cycling needs SIGSTOP/SIGCONT")
+    def test_governor_duty_cycles_a_real_child_and_always_leaves_it_running(self) -> None:
+        import signal
+        import subprocess
+        import sys
+        import time
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        sent = []
+        real_kill = os.kill
+
+        def recording_kill(pid, sig):
+            sent.append(sig)
+            real_kill(pid, sig)
+
+        try:
+            with patch.dict(self.ffrife._PACING, mode="adaptive"), \
+                 patch.object(self.ffrife, "pacing_decision", return_value=(0.5, False, "test")), \
+                 patch.object(self.ffrife, "user_idle_seconds", return_value=0), \
+                 patch.object(self.ffrife, "thermal_pressure", return_value=0), \
+                 patch.object(self.ffrife, "PACING_SLICE", 0.2), \
+                 patch.object(self.ffrife.os, "kill", recording_kill), \
+                 patch("builtins.print"):
+                with self.ffrife.PacingGovernor(child, "RIFE", duty_cycle=True):
+                    time.sleep(0.9)
+            self.assertIn(signal.SIGSTOP, sent)
+            self.assertIn(signal.SIGCONT, sent)
+            self.assertEqual(sent[-1], signal.SIGCONT)
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(child.pid)], capture_output=True, text=True).stdout
+            self.assertNotIn("T", state)  # not left stopped
+        finally:
+            child.kill()
+            child.wait()
+
+
 class FfrifeDetectionInputTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
