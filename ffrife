@@ -51,6 +51,7 @@ import math
 import operator
 import os
 import platform
+import plistlib
 import re
 import shutil
 import signal
@@ -509,6 +510,10 @@ PACING_GPU_SETTLE = 0.6  # seconds a paused RIFE needs before the utilization co
 _PACING = {"mode": "adaptive", "idle_seconds": 120.0, "shared_duty": 0.5, "background_priority": True,
            "rife_tta": "none"}
 _PACING_ANNOUNCED = [None]  # last (reason, share) printed, shared by every governed process
+# GPU probe schedule and readings, also shared: RIFE is a fresh process (and a
+# fresh governor) every chunk, and a chunk on a fast GPU lasts less than the
+# probe interval - per-governor state would never take a single reading.
+_PACING_GPU = {"samples": collections.deque(maxlen=3), "next": None}  # samples: (time, utilization %)
 RIFE_TTA_FLAGS = {"none": [], "temporal": ["-z"], "spatial": ["-x"], "both": ["-x", "-z"]}
 
 
@@ -577,6 +582,15 @@ def user_idle_seconds():
     return None
 
 
+THERMAL_ROOT = Path("/sys/class/thermal")
+# Laptop CPU package sensors often expose no usable trip point at all (only
+# the kernel's -274C "unset" value), which used to blank the whole heat signal
+# on a machine reading 86C under load. For these, fall back to the usual
+# 100C junction limit: moderate pressure from 90C, heavy at 100C.
+CPU_THERMAL_ZONES = ("x86_pkg_temp", "coretemp", "k10temp", "cpu-thermal", "cpu_thermal", "soc_thermal")
+CPU_FALLBACK_LIMIT = 100.0
+
+
 def thermal_pressure():
     """0 nominal, 1 moderate, 2 heavy or worse - or None when the platform
     doesn't say (then the governor falls back to watching throughput)."""
@@ -588,13 +602,21 @@ def thermal_pressure():
             return min(2, int(out[-1])) if out else None
         if system == "Linux":
             level = None
-            for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
-                temp = int((zone / "temp").read_text()) / 1000.0
-                trips = {}
-                for trip in zone.glob("trip_point_*_type"):
-                    kind = trip.read_text().strip()
-                    trips.setdefault(kind, int(trip.with_name(trip.name.replace("_type", "_temp")).read_text()) / 1000.0)
+            for zone in THERMAL_ROOT.glob("thermal_zone*"):
+                try:
+                    temp = int((zone / "temp").read_text()) / 1000.0
+                    trips = {}
+                    for trip in zone.glob("trip_point_*_type"):
+                        kind = trip.read_text().strip()
+                        value = int(trip.with_name(trip.name.replace("_type", "_temp")).read_text()) / 1000.0
+                        if value > 0:  # -274000 is the kernel's "no trip point set"
+                            trips.setdefault(kind, value)
+                    zone_type = (zone / "type").read_text().strip()
+                except (OSError, ValueError):
+                    continue  # one unreadable sensor (Wi-Fi cards report EINVAL) must not hide the rest
                 limit = trips.get("passive") or (trips["critical"] - 15 if "critical" in trips else None)
+                if limit is None and zone_type in CPU_THERMAL_ZONES:
+                    limit = CPU_FALLBACK_LIMIT
                 if not limit or limit <= 0:
                     continue
                 zone_level = 2 if temp >= limit else 1 if temp >= limit - 10 else 0
@@ -756,9 +778,10 @@ class PacingGovernor:
         # second once a minute (~1.5% of throughput), long enough for its own
         # queued GPU work to drain. Short duty-cycle pauses are not used -
         # they still read RIFE's own backlog and would pin it down forever.
-        gpu_samples = collections.deque(maxlen=3)  # (time, utilization %)
+        gpu_samples = _PACING_GPU["samples"]
         gpu_supported = self.duty_cycle and gpu_utilization() is not None
-        next_gpu_probe = time.monotonic() + PACING_GPU_PROBE_EVERY
+        if _PACING_GPU["next"] is None:
+            _PACING_GPU["next"] = time.monotonic() + PACING_GPU_PROBE_EVERY
         while not self._stop.is_set() and self.proc.poll() is None:
             now = time.monotonic()
             if now >= next_sample:
@@ -793,10 +816,10 @@ class PacingGovernor:
                 if background != self.background:
                     _set_background_priority(self.proc, background)
                 self.duty, self.background, self.reason = duty, background, reason
-            if gpu_supported and time.monotonic() >= next_gpu_probe:
+            if gpu_supported and time.monotonic() >= _PACING_GPU["next"]:
                 # Scheduled probe, at any duty: pause, let RIFE's own work
                 # drain, and read what everyone else is using.
-                next_gpu_probe = time.monotonic() + PACING_GPU_PROBE_EVERY
+                _PACING_GPU["next"] = time.monotonic() + PACING_GPU_PROBE_EVERY
                 self._pause()
                 if not self._stop.wait(PACING_GPU_SETTLE):
                     # The counter is a sliding average that still carries
@@ -3598,6 +3621,238 @@ def rife_supports_custom_frame_count(rife_path, model_path):
     except Exception:
         return False
 
+# --- Fork build (TNTwise rife-ncnn-vulkan, macOS) ---------------------------
+#
+# The newer RIFE models (v4.7+) need TNTwise's fork of rife-ncnn-vulkan, and
+# its prebuilt macOS release statically links a Vulkan SDK from an unvetted
+# host, so it is built from source here against Homebrew's MoltenVK (see
+# docs/ffrife.md). The binary links libMoltenVK dynamically, so a MoltenVK
+# upgrade can leave it stale; `fork build --if-stale` rebuilds only then, and
+# `fork watch` has launchd run that whenever Homebrew touches the keg.
+FORK_REPO = "https://github.com/TNTwise/rife-ncnn-vulkan.git"
+FORK_TAG = "20250112"
+FORK_COMMIT = "5eea93c"  # what the tag must resolve to; a moved tag aborts the build
+FORK_NCNN_COMMIT = "b4ba207"  # the submodule pin: official ncnn, the same commit upstream pins
+FORK_DIR = BIN_DIR / f"rife-ncnn-vulkan-tntwise-{FORK_TAG}"
+FORK_STATE_FILE = CONFIG_DIR / "fork-build.json"
+FORK_LOG_FILE = CONFIG_DIR / "fork-build.log"  # the last build only, overwritten each time
+FORK_AGENT_LABEL = "org.jwkit.ffrife-fork"
+FORK_AGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{FORK_AGENT_LABEL}.plist"
+FORK_AGENT_INTERVAL = 6 * 3600  # safety net beside the keg watch: re-check this often
+FORK_BREW_PATHS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+class ForkBuildError(RuntimeError):
+    pass
+
+
+def _find_brew():
+    return shutil.which("brew", path=os.pathsep.join(FORK_BREW_PATHS + (os.environ.get("PATH", ""),)))
+
+
+def _brew_prefix(formula):
+    brew = _find_brew()
+    if not brew:
+        return None
+    result = subprocess.run([brew, "--prefix", formula], capture_output=True, text=True, timeout=60)
+    prefix = Path(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
+    return prefix if prefix and prefix.exists() else None
+
+
+def molten_vk_info():
+    """The installed Homebrew MoltenVK as ``{"version", "sha256", "dylib",
+    "keg"}``, or None when it isn't installed. The hash, not just the
+    version, is what a build is stamped with: a same-version bottle rebuild
+    changes the library too."""
+    prefix = _brew_prefix("molten-vk")
+    dylib = prefix / "lib" / "libMoltenVK.dylib" if prefix else None
+    if not dylib or not dylib.is_file():
+        return None
+    return {"version": prefix.resolve().name, "sha256": _file_sha256(dylib), "dylib": str(dylib),
+            "keg": str(prefix.resolve().parent)}
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def fork_state():
+    try:
+        return json.loads(FORK_STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def fork_is_stale(state, info):
+    """Whether the recorded build predates the installed MoltenVK. No record
+    at all is not stale: nothing here knows how that binary was built."""
+    return bool(state and info and (state.get("molten_vk_sha256") != info["sha256"]
+                                    or state.get("tag") != FORK_TAG))
+
+
+def _run_logged(cmd, log, cwd=None):
+    log.write(f"$ {' '.join(map(str, cmd))}\n")
+    log.flush()
+    result = subprocess.run(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        raise ForkBuildError(f"{cmd[0]} {cmd[1] if len(cmd) > 1 else ''} failed (exit {result.returncode})")
+
+
+def build_fork(config, log_file=FORK_LOG_FILE):
+    """Build the fork against the installed MoltenVK, prove the result runs,
+    and only then move it into place. A failure at any step leaves the
+    existing binary untouched. Returns the new state record."""
+    if platform.system() != "Darwin":
+        raise ForkBuildError("the fork build is for macOS (MoltenVK); on Linux and Windows the Vulkan driver is the system's")
+    missing = [tool for tool in ("git", "cmake") if not shutil.which(tool, path=os.pathsep.join(
+        FORK_BREW_PATHS + (os.environ.get("PATH", ""),)))]
+    if missing:
+        raise ForkBuildError(f"missing build tools: {', '.join(missing)} (brew install {' '.join(missing)})")
+    info = molten_vk_info()
+    headers = _brew_prefix("vulkan-headers")
+    if not info or not headers:
+        raise ForkBuildError("needs Homebrew's MoltenVK and Vulkan headers: brew install molten-vk vulkan-headers")
+    model_name = config.get("rife_model", DEFAULT_CONFIG["rife_model"])
+    FORK_DIR.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="ffrife-fork-"))
+    env_path = os.pathsep.join(FORK_BREW_PATHS + (os.environ.get("PATH", ""),))
+    os.environ["PATH"] = env_path
+    try:
+        with open(log_file, "w") as log:
+            src = work / "src"
+            # Blobless and sparse: the repo is >700MB of model files this build never reads.
+            _run_logged(["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout", "--depth", "1",
+                         "--branch", FORK_TAG, FORK_REPO, str(src)], log)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=src, capture_output=True, text=True).stdout.strip()
+            if not head.startswith(FORK_COMMIT):
+                raise ForkBuildError(f"tag {FORK_TAG} now points at {head[:7]}, not the reviewed {FORK_COMMIT}; "
+                                     "review the new code before updating FORK_COMMIT")
+            _run_logged(["git", "sparse-checkout", "set", "--cone", "src", f"models/{model_name}", "models/rife-v4.6"],
+                        log, cwd=src)
+            _run_logged(["git", "checkout", "--quiet"], log, cwd=src)
+            _run_logged(["git", "submodule", "update", "--init", "--depth", "1", "src/ncnn", "src/libwebp"], log, cwd=src)
+            ncnn = src / "src" / "ncnn"
+            pinned = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ncnn, capture_output=True, text=True).stdout.strip()
+            if not pinned.startswith(FORK_NCNN_COMMIT):
+                raise ForkBuildError(f"ncnn submodule is {pinned[:7]}, not the reviewed {FORK_NCNN_COMMIT}")
+            _run_logged(["git", "submodule", "update", "--init", "--depth", "1", "glslang"], log, cwd=ncnn)
+            build = src / "build"
+            _run_logged(["cmake", "-S", str(src / "src"), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release",
+                         "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",  # current CMake rejects the vendored projects' old minimum
+                         f"-DVulkan_INCLUDE_DIR={headers / 'include'}", f"-DVulkan_LIBRARY={info['dylib']}"], log)
+            _run_logged(["nice", "-n", "10", "cmake", "--build", str(build), "-j", str(os.cpu_count() or 4)], log)
+            built = build / "rife-ncnn-vulkan"
+            if not built.is_file():
+                raise ForkBuildError("the build finished without producing rife-ncnn-vulkan")
+            # Proof it runs on this GPU before it replaces anything.
+            for name in (model_name, "rife-v4.6"):
+                models = FORK_DIR / name
+                if not models.is_dir():
+                    shutil.copytree(src / "models" / name, models)
+            convention = _probe_rife_timestep_convention(built, FORK_DIR / model_name)
+            if convention is None:
+                raise ForkBuildError("the new binary failed its interpolation test run (see the build log)")
+            staged = FORK_DIR / "rife-ncnn-vulkan.new"
+            shutil.copy2(built, staged)
+            staged.chmod(0o755)
+            os.replace(staged, FORK_DIR / "rife-ncnn-vulkan")
+            log.write("installed\n")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    state = {"tag": FORK_TAG, "commit": FORK_COMMIT, "ncnn": FORK_NCNN_COMMIT, "binary": str(FORK_DIR / "rife-ncnn-vulkan"),
+             "molten_vk_version": info["version"], "molten_vk_sha256": info["sha256"],
+             "built_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    _write_json_atomic(FORK_STATE_FILE, state)
+    return state
+
+
+def fork_agent_plist(info):
+    return plistlib.dumps({
+        "Label": FORK_AGENT_LABEL,
+        # env so Homebrew's python/python upgrades never strand a hard-coded interpreter path
+        "ProgramArguments": ["/usr/bin/env", "python3", str(Path(__file__).resolve()), "fork", "build", "--if-stale", "--quiet"],
+        "WatchPaths": [info["keg"]],  # fires when Homebrew adds or removes a MoltenVK version
+        "StartInterval": FORK_AGENT_INTERVAL,
+        "ThrottleInterval": 300,
+        "EnvironmentVariables": {"PATH": os.pathsep.join(FORK_BREW_PATHS + ("/usr/bin", "/bin", "/usr/sbin", "/sbin"))},
+        "ProcessType": "Background",
+        "Nice": 10,
+        "LowPriorityIO": True,
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": "/dev/null",
+    })
+
+
+def _launchctl(*args):
+    return subprocess.run(["launchctl", *args], capture_output=True, text=True)
+
+
+def cmd_fork(args, config):
+    action = args.fork_action or "status"
+    domain = f"gui/{os.getuid()}"
+    if action == "status":
+        state, info = fork_state(), molten_vk_info()
+        print(f"fork binary:  {FORK_DIR / 'rife-ncnn-vulkan'}" + ("" if (FORK_DIR / "rife-ncnn-vulkan").is_file() else "  (not built)"))
+        print(f"MoltenVK now: {info['version'] + ' ' + info['sha256'][:12] if info else 'not installed'}")
+        if state:
+            print(f"built against: {state['molten_vk_version']} {state['molten_vk_sha256'][:12]} ({state['built_at']})")
+            print("status:       " + ("STALE - run: ffrife fork build" if fork_is_stale(state, info) else "up to date"))
+        else:
+            print("built against: no record (built by hand, or never) - 'ffrife fork build' makes one")
+        print(f"auto-rebuild: {'watching (' + FORK_AGENT_LABEL + ')' if FORK_AGENT_PLIST.exists() else 'off - ffrife fork watch'}")
+        return 0
+    if action == "build":
+        state, info = fork_state(), molten_vk_info()
+        if args.if_stale:
+            if not state:
+                if not args.quiet:
+                    print("No fork build on record; run 'ffrife fork build' once first.")
+                return 0
+            if not fork_is_stale(state, info):
+                if not args.quiet:
+                    print("Fork build is current with the installed MoltenVK.")
+                return 0
+            if not args.quiet:
+                print(f"MoltenVK changed ({state['molten_vk_version']} -> {info['version'] if info else 'missing'}); rebuilding.")
+        try:
+            new = build_fork(config)
+        except (ForkBuildError, OSError, subprocess.SubprocessError) as exc:
+            print(f"Fork build failed: {exc}\nThe previous binary, if any, is untouched. Log: {FORK_LOG_FILE}", file=sys.stderr)
+            return 1
+        if not args.quiet:
+            print(f"Built {new['binary']} against MoltenVK {new['molten_vk_version']}.")
+            print("Use it with: ffrife config set rife_binary_path " + new["binary"])
+        return 0
+    if action == "watch":
+        if platform.system() != "Darwin":
+            print("fork watch is macOS-only (launchd).", file=sys.stderr)
+            return 1
+        info = molten_vk_info()
+        if not info:
+            print("Homebrew's MoltenVK isn't installed, so there is nothing to watch.", file=sys.stderr)
+            return 1
+        FORK_AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+        FORK_AGENT_PLIST.write_bytes(fork_agent_plist(info))
+        _launchctl("bootout", domain, str(FORK_AGENT_PLIST))
+        result = _launchctl("bootstrap", domain, str(FORK_AGENT_PLIST))
+        if result.returncode != 0:
+            print(f"launchctl bootstrap failed: {result.stderr.strip()}", file=sys.stderr)
+            return 1
+        print(f"Watching {info['keg']}: ffrife rebuilds its fork after a MoltenVK upgrade ({FORK_AGENT_PLIST}).")
+        return 0
+    if action == "unwatch":
+        _launchctl("bootout", domain, str(FORK_AGENT_PLIST))
+        FORK_AGENT_PLIST.unlink(missing_ok=True)
+        print("Stopped watching MoltenVK.")
+        return 0
+    return 2
+
+
 def cmd_setup(config):
     hw = config.get("hardware_encoder", "cpu")
     print(f"Video encoder: {hw}")
@@ -3979,6 +4234,15 @@ def build_parser():
     p_benchmark.add_argument("--apply", action="store_true", help="Save the recommended hardware_encoder/video_codec/video_crf to config instead of just printing them")
     p_benchmark.add_argument("--quick", action="store_true", help="Skip the crf sweep (one crf per codec) for a faster, coarser answer")
 
+    p_fork = subparsers.add_parser("fork", help="macOS: build/maintain the TNTwise rife-ncnn-vulkan fork against Homebrew's MoltenVK")
+    fork_actions = p_fork.add_subparsers(dest="fork_action")
+    fork_actions.add_parser("status", help="Show the fork build, the installed MoltenVK, and whether the build is stale (default)")
+    p_fork_build = fork_actions.add_parser("build", help="Build the fork from source (no-op with --if-stale unless MoltenVK changed)")
+    p_fork_build.add_argument("--if-stale", action="store_true", help="Only rebuild when the installed MoltenVK differs from the one the last build used")
+    p_fork_build.add_argument("-q", "--quiet", action="store_true", help="Print nothing on success or when there is nothing to do")
+    fork_actions.add_parser("watch", help="Install a launchd agent that runs 'fork build --if-stale' when Homebrew changes MoltenVK")
+    fork_actions.add_parser("unwatch", help="Remove that launchd agent")
+
     p_run = subparsers.add_parser("run", help="Interpolate a file (also the default when no subcommand is given)")
     p_run.add_argument("input", help="Local path or remote URL")
     p_run.add_argument("-o", "--output", help="Defaults to <input>_rife<ext> alongside the input")
@@ -4010,7 +4274,7 @@ def normalize_argv(argv):
     """`ffrife <input> -o <output> ...` works without typing the 'run'
     subcommand explicitly - only dispatch to it when the first arg isn't
     already a known subcommand name."""
-    if argv and argv[0] not in ("setup", "config", "run", "batch", "bulk", "benchmark", "-h", "--help"):
+    if argv and argv[0] not in ("setup", "config", "run", "batch", "bulk", "benchmark", "fork", "-h", "--help"):
         return ["run"] + argv
     return argv
 
@@ -4038,6 +4302,10 @@ def main():
             raise SystemExit(status)
     elif args.command == "benchmark":
         cmd_benchmark(args, config)
+    elif args.command == "fork":
+        status = cmd_fork(args, config)
+        if status:
+            raise SystemExit(status)
     elif args.command == "run":
         apply_run_overrides(args, config)
         try:

@@ -1776,6 +1776,40 @@ class FfrifePacingTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.ffrife.run_rife("rife", "in", "out", 12)
 
+    def test_linux_thermal_zones_without_trip_points_fall_back_for_cpu_sensors(self) -> None:
+        ff = self.ffrife
+
+        def zone(root, name, kind, temp_c, trips):
+            directory = root / name
+            directory.mkdir()
+            (directory / "type").write_text(kind + "\n")
+            (directory / "temp").write_text(f"{int(temp_c * 1000)}\n")
+            for index, (trip_kind, trip_c) in enumerate(trips):
+                (directory / f"trip_point_{index}_type").write_text(trip_kind + "\n")
+                (directory / f"trip_point_{index}_temp").write_text(f"{int(trip_c * 1000)}\n")
+            return directory
+
+        def pressure(*zones):
+            with tempfile.TemporaryDirectory() as td:
+                for index, spec in enumerate(zones):
+                    zone(Path(td), f"thermal_zone{index}", *spec)
+                with patch.object(ff.platform, "system", return_value="Linux"), \
+                        patch.object(ff, "THERMAL_ROOT", Path(td)):
+                    return ff.thermal_pressure()
+
+        unset = [("passive", -274)]  # what the kernel reports for "no trip point"
+        self.assertEqual(pressure(("x86_pkg_temp", 70, unset)), 0)
+        self.assertEqual(pressure(("x86_pkg_temp", 86, unset)), 0)
+        self.assertEqual(pressure(("x86_pkg_temp", 92, unset)), 1)
+        self.assertEqual(pressure(("x86_pkg_temp", 101, unset)), 2)
+        # A Wi-Fi card with no trip points is not a CPU sensor and says nothing...
+        self.assertIsNone(pressure(("iwlwifi_1", 90, unset)))
+        # ...and an unreadable zone must not blank out the sensors that work.
+        self.assertEqual(pressure(("iwlwifi_1", 90, unset), ("x86_pkg_temp", 95, unset)), 1)
+        # A real trip point still decides.
+        self.assertEqual(pressure(("acpitz", 70, [("passive", 75)])), 1)
+        self.assertEqual(pressure(("acpitz", 76, [("passive", 75)])), 2)
+
     @unittest.skipUnless(hasattr(__import__("signal"), "SIGSTOP"), "duty-cycling needs SIGSTOP/SIGCONT")
     def test_governor_duty_cycles_a_real_child_and_always_leaves_it_running(self) -> None:
         import signal
@@ -1808,6 +1842,40 @@ class FfrifePacingTest(unittest.TestCase):
         finally:
             child.kill()
             child.wait()
+
+
+    @unittest.skipUnless(hasattr(__import__("signal"), "SIGSTOP"), "duty-cycling needs SIGSTOP/SIGCONT")
+    def test_gpu_probe_schedule_survives_the_governor_that_took_it(self) -> None:
+        # RIFE is a fresh process (and governor) every chunk, and a chunk can be
+        # shorter than the probe interval: probing state kept per governor
+        # would never take a reading, and another app on the GPU went unseen.
+        import subprocess
+        import sys
+        import time
+        ff = self.ffrife
+        ff._PACING_GPU["next"] = None
+        ff._PACING_GPU["samples"].clear()
+        try:
+            with patch.dict(ff._PACING, mode="adaptive"), \
+                 patch.object(ff, "gpu_utilization", return_value=90.0), \
+                 patch.object(ff, "thermal_pressure", return_value=0), \
+                 patch.object(ff, "user_idle_seconds", return_value=None), \
+                 patch.object(ff, "PACING_GPU_PROBE_EVERY", 0.4), \
+                 patch.object(ff, "PACING_GPU_SETTLE", 0.01), \
+                 patch.object(ff, "PACING_SLICE", 0.1), \
+                 patch("builtins.print"):
+                for _ in range(6):  # six governors, each living well under one probe interval
+                    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+                    try:
+                        with ff.PacingGovernor(child, "RIFE", duty_cycle=True):
+                            time.sleep(0.3)
+                    finally:
+                        child.kill()
+                        child.wait()
+            self.assertGreaterEqual(len(ff._PACING_GPU["samples"]), 2)
+        finally:
+            ff._PACING_GPU["next"] = None
+            ff._PACING_GPU["samples"].clear()
 
 
 class FfrifeDuplicateRepairTest(unittest.TestCase):
@@ -1937,6 +2005,95 @@ class FfrifeCadenceTest(unittest.TestCase):
         with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
             steps = self.ffrife.measure_frame_steps(["-i", "x"])
         self.assertEqual([round(s, 3) for s in steps], [0.0, 0.2, 0.0])
+
+
+class FfrifeForkBuildTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    INFO = {"version": "1.4.3", "sha256": "b" * 64, "dylib": "/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib",
+            "keg": "/opt/homebrew/Cellar/molten-vk"}
+
+    def state(self, sha="a" * 64, tag=None):
+        return {"tag": tag or self.ffrife.FORK_TAG, "molten_vk_version": "1.4.2", "molten_vk_sha256": sha,
+                "built_at": "2026-10-04T00:00:00+0000", "binary": "/x/rife-ncnn-vulkan"}
+
+    def run_cmd(self, action, state, info, **flags):
+        args = argparse.Namespace(fork_action=action, if_stale=flags.get("if_stale", False), quiet=flags.get("quiet", False))
+        with patch.object(self.ffrife, "fork_state", return_value=state), \
+                patch.object(self.ffrife, "molten_vk_info", return_value=info), \
+                patch.object(self.ffrife, "build_fork", return_value=dict(self.state(), binary="/x/new",
+                                                                         molten_vk_version="1.4.3")) as build:
+            status = self.ffrife.cmd_fork(args, {})
+        return status, build
+
+    def test_stale_means_the_moltenvk_library_changed_since_the_build(self) -> None:
+        stale = self.ffrife.fork_is_stale
+        self.assertTrue(stale(self.state(), self.INFO))
+        self.assertFalse(stale(self.state(sha=self.INFO["sha256"]), self.INFO))
+        self.assertTrue(stale(self.state(sha=self.INFO["sha256"], tag="20240101"), self.INFO))
+        # No record: nothing here knows how that binary was built, so it is never "stale".
+        self.assertFalse(stale(None, self.INFO))
+        self.assertFalse(stale(self.state(), None))
+
+    def test_if_stale_rebuilds_only_when_moltenvk_changed(self) -> None:
+        status, build = self.run_cmd("build", self.state(sha=self.INFO["sha256"]), self.INFO, if_stale=True, quiet=True)
+        self.assertEqual(status, 0)
+        build.assert_not_called()
+        status, build = self.run_cmd("build", None, self.INFO, if_stale=True, quiet=True)
+        self.assertEqual(status, 0)
+        build.assert_not_called()  # never built by this tool: the watcher must not start one unasked
+        status, build = self.run_cmd("build", self.state(), self.INFO, if_stale=True, quiet=True)
+        self.assertEqual(status, 0)
+        build.assert_called_once()
+
+    def test_plain_build_always_builds_and_a_failure_is_reported_not_raised(self) -> None:
+        status, build = self.run_cmd("build", self.state(sha=self.INFO["sha256"]), self.INFO, quiet=True)
+        self.assertEqual(status, 0)
+        build.assert_called_once()
+        with patch.object(self.ffrife, "build_fork", side_effect=self.ffrife.ForkBuildError("boom")), \
+                patch.object(self.ffrife, "fork_state", return_value=None), \
+                patch.object(self.ffrife, "molten_vk_info", return_value=self.INFO), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            status = self.ffrife.cmd_fork(argparse.Namespace(fork_action="build", if_stale=False, quiet=True), {})
+        self.assertEqual(status, 1)
+        self.assertIn("previous binary", err.getvalue())
+
+    def test_build_refuses_outside_macos_and_without_moltenvk(self) -> None:
+        with patch.object(self.ffrife.platform, "system", return_value="Linux"):
+            with self.assertRaisesRegex(self.ffrife.ForkBuildError, "macOS"):
+                self.ffrife.build_fork({})
+        with patch.object(self.ffrife.platform, "system", return_value="Darwin"), \
+                patch.object(self.ffrife.shutil, "which", return_value="/usr/bin/tool"), \
+                patch.object(self.ffrife, "molten_vk_info", return_value=None), \
+                patch.object(self.ffrife, "_brew_prefix", return_value=None):
+            with self.assertRaisesRegex(self.ffrife.ForkBuildError, "molten-vk"):
+                self.ffrife.build_fork({})
+
+    def test_molten_vk_info_reads_version_and_fingerprint_from_the_keg(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            keg = Path(td) / "Cellar" / "molten-vk" / "1.4.3"
+            (keg / "lib").mkdir(parents=True)
+            (keg / "lib" / "libMoltenVK.dylib").write_bytes(b"dylib bytes")
+            opt = Path(td) / "opt"
+            opt.mkdir()
+            (opt / "molten-vk").symlink_to(keg)
+            with patch.object(self.ffrife, "_brew_prefix", return_value=opt / "molten-vk"):
+                info = self.ffrife.molten_vk_info()
+            self.assertEqual(info["version"], "1.4.3")
+            self.assertEqual(Path(info["keg"]).name, "molten-vk")
+            import hashlib
+            self.assertEqual(info["sha256"], hashlib.sha256(b"dylib bytes").hexdigest())
+
+    def test_watch_agent_runs_the_staleness_check_when_the_keg_changes(self) -> None:
+        import plistlib
+        plist = plistlib.loads(self.ffrife.fork_agent_plist(self.INFO))
+        self.assertEqual(plist["WatchPaths"], [self.INFO["keg"]])
+        self.assertEqual(plist["ProgramArguments"][-4:], ["fork", "build", "--if-stale", "--quiet"])
+        self.assertIn("/opt/homebrew/bin", plist["EnvironmentVariables"]["PATH"])  # launchd's own PATH has no brew
+        self.assertEqual(plist["Nice"], 10)
+        self.assertGreater(plist["StartInterval"], 0)  # also re-checks on a timer, in case a keg event is missed
 
 
 class FfrifeDetectionInputTest(unittest.TestCase):

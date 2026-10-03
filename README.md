@@ -96,7 +96,7 @@ Full docs: [docs/ffinpaint.md](docs/ffinpaint.md)
 
 ### [`ffrife`](./ffrife)
 
-`ffrife` interpolates any video to a higher frame rate using `rife-ncnn-vulkan`, a GPU-accelerated AI model that generates real in-between frames instead of just blending adjacent ones. Short jobs preserve RIFE's upstream performance defaults; long jobs and batches automatically use a cooler resumable profile, with explicit performance/balanced/cool controls. Batch mode handles folders, globs, or file lists sequentially.
+`ffrife` interpolates any video to a higher frame rate using `rife-ncnn-vulkan`, a GPU-accelerated AI model that generates real in-between frames instead of just blending adjacent ones. Short jobs preserve RIFE's upstream performance defaults; long jobs and batches automatically use a cooler resumable profile, with explicit performance/balanced/cool controls. Batch mode handles folders, globs, or file lists sequentially. It spots animation drawn on twos/threes and interpolates its true frames, and on macOS `ffrife fork` builds and keeps current the newer-model fork of RIFE.
 
 Full docs: [docs/ffrife.md](docs/ffrife.md)
 
