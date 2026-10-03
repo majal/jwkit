@@ -1701,7 +1701,9 @@ class FfrifePacingTest(unittest.TestCase):
     def test_idle_or_headless_machine_runs_full_speed(self) -> None:
         decide = self.ffrife.pacing_decision
         self.assertEqual(decide(600, 0, False, self.settings())[:2], (1.0, False))
-        self.assertEqual(decide(None, None, False, self.settings())[:2], (1.0, False))
+        # Headless: full duty, but niced - other tenants may be sharing the host.
+        self.assertEqual(decide(None, None, False, self.settings())[:2], (1.0, True))
+        self.assertEqual(decide(None, None, False, self.settings(background_priority=False))[:2], (1.0, False))
 
     def test_someone_working_gets_headroom(self) -> None:
         duty, background, reason = self.ffrife.pacing_decision(3, 0, False, self.settings())
@@ -1868,6 +1870,73 @@ class FfrifeDuplicateRepairTest(unittest.TestCase):
             self.assertEqual((frames / "00000008.png").read_text(), "blend:5:8:0.667")
             self.assertEqual((frames / "00000011.png").read_text(), "blend:9:11:0.500")
             self.assertEqual((frames / "00000004.png").read_text(), "src:3")  # real frames untouched
+
+
+class FfrifeCadenceTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    @staticmethod
+    def pattern(length, period=2, phase=0, repeat=0.0002, seed=1):
+        """Step magnitudes for a clip whose frames `phase`, `phase + period`,
+        ... are new and the rest repeat the previous one."""
+        import random
+        rng = random.Random(seed)
+        return [rng.uniform(0.01, 0.05) if (i + 1 - phase) % period == 0 else repeat for i in range(length)]
+
+    def test_finds_period_and_phase(self) -> None:
+        for period, phase in ((2, 0), (2, 1), (3, 2), (4, 3)):
+            with self.subTest(period=period, phase=phase):
+                found = self.ffrife.find_cadence(self.pattern(120, period, phase))
+                self.assertEqual(found[:2], (period, phase))
+
+    def test_largest_consistent_period_wins(self) -> None:
+        # On fours every second step is also a repeat, so the 2-cadence test passes too.
+        self.assertEqual(self.ffrife.find_cadence(self.pattern(160, 4, 1))[:2], (4, 1))
+
+    def test_full_rate_motion_has_no_cadence(self) -> None:
+        import random
+        rng = random.Random(3)
+        self.assertIsNone(self.ffrife.find_cadence([rng.uniform(0.01, 0.05) for _ in range(120)]))
+
+    def test_stills_and_short_clips_have_no_cadence(self) -> None:
+        self.assertIsNone(self.ffrife.find_cadence([0.0] * 120))
+        self.assertIsNone(self.ffrife.find_cadence(self.pattern(10)))
+
+    def test_holds_do_not_hide_the_pattern_but_a_broken_one_is_refused(self) -> None:
+        steps = self.pattern(160, 2, 0)
+        for index in range(1, 40, 2):  # a drawing held for 4 frames: some new-frame steps are flat
+            steps[index] = 0.0002
+        self.assertEqual(self.ffrife.find_cadence(steps)[:2], (2, 0))
+        broken = self.pattern(160, 2, 0)
+        for index in range(0, 160, 5):  # motion where a repeat belongs, 20% of the time
+            broken[index] = 0.03
+        self.assertIsNone(self.ffrife.find_cadence(broken))
+
+    def test_cut_or_retimed_shot_is_tolerated_within_the_match_budget(self) -> None:
+        steps = self.pattern(200, 2, 0)
+        steps[41] = 0.03  # one repeat step that moved: 1 of 100
+        self.assertEqual(self.ffrife.find_cadence(steps)[:2], (2, 0))
+
+    def test_decimation_filter_spaces_survivors_at_the_effective_rate(self) -> None:
+        self.assertEqual(self.ffrife.cadence_filter(2, 12),
+                         "select='not(mod(n,2))',setpts=N/(12*TB),fps=12")
+
+    def test_resolve_cadence_is_off_when_disabled_and_scales_the_rate_to_the_duration(self) -> None:
+        self.assertIsNone(self.ffrife.resolve_cadence("clip.mp4", {"cadence_detection": "false"}, None, None, None, 24))
+        steps = self.pattern(100, 3, 1)  # 101 frames; frame 0 is a leftover, 100 remain: 34 groups
+        with patch.object(self.ffrife, "measure_frame_steps", return_value=steps):
+            cadence = self.ffrife.resolve_cadence("clip.mp4", {}, None, None, None, 24)
+        self.assertEqual((cadence["period"], cadence["phase"], cadence["frames"], cadence["kept"]), (3, 1, 100, 34))
+        # 34 kept frames must last as long as the 100 real ones did.
+        self.assertAlmostEqual(34 / cadence["effective_fps"], 100 / 24)
+
+    def test_measure_frame_steps_reads_consecutive_differences(self) -> None:
+        frames = [bytes([value] * (32 * 18 * 3)) for value in (0, 0, 51, 51)]
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
+            steps = self.ffrife.measure_frame_steps(["-i", "x"])
+        self.assertEqual([round(s, 3) for s in steps], [0.0, 0.2, 0.0])
 
 
 class FfrifeDetectionInputTest(unittest.TestCase):

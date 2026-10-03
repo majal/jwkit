@@ -2412,6 +2412,16 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         bridged = self.slverse.ffrife_config_for({"rife_scene_detection": "true"})
         self.assertEqual(bridged["scene_detection"], "true")
 
+    def test_slverse_leaves_cadence_detection_off_unless_asked(self) -> None:
+        self.assertEqual(self.slverse.ffrife_config_for(dict(self.slverse.DEFAULT_CONFIG))["cadence_detection"], "false")
+        self.assertIn("rife_cadence_detection", self.slverse.BOOLEAN_CONFIG_KEYS)
+        parser = argparse.ArgumentParser()
+        self.slverse.add_generic_config_overrides(parser)
+        args = parser.parse_args(["--rife-cadence-detection"])
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        self.slverse.apply_generic_config_overrides(args, config)
+        self.assertEqual(self.slverse.ffrife_config_for(config)["cadence_detection"], "true")
+
     def test_extract_verse_rife_engine_delegates_to_ffrife(self) -> None:
         calls = []
         fake_ffrife = argparse.Namespace(

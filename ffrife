@@ -137,6 +137,7 @@ DEFAULT_CONFIG = {
     "scene_histogram_check": "true",  # colour-histogram second opinion rescuing cuts the pixel test misses
     "scene_histogram_floor": "0.15",  # histogram distance a rescued cut must clear (above ordinary motion's ~0.135 99.9th pct)
     "duplicate_frame_repair": "true",  # re-synthesize repeated (dropped-and-duplicated) frames inside motion before interpolating
+    "cadence_detection": "true",  # animation drawn "on twos/threes" (every 2nd/3rd frame repeated in a steady pattern): interpolate from the true drawn frames instead of the repeats
     "gradual_transition_detection": "false",  # off: interpolating through a dissolve beats holding it at source rate
     "transition_blend_tolerance": "0.25",  # max blend-fit residual (vs. endpoint change) for a run to count as a dissolve
     "transition_min_duration": "0.25",  # seconds of baseline lookback, not a minimum run length
@@ -191,6 +192,7 @@ CONFIG_HELP = {
     "scene_revert_fraction": "How much a neighboring frame's motion must fall relative to a spike's own size to still count it as an isolated cut",
     "scene_histogram_check": "Second-opinion colour-histogram test that rescues cuts the pixel test misses (low-contrast, partial-frame, or busy-motion cuts)",
     "scene_histogram_floor": "Histogram distance (0-1) a cut rescued by the histogram check must clear",
+    "cadence_detection": "Detect a steady repeat pattern (animation on twos/threes/fours) and interpolate from the true drawn frames, not the repeats",
     "duplicate_frame_repair": "Re-synthesize frames the source repeated in the middle of motion (a dropped frame filled with a copy) so the output doesn't stall then jump",
     "gradual_transition_detection": "Also detect verified fades/dissolves and hold them at source rate instead of interpolating",
     "transition_blend_tolerance": "Largest residual (relative to the endpoint change) a candidate run may leave when fitted as a cross-fade of its endpoints",
@@ -648,9 +650,13 @@ def pacing_decision(idle_seconds, pressure, sagging, settings=None, gpu_busy=Fal
     if heat:
         duty = min(duty, PACING_HEAT_DUTY[min(2, heat)])
         reasons.append("thermal pressure" if pressure is not None else "throughput sagging (heat)")
-    background = settings["background_priority"] and (shared or heat >= 1)
+    # A host with no local session (a server, possibly shared) has nobody at
+    # a keyboard to protect but may well have other tenants: a nice value
+    # costs nothing while the CPU is free and yields the moment they want it.
+    headless = idle_seconds is None
+    background = settings["background_priority"] and (shared or heat >= 1 or headless)
     if not reasons:
-        reasons.append("machine idle" if idle_seconds is not None else "no local user session")
+        reasons.append("no local user session, yielding CPU to other work" if headless else "machine idle")
     return max(PACING_MIN_DUTY, duty), background, ", ".join(reasons)
 
 
@@ -2411,6 +2417,103 @@ def _find_duplicate_runs(magnitudes, boundaries):
             runs.append((first, nxt))
     return runs
 
+# --- Cadence detection -----------------------------------------------------
+#
+# Animation is often drawn at 12 (or 8) frames a second and stored at 24, so
+# every 2nd (or 3rd) frame is a repeat in a steady pattern. Interpolating that
+# as if it were a 24 fps clip makes RIFE spend half its work on repeats and
+# leaves the motion stepping at the drawn rate. Detecting the pattern lets the
+# run decimate to the true frames and interpolate from those directly.
+# Duplicate-frame repair already copes with irregular repeats (and, as a
+# fallback, with a pattern that holds only part of the clip), so this only
+# acts when one period/phase explains the whole clip.
+CADENCE_PERIODS = (4, 3, 2)  # tried largest first: a 4-cadence also satisfies the 2-cadence test
+CADENCE_MIN_ARRIVALS = 8  # moving "new frame" steps needed before a pattern is believed
+CADENCE_MIN_MOVING = 0.5  # share of new-frame steps that must show real change (the rest are holds)
+CADENCE_REPEAT_RATIO = 0.3  # a repeat step must measure under this share of a new-frame step's typical change
+CADENCE_MATCH = 0.97  # share of repeat steps that must obey that; the slack covers cuts and re-timed shots
+
+
+def find_cadence(magnitudes, min_match=CADENCE_MATCH):
+    """``(period, phase, match)`` when a single repeat pattern explains the
+    clip, else None. ``magnitudes[i]`` is the change from frame i to i + 1;
+    the pattern is "frames phase, phase + period, ... are new, the frames
+    between them repeat the previous new one". Holds (a drawing kept on for
+    longer than the cadence) look like repeats at a new-frame step and are
+    ignored there; what rules a candidate out is real change where a repeat
+    belongs."""
+    for period in CADENCE_PERIODS:
+        best = None
+        for phase in range(period):
+            arrivals, repeats = [], []
+            for index, magnitude in enumerate(magnitudes):
+                (arrivals if (index + 1 - phase) % period == 0 else repeats).append(magnitude)
+            moving = sorted(m for m in arrivals if m >= DUPLICATE_MOTION)
+            if (len(moving) < CADENCE_MIN_ARRIVALS or len(moving) < CADENCE_MIN_MOVING * len(arrivals)
+                    or not repeats):
+                continue
+            limit = max(DUPLICATE_STILL, CADENCE_REPEAT_RATIO * moving[len(moving) // 2])
+            match = sum(1 for m in repeats if m < limit) / len(repeats)
+            if match >= min_match and (best is None or match > best[2]):
+                best = (period, phase, match)
+        if best:
+            return best
+    return None
+
+
+def measure_frame_steps(input_args, pre_vf=None):
+    """Per-step change of every frame in `input_args` (after `pre_vf`): the
+    mean absolute difference of consecutive 32x18 RGB renditions, 0-1 -
+    the same measure and scale detect_transitions uses."""
+    width, height = DETECT_PIXEL_SIZE
+    size = width * height * 3
+    proc = subprocess.Popen(_tiny_frame_stream(input_args, pre_vf, width, height),
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    steps, previous = [], None
+    try:
+        while True:
+            frame = proc.stdout.read(size)
+            if len(frame) < size:
+                break
+            if previous is not None:
+                steps.append(sum(map(abs, map(operator.sub, previous, frame))) / (size * 255))
+            previous = frame
+    finally:
+        proc.stdout.close()
+        proc.wait()
+    return steps
+
+
+def cadence_filter(period, effective_fps):
+    """-vf fragment keeping every `period`-th frame (counting from the first)
+    and re-spacing the survivors at the decimated frame rate."""
+    # The trailing fps filter is what stops every later stage (rawvideo
+    # counting, PNG extraction) conforming the survivors' gaps back to the
+    # input's frame rate with duplicates.
+    return f"select='not(mod(n,{period}))',setpts=N/({effective_fps:.12g}*TB),fps={effective_fps:.12g}"
+
+
+def resolve_cadence(source, config, start, end, vf, source_fps):
+    """Look for a steady repeat cadence over the window to be interpolated.
+    Returns None, or a dict: ``period``/``phase``, the real ``fps``, the
+    ``frames`` the pattern covers after skipping the first `phase` frames (the
+    tail of a drawing that began before the window), and the decimated
+    stream's ``effective_fps`` - scaled so its duration matches the real one
+    even when the window isn't a whole number of periods."""
+    if not config_bool(config, "cadence_detection", True):
+        return None
+    print("Checking for a repeat cadence...")
+    steps = measure_frame_steps(source_window_args(start, end) + ["-i", str(source)], vf)
+    found = find_cadence(steps)
+    if not found:
+        return None
+    period, phase, match = found
+    frames = len(steps) + 1 - phase
+    kept = _ceil_div(frames, period)
+    return {"period": period, "phase": phase, "match": round(match, 4), "fps": float(source_fps),
+            "frames": frames, "kept": kept, "effective_fps": float(source_fps) * kept / frames}
+
+
 def parse_transition_ranges(value, source_fps, input_count):
     ranges = []
     for item in str(value or "").split(","):
@@ -2694,10 +2797,16 @@ class WindowedFrameProvider:
 
     windowed = True
 
-    def __init__(self, source, count, source_fps, window_start=0.0, vf=None):
+    def __init__(self, source, count, source_fps, window_start=0.0, vf=None, frame_step=1, step_fps=None):
         self.source = source
         self.count = int(count)
         self.source_fps = float(source_fps)
+        # Cadence decimation: chunk frame i is source frame i * frame_step,
+        # and the seek is aimed in real source frames (step_fps), not the
+        # decimated stream's - half a *decimated* frame early would land
+        # whole source frames before the wanted one.
+        self.frame_step = int(frame_step)
+        self.step_fps = float(step_fps or source_fps)
         self.window_start = float(window_start or 0.0)
         self.vf = vf
         self._seam = None  # (global index, digest) of the last frame materialized
@@ -2714,7 +2823,7 @@ class WindowedFrameProvider:
         # Half a frame early: accurate seek keeps frames at or after the
         # seek time, so aiming at (first - 0.5)/fps lands on `first` itself
         # for any rounding within half a frame either way.
-        seek = self.window_start + max(0.0, first - 0.5) / self.source_fps
+        seek = self.window_start + max(0.0, first * self.frame_step - 0.5) / self.step_fps
         cmd = ["-ss", f"{seek:.6f}", "-i", str(self.source)]
         if self.vf:
             cmd += ["-vf", self.vf]
@@ -2999,7 +3108,7 @@ def _estimate_source_frame_count(source, source_fps, start, end):
 
 
 def render_rife_frames(source, frames_root, config, start=None, end=None, vf=None, fps=60, speed=None, source_fps=None,
-                        output_vf=None, stream_encode=False):
+                        output_vf=None, stream_encode=False, cadence=None):
     """Decode a source window, synthesize its final retimed RIFE frame
     sequence, and return ``(out_frames, resolved_fps, duration)``.
 
@@ -3020,6 +3129,11 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     only take PNGs leave this False and always get them. ``output_vf`` is
     only meaningful when a streaming pipeline is actually chosen, applied
     per-segment since there's no later separate merge step for video then.
+
+    ``cadence`` is a resolve_cadence() result: only every ``period``-th
+    source frame is extracted and the run treats the survivors as the clip
+    (at their ``effective_fps``), so RIFE interpolates the true drawn frames.
+    The caller has already moved `start` past the pattern's leading `phase`.
     """
     if str(fps).strip().lower().endswith(("x", "%")):
         fps = resolve_target_fps(fps, probe_source_fps(source))
@@ -3029,6 +3143,10 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     if not rife_path or not command_exists(rife_path):
         return None
     configure_pacing(config)
+    frame_step, step_fps = 1, None
+    if cadence:
+        vf = ",".join(filter(None, [vf, cadence_filter(cadence["period"], cadence["effective_fps"])]))
+        source_fps, frame_step, step_fps = cadence["effective_fps"], cadence["period"], cadence["fps"]
 
     print()
     print(COLOR.header("Interpolating using rife-ncnn-vulkan..."))
@@ -3141,7 +3259,8 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
             # frame count for free; only a run with detection turned off has
             # to pay for a separate counting pass.
             count = counted or count_decoded_frames(source_input_args, vf)
-            provider = WindowedFrameProvider(source, count, source_fps, window_start=start or 0.0, vf=vf)
+            provider = WindowedFrameProvider(source, count, source_fps, window_start=start or 0.0, vf=vf,
+                                             frame_step=frame_step, step_fps=step_fps)
             return provider, cuts, transition_count, count, duplicates
         count = _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration)
         if count == 0:
@@ -3332,7 +3451,22 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
                 shutil.rmtree(carryover_dir, ignore_errors=True)
         return True
 
-    options = {"start": start, "end": end, "vf": vf, "fps": fps, "speed": speed,
+    cadence = None
+    if config_bool(config, "cadence_detection", True):
+        cadence = resolve_cadence(source, config, start, end, vf, probe_source_fps(source))
+        if cadence:
+            real = cadence["fps"]
+            print(f"Cadence: every {cadence['period']}{'nd' if cadence['period'] == 2 else 'rd' if cadence['period'] == 3 else 'th'}"
+                  f" frame is new ({real:.4g} -> {real / cadence['period']:.4g} fps drawn, "
+                  f"{cadence['match']:.0%} of repeats clean); interpolating the true frames.")
+            if cadence["phase"]:
+                # Skip the tail of the drawing that began before the window so
+                # frame 0 is a new one; audio and extras follow the same start.
+                # A quarter frame early keeps a float rounding from dropping it.
+                start = (start or 0.0) + (cadence["phase"] - 0.25) / real
+                trim_args = source_window_args(start, end)
+                duration = (end - start) if end is not None else None
+    options = {"start": start, "end": end, "vf": vf, "fps": fps, "speed": speed, "cadence": cadence,
                "model": config.get("rife_model"), "threads": config.get("rife_threads"),
                "gpu": config.get("rife_gpu"), "profile": config.get("rife_profile"),
                "chunk_frames": config.get("chunk_frames"), "long_run_frames": config.get("long_run_frames"),
@@ -3341,7 +3475,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
     # Every detection setting changes which frames get held, so any of them
     # changing must start fresh work rather than reuse held chunks.
     options.update({key: config.get(key) for key in DEFAULT_CONFIG
-                    if key.startswith(("scene_", "transition_", "gradual_", "duplicate_"))})
+                    if key.startswith(("scene_", "transition_", "gradual_", "duplicate_", "cadence_"))})
     signature = _job_signature(source, output_file, options)
     durable = config_bool(config, "resume", False)
     work_path = _work_dir_for(output_file, signature, config) if durable else Path(tempfile.mkdtemp(prefix="ffrife-"))
@@ -3349,7 +3483,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
     try:
         temp_dir_path = work_path
         rendered = render_rife_frames(source, temp_dir_path, config, start=start, end=end, vf=vf, fps=fps, speed=speed,
-                                      output_vf=output_vf, stream_encode=True)
+                                      output_vf=output_vf, stream_encode=True, cadence=cadence)
         if not rendered:
             if not durable:
                 shutil.rmtree(work_path, ignore_errors=True)
@@ -3615,7 +3749,7 @@ def cmd_config(args, config):
 GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset",
                                   "rife_profile", "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds",
                                   "resume", "keep_work", "scene_detection", "gradual_transition_detection", "scene_histogram_check",
-                                  "pacing", "rife_tta", "pacing_background_priority", "duplicate_frame_repair",
+                                  "pacing", "rife_tta", "pacing_background_priority", "duplicate_frame_repair", "cadence_detection",
                                   "container", "keep_subtitles", "keep_chapters", "keep_extra_audio_tracks",
                                   "keep_attachments", "keep_thumbnail", "keep_source_metadata", "space_check",
                                   "stream_segment_chunks", "pipeline_mode", "disk_budget_fraction", "extraction_mode"}
@@ -3716,7 +3850,7 @@ def apply_run_overrides(args, config):
         config["gradual_transition_detection"] = args.gradual_transition_detection
     if getattr(args, "scene_histogram_check", None) is not None:
         config["scene_histogram_check"] = args.scene_histogram_check
-    for key in ("pacing", "rife_tta", "pacing_background_priority", "duplicate_frame_repair"):
+    for key in ("pacing", "rife_tta", "pacing_background_priority", "duplicate_frame_repair", "cadence_detection"):
         if getattr(args, key, None) is not None:
             config[key] = getattr(args, key)
     for key in EXTRAS_OVERRIDE_KEYS:
@@ -3802,6 +3936,9 @@ def add_processing_arguments(parser, include_trim=True):
     add_bool_flag(parser, "duplicate_frame_repair", "duplicate-frame-repair",
                  help_on="Re-synthesize repeated frames inside motion before interpolating (default)",
                  help_off="Interpolate repeated frames as they are")
+    add_bool_flag(parser, "cadence_detection", "cadence-detection",
+                 help_on="Detect animation drawn on twos/threes and interpolate its true frames (default)",
+                 help_off="Interpolate every stored frame, repeats included")
     add_bool_flag(parser, "scene_histogram_check", "scene-histogram-check",
                  help_on="Rescue cuts the pixel test misses with a colour-histogram second opinion (default)",
                  help_off="Use the pixel-change cut test alone")
