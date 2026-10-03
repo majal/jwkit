@@ -248,6 +248,7 @@ Persistent mux preferences live in `~/.config/jwkit/jwvideo-mux/config.toml`. Us
   whatever it marks `review_recommended` or `incompatible`, and record the
   verdict in the overrides file so future runs on the same library don't
   need to ask again.
+- In an `.mp4` export the language of each video, audio, and subtitle stream is written as a three-letter ISO 639-2 code (`eng`, `tgl`, `ceb`, ...). jw.org's language list mixes two- and three-letter codes, and ffmpeg's mov muxer silently turns a two-letter code into `und`, which used to leave English and Tagalog tracks unlabeled. Matroska keeps jw.org's code as given.
 
 ## Notes / Caveats
 

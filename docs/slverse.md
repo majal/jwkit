@@ -210,6 +210,15 @@ Time every video encoder this machine's ffmpeg build actually has (real hardware
 
 The winner is the smallest file among everything at SSIM ≥ 0.98 - but ties within 15% of the smallest go to whichever is fastest, so a barely-smaller-but-3x-slower option doesn't win on noise-level size differences (see `docs/ffrife.md`'s codec comparison for a real example this changed the outcome on).
 
+Know how a clip was made, and rebuild it when jw.org replaces its source:
+
+```bash
+./slverse inspect "02 Luke_4_6_FSL_cut_rife.mp4"          # source, md5, tool commit, rebuild command
+./slverse rebuild --check "/path/to/talk/media"            # which clips' sources has jw.org replaced?
+./slverse rebuild "/path/to/talk/media"                    # rebuild just those, in place
+./slverse rebuild --force "02 Luke_4_6_FSL_cut_rife.mp4"   # rebuild regardless (e.g. after an ffrife improvement)
+```
+
 ## Important Behavior / Defaults
 
 - Global configuration is saved in `~/.config/jwkit/slverse/config.toml`. Sync state is split into a small `state.json` (sync timestamps, cached book-name lookups) plus one index file per synced language under `~/.config/jwkit/slverse/index/`, so it stays fast to load as you sync more languages.
@@ -233,6 +242,8 @@ The winner is the smallest file among everything at SSIM ≥ 0.98 - but ties wit
 - Both preview players (`ffplay` by default, `mpv` with `--play`/`-m`) stay open on the last frame once playback ends instead of closing themselves, so you can seek back and review the clip; close the window yourself when you're done.
 - Every mpv preview/playback window (`extract`'s live preview, `extract -m`/`--play`, `find`'s preview) is sized via `preview_window_size` (default `65%` of screen size, aspect preserved, via mpv's `--autofit`) rather than opening fullscreen. `find`'s multi-language cascade additionally offsets each window so they don't stack exactly on top of each other, and only the first window that opens takes focus - the rest open behind it, so you can start watching the first while the others keep loading.
 - A multi-verse extraction can show more than one distinct source caption in sequence (each verse advances its own marker's label, e.g. "Psalm 16:10" then "Psalm 16:11") - the delogo box is sized to whichever is widest/tallest across the whole window, so it stays correctly sized throughout rather than only for the first verse. The replacement reference overlay follows the same per-verse rhythm - there is never a combined "5:23-24" label; each verse gets its own drawtext switched on exactly when the source moves into it (like old `ffv`), fades matching `overlay_alpha`'s existing paragraph-boundary dip/recovery (only for a *real* transition - see `min_transition_duration`). `--slow`/`--fast` retimes those per-verse switches, and the paragraph-boundary fade itself, along with the video - a boundary landing mid-verse just splits that verse's window across the retimed cut rather than losing the switch.
+- Every clip written by `extract --write` gets a provenance sidecar beside it, `<clip>.mp4.jwkit.json`: the exact request (language, reference, window/trims, slow/fast, engine), the source file's URL and jw.org's own MD5 for it, the part of the source it was cut from, the settings that shape the pixels, the jwkit commit and RIFE build, and the `slverse extract ...` command that reproduces it. MP4 keeps only its standard tags, so custom tags such as `source_checksum` never survived the final mux; the sidecar is the reliable record, while the MP4 `comment` still carries the source URL, the MD5, and a link to this script. Keep the sidecar next to the clip (move or rename them together; `rebuild` reads the media name from the sidecar). A rebuild keeps the previous build's commit/source MD5 in the sidecar's `history`.
+- `slverse rebuild` asks jw.org (live, not the saved index) which file it now publishes for each recorded chapter/language. A clip is out of date when that MD5 differs from the one it was cut from; `--check` only reports (exit status 1 if anything is out of date), otherwise those clips are rebuilt in place after refreshing the saved index entry. The old clip is set aside until the new one exists, then sent to the Trash; if the rebuild fails it is put back. `--force` rebuilds every clip found, and `--recorded-settings` replays each sidecar's recorded settings instead of today's configuration. Clips made before sidecars existed can't be rebuilt this way - extract them once with the current slverse to create one. `bulk` outputs get no sidecar.
 
 ## Notes / Caveats
 
