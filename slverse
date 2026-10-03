@@ -287,7 +287,7 @@ def load_config():
 def save_config(config):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
-        for k, v in config.items():
+        for k, v in _jwkit_common.config_overrides(config, DEFAULT_CONFIG).items():
             f.write(f"{k} = {json.dumps(str(v), ensure_ascii=False)}\n")
 
 def get_state():

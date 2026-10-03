@@ -688,15 +688,46 @@ def load_jwkit_config():
     return config
 
 
+def _config_value_text(value):
+    return ("true" if value else "false") if isinstance(value, bool) else str(value).strip()
+
+
+def config_overrides(config, defaults, skip=()):
+    """The part of `config` worth writing back to disk: every key whose value
+    differs from `defaults`, plus keys `defaults` doesn't know (kept so
+    `config check` can report them instead of them vanishing silently).
+    Runtime-only keys (a leading underscore, or anything in `skip`) are
+    never persisted.
+
+    Every tool saves through this rather than dumping its whole merged
+    config: a full dump pins each default as it stood the day the file was
+    first written, so an improved default never reaches an existing install
+    (seen in practice with ffrife's scene-detection defaults)."""
+    return {key: value for key, value in config.items()
+            if not str(key).startswith("_") and key not in skip
+            and (key not in defaults or not _config_values_equal(value, defaults[key]))}
+
+
+def _config_values_equal(value, default):
+    """Equal as config values: "true" == True, and "24" == 24 == 24.0 (a
+    loader that parses numbers must not make every default look changed)."""
+    left, right = _config_value_text(value), _config_value_text(default)
+    if left == right:
+        return True
+    if isinstance(value, bool) or isinstance(default, bool):
+        return False
+    try:
+        return float(left) == float(right)
+    except ValueError:
+        return False
+
+
 def save_jwkit_config(config):
     JWKIT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    known = {key: config.get(key, default) for key, default in DEFAULT_JWKIT_CONFIG.items()}
     with open(JWKIT_CONFIG_FILE, "w") as f:
-        f.write(f"auto_update = {'true' if config.get('auto_update', True) else 'false'}\n")
-        f.write(f"auto_update_interval_hours = {config.get('auto_update_interval_hours', 24)}\n")
-        f.write(f"color_output = {config.get('color_output', 'auto')}\n")
-        f.write(f"on_output_exists = {config.get('on_output_exists', 'ask')}\n")
-        f.write(f"on_output_exists_unattended = {config.get('on_output_exists_unattended', 'rename')}\n")
-        f.write(f"overwrite_prompt_timeout = {config.get('overwrite_prompt_timeout', 20)}\n")
+        for key, value in config_overrides(known, DEFAULT_JWKIT_CONFIG).items():
+            f.write(f"{key} = {_config_value_text(value)}\n")
 
 
 def _read_last_checked():

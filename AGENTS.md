@@ -36,7 +36,9 @@ tool-local configuration as TOML under the XDG-style
 settings that genuinely apply to every tool. Use Unix-style text output and
 exit statuses, honor `$VISUAL` then `$EDITOR` for `config edit`, reject unknown
 keys and invalid values, and make `config check` safe and non-mutating. Reuse
-the helpers in `_jwkit_common.py` instead of cloning config-command logic.
+the helpers in `_jwkit_common.py` instead of cloning config-command logic. Persist only overrides: every tool's `save_config` filters through
+`_jwkit_common.config_overrides`, so a saved file never pins defaults and
+improved defaults reach existing installs.
 Keep every persisted setting paired with a long per-run flag, add short flags
 only for frequent operations, and update help, documentation, and tests in the
 same change. When retiring a key or path, migrate active installations first,

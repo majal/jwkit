@@ -672,3 +672,26 @@ class JwkitCommonOverwritePolicyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfigOverridesTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def test_only_changed_and_unknown_keys_are_persisted(self) -> None:
+        common = self.common
+        defaults = {"a": True, "b": 24, "c": "auto", "d": 20}
+        config = {"a": "true", "b": "25", "c": "auto", "d": 20.0, "legacy": "x", "_runtime": 1, "skipme": 2}
+        self.assertEqual(common.config_overrides(config, defaults, skip={"skipme"}), {"b": "25", "legacy": "x"})
+
+    def test_shared_config_saves_only_overrides(self) -> None:
+        common = self.common
+        with tempfile.TemporaryDirectory() as td:
+            config_file = Path(td) / "config.toml"
+            with mock.patch.object(common, "JWKIT_CONFIG_DIR", Path(td)), \
+                 mock.patch.object(common, "JWKIT_CONFIG_FILE", config_file):
+                common.save_jwkit_config(dict(common.DEFAULT_JWKIT_CONFIG, on_output_exists="trash"))
+                self.assertEqual(config_file.read_text(), "on_output_exists = trash\n")
+                self.assertEqual(common.load_jwkit_config()["on_output_exists"], "trash")
+                self.assertEqual(common.load_jwkit_config()["auto_update"], True)

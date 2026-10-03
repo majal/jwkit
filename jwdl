@@ -138,10 +138,9 @@ def load_config():
 def save_config(config):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
-    for key in DEFAULT_CONFIG:
-        if key == "pubs":
-            continue
-        value = config[key]
+    overrides = _jwkit_common.config_overrides({key: config[key] for key in DEFAULT_CONFIG if key != "pubs"},
+                                              DEFAULT_CONFIG)
+    for key, value in overrides.items():
         if isinstance(value, bool): rendered = "true" if value else "false"
         elif isinstance(value, (int, float)): rendered = str(value)
         else: rendered = json.dumps(str(value), ensure_ascii=False)

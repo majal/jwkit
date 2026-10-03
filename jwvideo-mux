@@ -83,7 +83,7 @@ def load_config():
 def save_config(config):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
-    for key, value in config.items():
+    for key, value in _jwkit_common.config_overrides(config, DEFAULT_CONFIG).items():
         rendered = str(value).lower() if isinstance(value, bool) else str(value) if isinstance(value, (int, float)) else f'"{value}"'
         lines.append(f"{key} = {rendered}\n")
     CONFIG_FILE.write_text("".join(lines))

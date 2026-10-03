@@ -603,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         saved = _read_toml(CONFIG_FILE)
         resolved = {**DEFAULTS, **saved}
         def save_global_config(current):
-            _write_toml(CONFIG_FILE, {key: value for key, value in current.items() if value != DEFAULTS[key]})
+            _write_toml(CONFIG_FILE, _jwkit_common.config_overrides(current, DEFAULTS))
         def validate(key, value):
             if key == "end_action" and int(value) not in range(4): return "must be 0, 1, 2, or 3"
             if key == "image_duration_seconds" and _jwkit_common.parse_time_seconds(value) <= 0: return "must be positive"
