@@ -3149,3 +3149,111 @@ class SlverseExtractCliParsingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlverseProvenanceTest(unittest.TestCase):
+    """The provenance sidecar + `slverse rebuild`: a clip's exact request,
+    source checksum, and tool version live beside it, because MP4 drops any
+    custom tag (source_checksum/editing never survive the final mux)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def ns(self, **overrides):
+        base = dict(clip_window=None, trim_start=None, trim_end=None, keep_end_transition=None,
+                    trim_mid_transitions=None, slow=None, fast=None, speed=None)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def config(self, **overrides):
+        config = dict(self.slverse.DEFAULT_CONFIG)
+        config.update(interpolate="true", interpolation_engine="rife")
+        config.update(overrides)
+        return config
+
+    def test_comment_carries_source_checksum_and_the_script_link(self) -> None:
+        args = self.slverse.output_metadata_args("Luke", 4, "6", "FSL", "https://cfp2.jw-cdn.org/a/x/1/o/nwt_42_Lu_FSL_04_r720P.mp4", "abc123")
+        comment = next(value for flag, value in zip(args, args[1:]) if value.startswith("comment="))
+        self.assertIn("Source: https://cfp2.jw-cdn.org/a/x/1/o/nwt_42_Lu_FSL_04_r720P.mp4 (md5 abc123)", comment)
+        self.assertIn("https://github.com/majal/jwkit/blob/main/slverse", comment)
+
+    def test_rebuild_argv_replays_window_trim_and_engine(self) -> None:
+        argv = self.slverse.extract_rebuild_argv("SPE", "Revelation", 12, "12", "out.mp4", self.ns(clip_window=(18.852, 30.163)), self.config())
+        self.assertEqual(argv[:5], ["extract", "SPE", "Revelation 12:12", "--write", "--output"])
+        self.assertIn("--window", argv)
+        self.assertEqual(argv[argv.index("--window") + 1], "18.852-30.163")
+        self.assertEqual(argv[-3:], ["--interpolate", "--interpolation-engine", "rife"])
+        argv = self.slverse.extract_rebuild_argv("FSL", "Luke", 4, "6", "o.mp4", self.ns(trim_end=6.24, trim_mid_transitions=True), self.config(interpolate="false"))
+        self.assertEqual(argv[argv.index("--trim-end") + 1], "6.24")
+        self.assertIn("--trim-mid-transitions", argv)
+        self.assertEqual(argv[-1], "--no-interpolate")
+
+    def test_rebuild_argv_round_trips_through_the_extract_parser(self) -> None:
+        parser = self.slverse.build_parser()
+        argv = self.slverse.extract_rebuild_argv("FSL", "Hebrews", 12, "1", "o.mp4", self.ns(trim_start=7.741, trim_end=8.909), self.config())
+        parsed = parser.parse_args(argv)
+        self.assertAlmostEqual(parsed.trim_start, 7.741)
+        self.assertAlmostEqual(parsed.trim_end, 8.909)
+        self.assertEqual(parsed.interpolation_engine, "rife")
+        self.assertTrue(parsed.write)
+
+    def test_extract_writes_a_sidecar_with_source_and_rebuild_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "Luke_4_6_FSL_cut_rife.mp4"
+            media.write_bytes(b"clip")
+            config = self.config()
+            with mock.patch.object(self.slverse, "ffrife_config_for", return_value={"rife_binary_path": "/x/rife-build/rife-ncnn-vulkan", "rife_model": "rife-v4.6"}):
+                self.slverse.write_extract_provenance(
+                    str(media), lang="FSL", book_name="Luke", book_num=42, chapter=4, verses_str="6", valid_verses=[6],
+                    url="https://cfp2.jw-cdn.org/a/82d3a3/1/o/nwt_42_Lu_FSL_04_r720P.mp4", checksum="abc123",
+                    start_time=10.0, end_time=22.5, args=self.ns(trim_end=6.24), config=config, edit_bits=["cut end 6.24s"],
+                )
+            record = self.slverse._jwkit_common.read_provenance(media)
+        self.assertEqual(record["tool"], "slverse")
+        self.assertEqual(record["source"]["checksum"], "abc123")
+        self.assertEqual(record["source"]["window_seconds"], [10.0, 22.5])
+        self.assertEqual(record["interpolation"]["rife_build"], "rife-build")
+        self.assertEqual(record["output"]["file"], media.name)
+        self.assertEqual(record["output"]["size"], 4)
+        self.assertIn("slverse extract FSL 'Luke 4:6'", record["rebuild"]["command"])
+        self.assertIn("github.com/majal/jwkit", record["advert"])
+
+    def test_second_write_keeps_the_previous_build_in_history(self) -> None:
+        common = self.slverse._jwkit_common
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "clip.mp4"
+            media.write_bytes(b"one")
+            common.write_provenance(media, {"tool": "slverse", "tool_commit": "aaa", "source": {"checksum": "old"}})
+            media.write_bytes(b"two!")
+            common.write_provenance(media, {"tool": "slverse", "tool_commit": "bbb", "source": {"checksum": "new"}})
+            record = common.read_provenance(media)
+        self.assertEqual(record["source"]["checksum"], "new")
+        self.assertEqual(len(record["history"]), 1)
+        self.assertEqual(record["history"][0]["source_checksum"], "old")
+        self.assertEqual(record["history"][0]["tool_commit"], "aaa")
+
+    def test_check_flags_a_clip_whose_source_jw_org_replaced(self) -> None:
+        common = self.slverse._jwkit_common
+        parser = self.slverse.build_parser()
+        with tempfile.TemporaryDirectory() as tmp:
+            current, replaced = Path(tmp) / "a.mp4", Path(tmp) / "b.mp4"
+            for media, checksum in ((current, "same"), (replaced, "old")):
+                media.write_bytes(b"x")
+                common.write_provenance(media, {
+                    "tool": "slverse", "tool_commit": "aaa",
+                    "request": {"language": "FSL", "book": "Luke", "book_num": 42, "chapter": 4, "verses": "6"},
+                    "source": {"language": "FSL", "book_num": 42, "chapter": 4, "checksum": checksum},
+                    "rebuild": {"argv": ["extract", "FSL", "Luke 4:6", "--write", "--output", media.name]},
+                })
+            live = {"files": {"FSL": {"MP4": [{"track": 4, "file": {"url": "u", "checksum": "same"}}]}}}
+            with mock.patch.object(self.slverse, "get_pub_media_links", return_value=live), \
+                 mock.patch.object(self.slverse, "find_track", return_value={"file": {"url": "u", "checksum": "same"}}), \
+                 mock.patch.object(self.slverse, "COLOR", self.slverse._jwkit_common.Colorizer(False)), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                args = parser.parse_args(["rebuild", "--check", tmp])
+                status = self.slverse.cmd_rebuild(args, dict(self.slverse.DEFAULT_CONFIG), parser)
+        self.assertEqual(status, 1)
+        self.assertIn("SOURCE UPDATED  b.mp4", out.getvalue())
+        self.assertIn("current  a.mp4", out.getvalue())
+        self.assertIn("1 of 2 clip(s) need a rebuild", out.getvalue())

@@ -1079,3 +1079,103 @@ def resolve_output_conflict(path, jwkit_config=None):
         return path
     print(f"{path} already exists (on_output_exists=fail) - not overwriting.")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Provenance sidecars
+#
+# MP4 keeps only a handful of standard tags, so a custom `source_checksum`
+# or `editing` tag never survives the final mux. The record of *how* a file
+# was made (exact command, source URL + jw.org's own MD5 for the source,
+# tool commit, interpolation engine) therefore lives in a JSON sidecar
+# beside the media file, `<name>.mp4.jwkit.json`. `slverse rebuild` reads it
+# to re-create a clip and to notice that jw.org replaced its source; other
+# tools can write the same schema.
+# ---------------------------------------------------------------------------
+
+JWKIT_REPO_URL = "https://github.com/majal/jwkit"
+PROVENANCE_SUFFIX = ".jwkit.json"
+PROVENANCE_SCHEMA = "jwkit-provenance/1"
+_COMMIT_CACHE = {}
+
+
+def tool_advert(tool):
+    """One line crediting the tool, safe for an MP4 `comment` tag."""
+    return f"Made with {tool} - {JWKIT_REPO_URL}/blob/main/{tool}"
+
+
+def jwkit_commit(root):
+    """Short commit of the checkout the running tool came from, '+dirty'
+    when it has uncommitted edits, or 'unknown' for a tarball install."""
+    root = str(root)
+    if root not in _COMMIT_CACHE:
+        try:
+            head = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10)
+            dirty = subprocess.run(["git", "-C", root, "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True, timeout=10)
+            commit = head.stdout.strip() or "unknown"
+            if commit != "unknown" and dirty.stdout.strip():
+                commit += "+dirty"
+        except (OSError, subprocess.SubprocessError):
+            commit = "unknown"
+        _COMMIT_CACHE[root] = commit
+    return _COMMIT_CACHE[root]
+
+
+def file_digest(path, algorithm="sha256"):
+    import hashlib
+    digest = hashlib.new(algorithm)
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def provenance_path(media_path):
+    media_path = Path(media_path)
+    return media_path.with_name(media_path.name + PROVENANCE_SUFFIX)
+
+
+def read_provenance(media_path):
+    """The sidecar's record for a media file (or the sidecar itself), or None."""
+    path = Path(media_path)
+    if not path.name.endswith(PROVENANCE_SUFFIX):
+        path = provenance_path(path)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and record.get("schema", "").startswith("jwkit-provenance/") else None
+
+
+def write_provenance(media_path, record):
+    """Write the sidecar for a finished media file; returns its path.
+
+    Adds the schema, timestamp, and the output's size + sha256. If a sidecar
+    already exists (a rebuild), its identifying fields move to `history` so
+    the chain of builds stays visible."""
+    media_path = Path(media_path)
+    path = provenance_path(media_path)
+    record = dict(record)
+    history = []
+    previous = read_provenance(media_path)
+    if previous:
+        history = list(previous.get("history", []))
+        history.append({
+            "created_at": previous.get("created_at"),
+            "tool_commit": previous.get("tool_commit"),
+            "source_checksum": (previous.get("source") or {}).get("checksum"),
+            "output_sha256": (previous.get("output") or {}).get("sha256"),
+        })
+    record["schema"] = PROVENANCE_SCHEMA
+    record["created_at"] = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+    record["output"] = {
+        "file": media_path.name,
+        "size": media_path.stat().st_size,
+        "sha256": file_digest(media_path),
+    }
+    if history:
+        record["history"] = history
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path

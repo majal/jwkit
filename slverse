@@ -1267,8 +1267,12 @@ def default_extract_filename(book_name, chapter, verses, lang, args, config):
 
 def output_metadata_args(book_name, chapter, verses, lang, source_url, checksum, edit_note="normal-speed full verse window", title_edit=""):
     title = f"{book_name} {chapter}:{verses} {lang}" + (f" ({title_edit})" if title_edit else "")
+    # MP4 keeps only its standard tags, so `comment` carries the source's
+    # checksum and the tool credit; the full record is the provenance
+    # sidecar (see write_extract_provenance).
+    comment = f"Source: {source_url}" + (f" (md5 {checksum})" if checksum else "") + f" | {_jwkit_common.tool_advert('slverse')}"
     return ["-metadata", f"title={title}", "-metadata", f"artist=JW.org ({lang})",
-            "-metadata", "encoder=jwkit slverse", "-metadata", f"comment=Source: {source_url}",
+            "-metadata", "encoder=jwkit slverse", "-metadata", f"comment={comment}",
             "-metadata", f"source_checksum={checksum or ''}", "-metadata", f"editing={edit_note}"]
 
 def remap_through_timeline(source_start, source_end, timeline_segments):
@@ -3170,6 +3174,11 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
 
     chapters_meta = markers_to_verse_times(load_index(lang).get(f"{book_num}_{chapter}", {}).get("markers", []))
     add_verse_chapters(out_filename, chapters_meta, valid_verses, start_time, end_time, book_name, chapter, chapter_timeline)
+    write_extract_provenance(
+        out_filename, lang=lang, book_name=book_name, book_num=book_num, chapter=chapter, verses_str=verses_str,
+        valid_verses=valid_verses, url=url, checksum=checksum, start_time=start_time, end_time=end_time,
+        args=args, config=config, edit_bits=edit_bits,
+    )
 
     if args.play:
         if command_exists("mpv"):
@@ -3179,6 +3188,215 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
             print(COLOR.yellow(f"[{lang}] (--play needs mpv, which isn't installed)"))
 
     return lang, out_filename, None
+
+# Settings that shape the pixels of an extracted clip, recorded in its
+# provenance sidecar. Machine-local paths, cache tuning, and preview/mpv
+# options are left out on purpose: they never change the output.
+PROVENANCE_SETTING_KEYS = (
+    "interpolate", "interpolation_engine", "interpolation_target_fps",
+    "rife_scene_detection", "rife_cadence_detection", "smooth_slow_motion",
+    "hardware_encoder", "video_codec", "video_crf", "video_preset",
+    "delogo_engine", "delogo_inpaint_fallback", "caption_detection", "caption_detection_samples",
+    "delogo_width_pad", "delogo_height_pad", "default_target_lang", "sign_lang_ref_language",
+    "show_source_lang_label", "overlay_x", "overlay_y", "overlay_fontsize", "overlay_alpha",
+    "overlay_source_label_alpha", "font_family", "font_weight_main", "font_weight_estimator",
+    "api_language", "trim_end_transition", "trim_mid_transitions", "min_transition_duration",
+)
+
+
+def _fmt_seconds(value):
+    return (f"{float(value):.3f}".rstrip("0").rstrip(".")) or "0"
+
+
+def extract_rebuild_argv(lang, book_name, chapter, verses_str, output_name, args, config):
+    """The `slverse extract` argument list that reproduces this clip: the
+    request flags actually used plus the effective interpolation choice (so
+    a later config change can't silently turn RIFE off for a rebuild)."""
+    argv = ["extract", lang, f"{book_name} {chapter}:{verses_str}", "--write", "--output", output_name]
+    window = getattr(args, "clip_window", None)
+    if window:
+        argv += ["--window", f"{_fmt_seconds(window[0])}-{_fmt_seconds(window[1])}"]
+    for flag, key in (("--trim-start", "trim_start"), ("--trim-end", "trim_end")):
+        value = getattr(args, key, None)
+        if value:
+            argv += [flag, _fmt_seconds(value)]
+    if getattr(args, "keep_end_transition", None) is True:
+        argv.append("--keep-end-transition")
+    mid = getattr(args, "trim_mid_transitions", None)
+    if mid is True:
+        argv.append("--trim-mid-transitions")
+    elif mid is False:
+        argv.append("--keep-mid-transitions")
+    for flag, key in (("--slow", "slow"), ("--fast", "fast")):
+        if getattr(args, key, None):
+            argv += [flag, *[str(t) for t in getattr(args, key)]]
+    if getattr(args, "speed", None):
+        argv += ["--speed", _fmt_seconds(args.speed)]
+    engine = effective_interpolation_engine(config)
+    argv += ["--interpolate", "--interpolation-engine", engine] if engine else ["--no-interpolate"]
+    return argv
+
+
+def write_extract_provenance(out_filename, *, lang, book_name, book_num, chapter, verses_str, valid_verses,
+                             url, checksum, start_time, end_time, args, config, edit_bits):
+    """Sidecar record of how this clip was made (see _jwkit_common's
+    provenance section): the exact request, the source file and jw.org's MD5
+    for it, the settings that shape the pixels, and the tool + interpolation
+    versions - everything `slverse rebuild` needs to re-create the clip and
+    to notice when jw.org replaced the source. Best effort: a sidecar problem
+    must never fail an extract that already produced its video."""
+    try:
+        root = Path(__file__).resolve().parent
+        engine = effective_interpolation_engine(config)
+        interpolation = None
+        if engine:
+            interpolation = {"engine": engine, "target_fps": config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"])}
+            if engine == "rife":
+                ffrife_config = ffrife_config_for(config)
+                interpolation.update({
+                    "rife_build": Path(ffrife_config.get("rife_binary_path") or "").parent.name or None,
+                    "rife_model": ffrife_config.get("rife_model"),
+                    "scene_detection": ffrife_config.get("scene_detection"),
+                    "cadence_detection": ffrife_config.get("cadence_detection"),
+                })
+        output_name = Path(out_filename).name
+        argv = extract_rebuild_argv(lang, book_name, chapter, verses_str, output_name, args, config)
+        record = {
+            "tool": "slverse",
+            "tool_commit": _jwkit_common.jwkit_commit(root),
+            "tool_url": f"{_jwkit_common.JWKIT_REPO_URL}/blob/main/slverse",
+            "request": {
+                "language": lang, "book": book_name, "book_num": book_num, "chapter": chapter,
+                "verses": verses_str, "edits": edit_bits,
+            },
+            "source": {
+                "publication": "nwt", "language": lang, "book_num": book_num, "chapter": chapter,
+                "url": url, "checksum": checksum, "checksum_algorithm": "md5",
+                "window_seconds": [round(start_time, 3), round(end_time, 3)],
+            },
+            "interpolation": interpolation,
+            "settings": {key: config[key] for key in PROVENANCE_SETTING_KEYS if key in config},
+            "rebuild": {"argv": argv, "command": "slverse " + shlex.join(argv)},
+            "advert": _jwkit_common.tool_advert("slverse"),
+        }
+        _jwkit_common.write_provenance(out_filename, record)
+    except Exception as error:  # noqa: BLE001 - see docstring
+        print(COLOR.yellow(f"(could not write the provenance sidecar for {out_filename}: {error})"))
+
+
+def refresh_index_entry(lang, book_num, chapter, data=None):
+    """Point the saved per-language index at jw.org's current file for one
+    chapter (url, checksum, verse markers), the same entry resolve_verse_window
+    backfills on a miss, so a rebuild cuts from the new source and not the
+    one the index remembered."""
+    data = data or get_pub_media_links(lang, book_num)
+    file = find_track(data, lang, chapter) if data else None
+    if not file:
+        return False
+    index = load_index(lang)
+    index[f"{book_num}_{chapter}"] = {
+        "url": file["file"]["url"], "checksum": file["file"]["checksum"],
+        "book_num": book_num, "chapter": chapter, "markers": verse_markers(file),
+    }
+    save_index(lang, index)
+    return True
+
+
+def cmd_rebuild(args, config, parser):
+    """Re-create slverse clips from their provenance sidecars, or with
+    --check just report which ones have fallen behind jw.org.
+
+    A clip is stale when jw.org now publishes a different file (MD5) for the
+    chapter it was cut from; --force rebuilds regardless (e.g. after an
+    ffrife/slverse improvement). The rebuild replays the recorded request
+    with today's code and settings, or with the recorded settings under
+    --recorded-settings, and replaces the clip in place (the old file goes
+    to the Trash unless --on-exists says otherwise)."""
+    records = []
+    for raw in args.paths:
+        path = Path(raw).expanduser()
+        found = sorted(path.rglob("*" + _jwkit_common.PROVENANCE_SUFFIX)) if path.is_dir() else [path]
+        for item in found:
+            record = _jwkit_common.read_provenance(item)
+            if record and record.get("tool") == "slverse":
+                sidecar = item if item.name.endswith(_jwkit_common.PROVENANCE_SUFFIX) else _jwkit_common.provenance_path(item)
+                records.append((sidecar.parent / record["output"]["file"], record))
+            elif not path.is_dir():
+                print(COLOR.yellow(f"{item}: no slverse provenance sidecar - cannot rebuild (rebuild it by hand once with the current slverse to create one)."))
+    if not records:
+        print("No slverse provenance sidecars found.")
+        return 1
+
+    live_sources = {}
+
+    def live_source(lang, book_num, chapter):
+        key = (lang, book_num)
+        if key not in live_sources:
+            live_sources[key] = get_pub_media_links(lang, book_num)
+        data = live_sources[key]
+        file = find_track(data, lang, chapter) if data else None
+        return (file["file"]["url"], file["file"]["checksum"]) if file else (None, None)
+
+    stale = []
+    for media, record in records:
+        request, source = record["request"], record["source"]
+        url, checksum = live_source(source["language"], source["book_num"], source["chapter"])
+        if checksum is None:
+            status = "unknown"
+        elif checksum != source.get("checksum"):
+            status = "source-updated"
+        else:
+            status = "current"
+        label = f"{request['book']} {request['chapter']}:{request['verses']} {request['language']}"
+        built = f"built {record.get('created_at', '?')[:10]} by jwkit {record.get('tool_commit', '?')}"
+        if status == "source-updated":
+            print(f"{COLOR.yellow('SOURCE UPDATED')}  {media.name}  ({label}; {built})\n    jw.org now has md5 {checksum}, clip was cut from {source.get('checksum')}")
+        elif status == "unknown":
+            print(f"{COLOR.red('UNKNOWN')}  {media.name}  ({label}) - jw.org no longer lists this chapter/language")
+        else:
+            print(f"{COLOR.green('current')}  {media.name}  ({label}; {built})")
+        if status == "source-updated" or args.force:
+            stale.append((media, record))
+
+    if args.check:
+        print(f"\n{len(stale)} of {len(records)} clip(s) need a rebuild." + ("" if stale else " Everything is current."))
+        return 1 if stale else 0
+    if not stale:
+        print("\nNothing to rebuild (use --force to rebuild current clips).")
+        return 0
+
+    status = 0
+    for media, record in stale:
+        source = record["source"]
+        refresh_index_entry(source["language"], source["book_num"], source["chapter"], live_sources.get((source["language"], source["book_num"])))
+        argv = list(record["rebuild"]["argv"])
+        argv[argv.index("--output") + 1] = str(media)
+        argv += ["--on-exists", "overwrite", "--no-auto-sync"]
+        run_args = parser.parse_args(argv)
+        run_config = dict(config)
+        if args.recorded_settings:
+            for key, value in (record.get("settings") or {}).items():
+                if key in DEFAULT_CONFIG:
+                    run_config[key] = value
+        print(f"\n{COLOR.bold('Rebuilding')} {media.name}\n  slverse {shlex.join(argv)}")
+        # The old clip is set aside, not deleted, until the replacement exists:
+        # a failed encode puts it back instead of leaving a hole in the folder.
+        backup = media.with_name(f".{media.name}.rebuild-backup")
+        if media.exists():
+            os.replace(media, backup)
+        try:
+            run_extract(run_args, run_config)
+        finally:
+            if media.exists() and media.stat().st_size > 0:
+                if backup.exists():
+                    _jwkit_common._move_to_trash(backup)
+            else:
+                status = 1
+                if backup.exists():
+                    os.replace(backup, media)
+                    print(COLOR.red(f"Rebuild of {media.name} failed - the previous clip was put back."))
+    return status
+
 
 def cmd_extract(args, config):
     any_mode = args.lang.lower() == "any"
@@ -3577,9 +3795,16 @@ def cmd_inspect(args):
     for item in info.get("chapters", []):
         title = item.get("tags", {}).get("title", "Untitled")
         print(f"Chapter {item['start_time']}–{item['end_time']}: {title}")
+    record = _jwkit_common.read_provenance(args.file)
+    if record:
+        source = record.get("source", {})
+        print(f"Provenance sidecar: {_jwkit_common.provenance_path(args.file).name}")
+        print(f"  built {record.get('created_at')} by {record.get('tool')} {record.get('tool_commit')}")
+        print(f"  source: {source.get('url')} (md5 {source.get('checksum')})")
+        print(f"  rebuild: {record.get('rebuild', {}).get('command')}")
 
 # --- Main ---
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         description="slverse - JW Sign Language Video Tool",
         epilog="Nearly all behavior is configurable - see 'slverse config list' or docs/slverse.md.",
@@ -3682,6 +3907,34 @@ def main():
     p_bulk.add_argument("--preset", help="FFmpeg encoder preset for this run (e.g. slow, medium, fast)")
     add_generic_config_overrides(p_bulk)
 
+    p_rebuild = subparsers.add_parser("rebuild", help="Re-create clips from their provenance sidecars; --check reports which sources jw.org has replaced")
+    p_rebuild.add_argument("paths", nargs="+", help="slverse-made media files, their .jwkit.json sidecars, or folders to search recursively")
+    p_rebuild.add_argument("--check", action="store_true", help="Only report which clips are out of date (exit 1 if any are); change nothing")
+    p_rebuild.add_argument("--force", action="store_true", help="Rebuild every clip found, not just those whose source jw.org replaced")
+    p_rebuild.add_argument("--recorded-settings", action="store_true", help="Rebuild with the settings recorded in each sidecar instead of today's configuration")
+    return parser
+
+
+def prepare_extract(args, config):
+    """Apply an `extract` invocation's per-run overrides to `config` (shared
+    by the CLI and `rebuild`)."""
+    for arg_name, config_key in (("encoder", "hardware_encoder"), ("codec", "video_codec"), ("crf", "video_crf"), ("preset", "video_preset")):
+        value = getattr(args, arg_name)
+        if value is not None:
+            config[config_key] = value
+    if args.output:
+        args.write = True
+    apply_interpolation_overrides(args, config)
+
+
+def run_extract(args, config):
+    prepare_extract(args, config)
+    maybe_auto_sync(args, config)
+    cmd_extract(args, config)
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
     config = load_config()
@@ -3714,15 +3967,11 @@ def main():
     elif args.command == "sync":
         cmd_sync(args, config)
     elif args.command == "extract":
-        for arg_name, config_key in (("encoder", "hardware_encoder"), ("codec", "video_codec"), ("crf", "video_crf"), ("preset", "video_preset")):
-            value = getattr(args, arg_name)
-            if value is not None:
-                config[config_key] = value
-        if args.output:
-            args.write = True
-        apply_interpolation_overrides(args, config)
-        maybe_auto_sync(args, config)
-        cmd_extract(args, config)
+        run_extract(args, config)
+    elif args.command == "rebuild":
+        status = cmd_rebuild(args, config, parser)
+        if status:
+            raise SystemExit(status)
     elif args.command == "find":
         maybe_auto_sync(args, config)
         cmd_find(args, config)
