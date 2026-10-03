@@ -1629,3 +1629,31 @@ class CoverArtPreservedThroughMuxTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StreamLanguageTagTest(unittest.TestCase):
+    """ffmpeg's mov muxer drops a two-letter language code and writes 'und',
+    so English/Tagalog audio and subtitle tracks in an mp4 lost their
+    language. mp4 output must translate to ISO 639-2; Matroska keeps the
+    code as given."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mux = load_script_module("jwvideo-mux")
+
+    def test_mp4_translates_two_letter_codes(self) -> None:
+        self.assertEqual(self.mux.stream_language_tag("en", "mp4"), "eng")
+        self.assertEqual(self.mux.stream_language_tag("tl", "mp4"), "tgl")
+
+    def test_three_letter_codes_pass_through_in_mp4(self) -> None:
+        for code in ("ceb", "hil", "war", "psp"):
+            self.assertEqual(self.mux.stream_language_tag(code, "mp4"), code)
+
+    def test_matroska_keeps_the_code_as_given(self) -> None:
+        self.assertEqual(self.mux.stream_language_tag("en", "mkv"), "en")
+
+    def test_every_two_letter_jw_language_has_a_translation(self) -> None:
+        import json
+        langs = json.loads((Path(__file__).resolve().parents[1] / "jwlangs.json").read_text())
+        missing = sorted(iso for iso, _ in langs.values() if len(iso) == 2 and iso not in self.mux.ISO639_1_TO_2)
+        self.assertEqual(missing, [])

@@ -136,6 +136,30 @@ def update_and_load_langs() -> dict:
 
 _LOADED_LANGUAGES = None
 
+# MP4/MOV stores a stream's language as a packed three-letter ISO 639-2 code;
+# ffmpeg's mov muxer silently drops a two-letter one (English "en", Tagalog
+# "tl", ...) and writes "und". jw.org's language list mixes both lengths, so
+# mp4 output translates two-letter codes. Matroska accepts either as-is.
+ISO639_1_TO_2 = dict(pair.split(":") for pair in (
+    "ab:abk af:afr am:amh ar:ara as:asm av:ava ay:aym az:aze ba:bak be:bel bg:bul bi:bis bm:bam bn:ben bo:bod bs:bos "
+    "ce:che ch:cha co:cos cs:ces cv:chv cy:cym da:dan de:deu ee:ewe el:ell en:eng es:spa et:est eu:eus fa:fas fi:fin "
+    "fj:fij fo:fao fr:fra fy:fry ga:gle gd:gla gl:glg gu:guj ha:hau he:heb hi:hin ho:hmo hr:hrv ht:hat hu:hun hy:hye "
+    "hz:her id:ind ig:ibo is:isl it:ita iu:iku ja:jpn jv:jav ka:kat kg:kon ki:kik kj:kua kk:kaz kl:kal km:khm kn:kan "
+    "ko:kor ky:kir lb:ltz lg:lug ln:lin lo:lao lt:lit lu:lub lv:lav mg:mlg mh:mah mi:mri mk:mkd ml:mal mn:mon mr:mar "
+    "ms:msa mt:mlt my:mya nd:nde ne:nep ng:ndo nl:nld no:nor nr:nbl nv:nav ny:nya om:orm or:ori os:oss pa:pan pl:pol "
+    "ps:pus pt:por qu:que ro:ron ru:rus rw:kin se:sme sg:sag si:sin sk:slk sl:slv sm:smo sn:sna so:som sq:sqi ss:ssw "
+    "st:sot su:sun sv:swe sw:swa ta:tam te:tel tg:tgk th:tha ti:tir tk:tuk tl:tgl tn:tsn to:ton tr:tur ts:tso tt:tat "
+    "tw:twi ty:tah uk:ukr ur:urd ve:ven vi:vie wo:wol xh:xho yo:yor zu:zul".split()))
+
+
+def stream_language_tag(iso: str, container: str) -> str:
+    """The language tag to write for a stream in `container`."""
+    iso = (iso or "").lower()
+    if container == "mp4" and len(iso) == 2:
+        return ISO639_1_TO_2.get(iso, iso)
+    return iso
+
+
 def get_lang_meta(code: str) -> tuple[str, str]:
     global _LOADED_LANGUAGES
     if _LOADED_LANGUAGES is None:
@@ -2168,7 +2192,7 @@ def main():
         
         ff_maps.extend(["-map", f"{idx}:v:0"])
         ff_meta.extend([
-            f"-metadata:s:v:{video_stream_idx}", f"language={iso}",
+            f"-metadata:s:v:{video_stream_idx}", f"language={stream_language_tag(iso, args.container)}",
             f"-metadata:s:v:{video_stream_idx}", f"title={title}"
         ])
         if (args.default_video and args.default_video.upper() == lang) or (not args.default_video and video_stream_idx == 0):
@@ -2191,7 +2215,7 @@ def main():
         
         ff_maps.extend(["-map", f"{idx}:a:0?"])
         ff_meta.extend([
-            f"-metadata:s:a:{audio_stream_idx}", f"language={iso}",
+            f"-metadata:s:a:{audio_stream_idx}", f"language={stream_language_tag(iso, args.container)}",
             f"-metadata:s:a:{audio_stream_idx}", f"title={title}"
         ])
         if (args.default_audio and args.default_audio.upper() == lang) or (not args.default_audio and audio_stream_idx == 0):
@@ -2207,7 +2231,7 @@ def main():
             
             ff_maps.extend(["-map", f"{idx}:s"])
             ff_meta.extend([
-                f"-metadata:s:s:{subtitle_stream_idx}", f"language={iso}",
+                f"-metadata:s:s:{subtitle_stream_idx}", f"language={stream_language_tag(iso, args.container)}",
                 f"-metadata:s:s:{subtitle_stream_idx}", f"title={title}"
             ])
             if args.container == "mp4":
