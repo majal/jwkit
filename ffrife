@@ -99,7 +99,7 @@ COLOR = _jwkit_common.Colorizer(False)
 DEFAULT_CONFIG = {
     "rife_binary_path": "",
     "rife_fallback_engine": "none",  # none, framerate, minterpolate
-    "rife_model": "rife-v4.6",  # must be an arbitrary-timestep-capable model (rife-v4 or rife-v4.6) - interpolate() always passes an explicit -n/-m to hit an exact target fps, and older models (v2.x/v3.x/HD/UHD/anime) reject that with "only rife-v4 model support custom numframe and timestep"
+    "rife_model": "rife-v4.6",  # a model directory beside rife_binary_path that supports exact -n/-s (rife-v4.x); newer v4.7-v4.26 models need a build of the TNTwise fork (see docs/ffrife.md)
     "hardware_encoder": "cpu",  # cpu, videotoolbox, nvenc, qsv - see jwsl's detect_hardware_encoder for why cpu is the default
     "video_codec": "av1",  # h264, hevc, av1 - falls back to hevc then h264 automatically if unavailable, see _jwkit_common.build_encode_args
     "video_crf": "auto",  # h264=20, hevc=23, av1=30 unless overridden
@@ -136,6 +136,7 @@ DEFAULT_CONFIG = {
     "scene_revert_fraction": "0.5",  # neighbor magnitude vs. spike's own size to count as isolated
     "scene_histogram_check": "true",  # colour-histogram second opinion rescuing cuts the pixel test misses
     "scene_histogram_floor": "0.15",  # histogram distance a rescued cut must clear (above ordinary motion's ~0.135 99.9th pct)
+    "duplicate_frame_repair": "true",  # re-synthesize repeated (dropped-and-duplicated) frames inside motion before interpolating
     "gradual_transition_detection": "false",  # off: interpolating through a dissolve beats holding it at source rate
     "transition_blend_tolerance": "0.25",  # max blend-fit residual (vs. endpoint change) for a run to count as a dissolve
     "transition_min_duration": "0.25",  # seconds of baseline lookback, not a minimum run length
@@ -157,7 +158,7 @@ DEFAULT_CONFIG = {
 CONFIG_HELP = {
     "rife_binary_path": "Path to the rife-ncnn-vulkan executable (set by 'ffrife setup')",
     "rife_fallback_engine": "none, framerate, or minterpolate - what to do when RIFE isn't installed/configured",
-    "rife_model": "RIFE model directory name; must support custom -n/-m (rife-v4 or rife-v4.6)",
+    "rife_model": "RIFE model directory name beside the binary; rife-v4.x (v4.7+ need a TNTwise-fork build, see docs)",
     "hardware_encoder": "cpu, videotoolbox, nvenc, or qsv",
     "video_codec": "h264, hevc, or av1 - falls back down the tier automatically if unavailable",
     "video_crf": "Encode quality (lower = higher quality/larger file); auto uses the codec's own default",
@@ -190,6 +191,7 @@ CONFIG_HELP = {
     "scene_revert_fraction": "How much a neighboring frame's motion must fall relative to a spike's own size to still count it as an isolated cut",
     "scene_histogram_check": "Second-opinion colour-histogram test that rescues cuts the pixel test misses (low-contrast, partial-frame, or busy-motion cuts)",
     "scene_histogram_floor": "Histogram distance (0-1) a cut rescued by the histogram check must clear",
+    "duplicate_frame_repair": "Re-synthesize frames the source repeated in the middle of motion (a dropped frame filled with a copy) so the output doesn't stall then jump",
     "gradual_transition_detection": "Also detect verified fades/dissolves and hold them at source rate instead of interpolating",
     "transition_blend_tolerance": "Largest residual (relative to the endpoint change) a candidate run may leave when fitted as a cross-fade of its endpoints",
     "transition_min_duration": "Seconds of baseline lookback used to judge a gradual transition (not a minimum transition length)",
@@ -479,6 +481,8 @@ def build_encode_args(config, notice=True):
 #                            pacing_shared_duty: paused and resumed within
 #                            every second, because priority alone gives the
 #                            GPU no headroom - there is no GPU "nice"
+#   another app busy on GPU  same headroom as a person, judged from the GPU
+#                            utilization counter read while RIFE is paused
 #   thermal pressure         RIFE capped harder (moderate 60%, heavy 25%);
 #                            from the OS's own thermal-pressure signal, or,
 #                            where the OS gives none, from this run's RIFE
@@ -495,6 +499,11 @@ PACING_HEAT_DUTY = {1: 0.6, 2: 0.25}  # duty cap per thermal pressure level
 PACING_SAG_RATIO = 0.7  # throughput below this share of baseline reads as heat...
 PACING_SAG_SECONDS = 60.0  # ...once it has lasted this long at full duty
 PACING_SAG_BACKOFF = 120.0  # seconds to ease off before probing full speed again
+PACING_GPU_BUSY = 40.0  # other apps' average GPU utilization (%) that counts as sharing the GPU
+PACING_GPU_PROBE_EVERY = 60.0  # seconds between brief probe pauses while RIFE runs at full speed
+PACING_GPU_SETTLE = 0.6  # seconds a paused RIFE needs before the utilization counter shows only others
+                         # before the first reading; the counter is a sliding average that under steady
+                         # duty-cycling still shows RIFE's own work (~95%) at 0.6s and 0 by ~0.9s (M3)
 _PACING = {"mode": "adaptive", "idle_seconds": 120.0, "shared_duty": 0.5, "background_priority": True,
            "rife_tta": "none"}
 _PACING_ANNOUNCED = [None]  # last (reason, share) printed, shared by every governed process
@@ -594,15 +603,47 @@ def thermal_pressure():
     return None
 
 
-def pacing_decision(idle_seconds, pressure, sagging, settings=None):
+def gpu_utilization():
+    """Whole-GPU utilization in percent right now (every process, RIFE
+    included - the governor reads it while RIFE is paused), or None where
+    the platform doesn't expose one."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            out = subprocess.run(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            values = [int(v) for v in re.findall(r'"Device Utilization %"=(\d+)', out)]
+            return float(max(values)) if values else None
+        if system == "Linux":
+            busy = [int(p.read_text()) for p in Path("/sys/class/drm").glob("card*/device/gpu_busy_percent")]
+            if busy:
+                return float(max(busy))
+            if shutil.which("nvidia-smi"):
+                out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                                     capture_output=True, text=True, timeout=5).stdout.split()
+                return float(max(int(v) for v in out)) if out else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return None
+
+
+def pacing_decision(idle_seconds, pressure, sagging, settings=None, gpu_busy=False):
     """Pure policy: (duty, background, reason) for one sample. `duty` is the
-    share of each slice RIFE may run; `background` lowers CPU/IO priority."""
+    share of each slice RIFE may run; `background` lowers CPU/IO priority.
+    `gpu_busy` means other apps are keeping the GPU busy (see
+    PacingGovernor), which earns them the same headroom a person at the
+    keyboard gets - a game, another render, or a video call needs the GPU
+    even when nobody is typing."""
     settings = settings or _PACING
-    shared = idle_seconds is not None and idle_seconds < settings["idle_seconds"]
+    user = idle_seconds is not None and idle_seconds < settings["idle_seconds"]
+    shared = user or gpu_busy
     duty, reasons = 1.0, []
     if shared:
         duty = settings["shared_duty"]
-        reasons.append("someone is using this machine")
+        if user:
+            reasons.append("someone is using this machine")
+        if gpu_busy:
+            reasons.append("another app is using the GPU")
     heat = pressure if pressure is not None else (1 if sagging else 0)
     if heat:
         duty = min(duty, PACING_HEAT_DUTY[min(2, heat)])
@@ -704,6 +745,14 @@ class PacingGovernor:
         baseline = 0.0
         sag_since = backoff_until = None
         next_sample = 0.0
+        # Other apps' GPU use, read only while RIFE is paused (the counter
+        # covers every process): a scheduled probe pauses RIFE for under a
+        # second once a minute (~1.5% of throughput), long enough for its own
+        # queued GPU work to drain. Short duty-cycle pauses are not used -
+        # they still read RIFE's own backlog and would pin it down forever.
+        gpu_samples = collections.deque(maxlen=3)  # (time, utilization %)
+        gpu_supported = self.duty_cycle and gpu_utilization() is not None
+        next_gpu_probe = time.monotonic() + PACING_GPU_PROBE_EVERY
         while not self._stop.is_set() and self.proc.poll() is None:
             now = time.monotonic()
             if now >= next_sample:
@@ -725,13 +774,42 @@ class PacingGovernor:
                         backoff_until, sag_since = now + PACING_SAG_BACKOFF, None
                         rates.clear()
                     sagging = backoff_until is not None and now < backoff_until
-                duty, background, reason = pacing_decision(user_idle_seconds(), pressure, sagging)
+                # Readings expire, so a stale "busy" can never pin RIFE down
+                # after the other app has gone.
+                while gpu_samples and now - gpu_samples[0][0] > 2 * PACING_GPU_PROBE_EVERY:
+                    gpu_samples.popleft()
+                gpu_busy = (len(gpu_samples) >= 2
+                            and sum(v for _, v in gpu_samples) / len(gpu_samples) >= PACING_GPU_BUSY)
+                duty, background, reason = pacing_decision(user_idle_seconds(), pressure, sagging, gpu_busy=gpu_busy)
                 if not self.duty_cycle:
                     duty = 1.0
                 self._announce(duty, background, reason)
                 if background != self.background:
                     _set_background_priority(self.proc, background)
                 self.duty, self.background, self.reason = duty, background, reason
+            if gpu_supported and time.monotonic() >= next_gpu_probe:
+                # Scheduled probe, at any duty: pause, let RIFE's own work
+                # drain, and read what everyone else is using.
+                next_gpu_probe = time.monotonic() + PACING_GPU_PROBE_EVERY
+                self._pause()
+                if not self._stop.wait(PACING_GPU_SETTLE):
+                    # The counter is a sliding average that still carries
+                    # RIFE's own last burst for a while, so take the lowest of
+                    # a few readings, stopping as soon as one is clearly low:
+                    # a sustained competitor stays high in all of them.
+                    lowest = None
+                    for attempt in range(3):
+                        reading = gpu_utilization()
+                        if reading is not None:
+                            lowest = reading if lowest is None else min(lowest, reading)
+                        if lowest is not None and lowest < PACING_GPU_BUSY:
+                            break
+                        if attempt < 2 and self._stop.wait(0.25):
+                            break
+                    if lowest is not None:
+                        gpu_samples.append((time.monotonic(), lowest))
+                self._resume()
+                continue
             if self.duty >= 1:
                 self._resume()
                 self._stop.wait(min(PACING_SLICE, max(0.05, next_sample - time.monotonic())))
@@ -1927,7 +2005,8 @@ def rife_timestep_convention(rife_path, model_path=None):
         print(f"Note: {binary.name} places interpolated frames on an end-aligned grid; adjusting cut handling to match.")
     try:
         RIFE_TIMESTEP_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        _write_json_atomic(RIFE_TIMESTEP_CACHE, {key: convention})
+        cache[key] = convention  # keep other binaries'/models' entries
+        _write_json_atomic(RIFE_TIMESTEP_CACHE, cache)
     except OSError:
         pass
     return convention
@@ -2011,6 +2090,14 @@ HISTOGRAM_MIN_PIXEL_SHARE = 0.4
 BLEND_MONOTONIC_SLACK = 0.15
 # Smallest share of the minority shot some middle frame must carry.
 BLEND_MIN_MIX = 0.15
+# Duplicate-frame repair: a step this small (mean absolute change of the
+# 32x18 rendition) is a repeated frame - a re-encoded duplicate measures
+# well under it - but only counts when real motion surrounds it on both
+# sides (a still scene repeats frames legitimately), and only for runs of
+# at most DUPLICATE_MAX_REPEATS repeats: longer holds are freeze frames.
+DUPLICATE_STILL = 0.0015
+DUPLICATE_MOTION = 0.003  # still scenes measure under ~0.002; a false hit there is harmless anyway
+DUPLICATE_MAX_REPEATS = 2
 
 
 def _detection_frame_stream(input_args, pre_vf):
@@ -2106,7 +2193,7 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
                         revert_fraction=0.5, min_duration=0.25,
                         sensitivity=1.35, alignment=0.80, detect_gradual=False,
                         histogram_check=True, histogram_floor=0.15, blend_tolerance=0.25,
-                        input_args=None, pre_vf=None, stats=None):
+                        input_args=None, pre_vf=None, stats=None, detect_duplicates=False):
     """Single-pass detection of hard cuts and (optionally) gradual transitions.
 
     `input_args` overrides the default "read the extracted PNG sequence in
@@ -2158,7 +2245,10 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
     fades/dissolves; ``frame_count`` is how many frames this pass actually
     saw, which windowed extraction uses as the clip's authoritative source
     frame count. A ``stats`` dict, when given, receives
-    ``histogram_rescued`` and ``gradual_candidates`` counts.
+    ``histogram_rescued`` and ``gradual_candidates`` counts, and - with
+    ``detect_duplicates`` - ``duplicate_runs``: zero-based ``(b, c)`` pairs
+    where frames b+1..c-1 repeat frame b inside motion and c is the next
+    real frame (see repair_duplicate_frames).
     """
     size = _detection_frame_bytes()
     minimum = max(3, round(float(min_duration) * float(source_fps)))
@@ -2251,6 +2341,13 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
     for start_frame, end_frame in transitions:
         protected.update(range(start_frame, end_frame + 1))
 
+    # The step out of a repeated-frame run spans the dropped frames' motion
+    # too, right after a zero step - so it looks like an isolated spike to
+    # both cut tests. Judge it per frame of motion, against the motion
+    # before the run, so a dropped frame isn't mistaken for a cut.
+    duplicate_runs = _find_duplicate_runs(magnitudes, set()) if detect_duplicates else []
+    after_repeat = {nxt: (nxt - first, first) for first, nxt in duplicate_runs}
+
     cuts = []
     rescued = 0
     for index in range(len(magnitudes)):
@@ -2260,6 +2357,10 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
         magnitude = magnitudes[index]
         previous_magnitude = magnitudes[index - 1] if index >= 1 else 0.0
         next_magnitude = magnitudes[index + 1] if index + 1 < len(magnitudes) else 0.0
+        span, run_start = after_repeat.get(frame_index, (1, None))
+        if run_start is not None:
+            magnitude /= span
+            previous_magnitude = magnitudes[run_start - 1]
         baseline = baseline_at(index) if index >= 1 else magnitude
         pixel_cut = (magnitude >= max(float(cut_floor), baseline * float(cut_sensitivity))
                      and cosines.get(index, 0.0) < float(alignment)
@@ -2270,8 +2371,9 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
             continue
         if not histogram_check:
             continue
-        distance = hist_distances[index]
-        previous_distance = hist_distances[index - 1] if index >= 1 else 0.0
+        distance = hist_distances[index] / span
+        previous_distance = (hist_distances[run_start - 1] if run_start is not None
+                             else hist_distances[index - 1] if index >= 1 else 0.0)
         next_distance = hist_distances[index + 1] if index + 1 < len(hist_distances) else 0.0
         if (distance >= float(histogram_floor)
                 and previous_distance * HISTOGRAM_ISOLATION <= distance
@@ -2283,7 +2385,31 @@ def detect_transitions(in_frames, source_fps, cut_sensitivity=3.0, cut_floor=0.0
     if stats is not None:
         stats["histogram_rescued"] = rescued
         stats["gradual_candidates"] = candidate_count
+        if detect_duplicates:
+            boundaries = set(cuts) | protected
+            stats["duplicate_runs"] = [(first, nxt) for first, nxt in duplicate_runs
+                                       if nxt not in boundaries and first + 1 not in protected]
     return sorted(set(cuts)), transitions, frame_count
+
+
+def _find_duplicate_runs(magnitudes, boundaries):
+    """(b, c) runs of repeated frames inside motion - see DUPLICATE_STILL.
+    magnitudes[i] is the change from frame i to frame i + 1."""
+    runs = []
+    index = 1
+    while index < len(magnitudes):
+        if magnitudes[index] >= DUPLICATE_STILL or magnitudes[index - 1] < DUPLICATE_MOTION:
+            index += 1
+            continue
+        first = index  # frame `first` is the last real frame; first+1 repeats it
+        while index < len(magnitudes) and magnitudes[index] < DUPLICATE_STILL:
+            index += 1
+        repeats = index - first
+        nxt = index + 1  # first real frame after the repeats
+        if (index < len(magnitudes) and repeats <= DUPLICATE_MAX_REPEATS
+                and magnitudes[index] >= DUPLICATE_MOTION and nxt not in boundaries):
+            runs.append((first, nxt))
+    return runs
 
 def parse_transition_ranges(value, source_fps, input_count):
     ranges = []
@@ -2337,7 +2463,10 @@ def _chunk_ranges(frame_count, chunk_frames):
     return ranges
 
 def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config, input_args=None, pre_vf=None):
-    """Returns (cuts, transition_count, frame_count): cuts is a sorted,
+    """Returns (cuts, transition_count, frame_count, duplicates). `duplicates`
+    lists the repeated-frame runs repair_duplicate_frames should fix (empty
+    unless duplicate_frame_repair is on); the pass runs whenever scene
+    detection or duplicate repair is enabled. cuts is a sorted,
     deduped list of global zero-based "boundary" frame indices - frames
     that must not be interpolated *into* from the frame before them
     (detected hard cuts, plus every step inside a verified dissolve or an
@@ -2352,16 +2481,21 @@ def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config, input_
     `frame_count` is what that pass actually saw (None when detection is
     off), which windowed extraction needs as the clip's real source frame
     count."""
-    if not (config_bool(config, "scene_detection", True) and input_frame_count > 1):
-        return None, 0, None
+    scenes = config_bool(config, "scene_detection", True)
+    repair = config_bool(config, "duplicate_frame_repair", True)
+    if not ((scenes or repair) and input_frame_count > 1):
+        return None, 0, None, []
     scene_threshold = config_float(config, "scene_threshold", 3.0)
     if scene_threshold <= 0:
         raise ValueError("scene_threshold must be greater than 0")
     explicit_transitions = parse_transition_ranges(config.get("transition_ranges", ""), source_fps, input_frame_count)
     gradual = config_bool(config, "gradual_transition_detection", False)
     histogram = config_bool(config, "scene_histogram_check", True)
-    print(f"Detecting scene cuts{' and dissolves' if gradual else ''} (sensitivity={scene_threshold:g}"
-          f"{', histogram check' if histogram else ''})...")
+    if scenes:
+        print(f"Detecting scene cuts{' and dissolves' if gradual else ''} (sensitivity={scene_threshold:g}"
+              f"{', histogram check' if histogram else ''})...")
+    else:
+        print("Scanning for repeated frames...")
     stats = {}
     cuts, transitions, frame_count = detect_transitions(
         in_frames, source_fps,
@@ -2375,8 +2509,14 @@ def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config, input_
         histogram_check=histogram,
         histogram_floor=config_float(config, "scene_histogram_floor", 0.15),
         blend_tolerance=config_float(config, "transition_blend_tolerance", 0.25),
-        input_args=input_args, pre_vf=pre_vf, stats=stats,
+        input_args=input_args, pre_vf=pre_vf, stats=stats, detect_duplicates=repair,
     )
+    duplicates = stats.get("duplicate_runs", [])
+    if duplicates:
+        print(f"Repeated frames: {sum(c - b - 1 for b, c in duplicates)} in {len(duplicates)} run(s) inside motion "
+              f"- they will be re-synthesized before interpolation.")
+    if not scenes:
+        return None, 0, frame_count, duplicates
     summary = f"Scene detection: {len(cuts)} hard cut(s)"
     if histogram:
         summary += f" ({stats.get('histogram_rescued', 0)} found by the histogram check)"
@@ -2388,7 +2528,45 @@ def _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config, input_
     transitions = list(explicit_transitions) + transitions
     for start_frame, end_frame in transitions:
         cuts.extend(range(start_frame + 1, end_frame + 1))
-    return sorted(set(cuts)), len(transitions), frame_count
+    return sorted(set(cuts)), len(transitions), frame_count, duplicates
+
+
+def repair_duplicate_frames(rife_path, model_path, frames_dir, runs, convention="start", offset=0):
+    """Replace each run's repeated frames with RIFE's estimate of the frames
+    the source dropped: in a run (b, c), frame b + j becomes RIFE(b, c, j/d)
+    for d = c - b. Afterwards the main pass interpolates an evenly-timed
+    sequence again, instead of stalling on the repeat and then jumping.
+
+    Runs with the same d are batched into one RIFE call: a directory of
+    (b, c) pairs rendered on a grid of step 1/d puts output 2*q*d + j at
+    exactly pair q's timestep j/d (the outputs between pairs are discarded).
+    `frames_dir`/`offset` locate global frame i at
+    ``frames_dir / f"{i + 1 - offset:08d}.png"``. Returns frames repaired."""
+    frames_dir = Path(frames_dir)
+    by_span = collections.defaultdict(list)
+    for first, nxt in runs:
+        by_span[nxt - first].append((first, nxt))
+    repaired = 0
+    for span, group in sorted(by_span.items()):
+        with tempfile.TemporaryDirectory(prefix="ffrife-repair-") as tmp_dir:
+            pair_in, pair_out = Path(tmp_dir) / "in", Path(tmp_dir) / "out"
+            pair_in.mkdir()
+            pair_out.mkdir()
+            for q, (first, nxt) in enumerate(group):
+                _link_or_copy(frames_dir / f"{first + 1 - offset:08d}.png", pair_in / f"{2 * q + 1:08d}.png")
+                _link_or_copy(frames_dir / f"{nxt + 1 - offset:08d}.png", pair_in / f"{2 * q + 2:08d}.png")
+            inputs = 2 * len(group)
+            request = inputs * span if convention != "endpoint" else (inputs - 1) * span + 1
+            run_rife(rife_path, pair_in, pair_out, target_count=request, model_path=model_path)
+            for q, (first, _nxt) in enumerate(group):
+                for j in range(1, span):
+                    estimate = pair_out / f"{2 * q * span + j + 1:08d}.png"
+                    target = frames_dir / f"{first + j + 1 - offset:08d}.png"
+                    if estimate.exists():
+                        target.unlink(missing_ok=True)
+                        shutil.copy2(estimate, target)
+                        repaired += 1
+    return repaired
 
 # Floor for the decode-check timeout, plus the deliberately pessimistic
 # decode rate the rest of it is scaled from. A timeout here is read as
@@ -2563,7 +2741,7 @@ def _file_digest(path):
 
 
 def _render_one_chunk(rife_path, provider, chunk, chunk_in, chunk_out, model_path, config, boundaries,
-                      convention, label):
+                      convention, label, duplicates=()):
     """Materialize one RenderChunk's source frames, render its RIFE outputs
     into `chunk_out`, and hold its boundary-crossing frames. Returns how
     many outputs were held. `chunk_in` is left in place: under windowed
@@ -2574,6 +2752,12 @@ def _render_one_chunk(rife_path, provider, chunk, chunk_in, chunk_out, model_pat
     Path(chunk_in).mkdir(parents=True)
     Path(chunk_out).mkdir(parents=True)
     source_dir, source_offset = provider.materialize(chunk.start, chunk.end, chunk_in)
+    # Windowed extraction repairs repeated frames per chunk (full extraction
+    # already repaired them in place). Only runs whose repaired frames sit
+    # strictly inside the chunk - never on a seam frame a neighbour shares.
+    local = [(b, c) for b, c in duplicates if b >= chunk.start and c <= chunk.end - 1]
+    if local:
+        repair_duplicate_frames(rife_path, model_path, chunk_in, local, convention, offset=chunk.start)
     if not chunk.request:
         return 0
     if chunk.end - chunk.start < 2 or chunk.request < 2:
@@ -2594,7 +2778,7 @@ def _kept_chunk_frames(chunk_out, chunk):
 
 
 def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_path, config, state_path,
-                         cuts=None, input_count=None, encode=None, convention="start"):
+                         cuts=None, input_count=None, encode=None, convention="start", duplicates=()):
     """Run RIFE over `in_frames` in resumable chunks (see docs/ffrife.md).
 
     Chunks come from plan_render_chunks, which snaps seams onto `cuts` (the
@@ -2679,7 +2863,8 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
                     continue
                 print(f"Resume data for chunk {index + 1} is incomplete; rebuilding it.")
             held_total += _render_one_chunk(rife_path, provider, chunk, chunk_in, chunk_out, model_path, config,
-                                            boundaries, convention, f"RIFE chunk {index + 1}/{len(chunks)}")
+                                            boundaries, convention, f"RIFE chunk {index + 1}/{len(chunks)}",
+                                            duplicates)
             shutil.rmtree(chunk_in, ignore_errors=True)
             _write_json_atomic(marker, {"request": chunk.request})
             completed.add(str(index))
@@ -2752,7 +2937,8 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
             continue  # only ever set once that chunk's segment was finalized - see above
         chunk_in, chunk_out, _ = chunk_dirs(index)
         held_total += _render_one_chunk(rife_path, provider, chunk, chunk_in, chunk_out, model_path, config,
-                                        boundaries, convention, f"RIFE chunk {index + 1}/{len(chunks)}")
+                                        boundaries, convention, f"RIFE chunk {index + 1}/{len(chunks)}",
+                                        duplicates)
         shutil.rmtree(chunk_in, ignore_errors=True)
         pending_batch.append(index)
         if len(pending_batch) >= segment_chunks or index + 1 == len(chunks):
@@ -2874,8 +3060,10 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         target_count = round(input_frame_count * fps / source_fps / speed_factor)
         model_path = Path(rife_path).parent / config.get("rife_model", DEFAULT_CONFIG["rife_model"])
         _check_disk_space(frames_root, in_frames, target_count, config)
-        cuts, _, _ = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
+        cuts, _, _, duplicates = _resolve_scene_cuts(in_frames, source_fps, input_frame_count, config)
         convention = rife_timestep_convention(rife_path, model_path)
+        if duplicates:
+            repair_duplicate_frames(rife_path, model_path, in_frames, duplicates, convention)
         chunk = plan_render_chunks(input_frame_count, target_count, 0, convention=convention)[0]
         shutil.rmtree(out_frames, ignore_errors=True)
         out_frames.mkdir(parents=True)
@@ -2946,7 +3134,7 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         and resolve the cuts each chunk will need, returning
         (provider, cuts, transition_count, input_frame_count)."""
         if plan.extraction == "windowed":
-            cuts, transition_count, counted = _resolve_scene_cuts(
+            cuts, transition_count, counted, duplicates = _resolve_scene_cuts(
                 in_frames, source_fps, estimated_count, config,
                 input_args=source_input_args, pre_vf=vf)
             # Detection already decoded the whole clip, so it knows the real
@@ -2954,18 +3142,24 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
             # to pay for a separate counting pass.
             count = counted or count_decoded_frames(source_input_args, vf)
             provider = WindowedFrameProvider(source, count, source_fps, window_start=start or 0.0, vf=vf)
-            return provider, cuts, transition_count, count
+            return provider, cuts, transition_count, count, duplicates
         count = _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration)
         if count == 0:
-            return None, None, 0, 0
+            return None, None, 0, 0, []
         # Cuts must be known before any chunk runs: chunk seams snap onto
         # them, and each chunk holds its own boundary frames as soon as it's
         # generated - see _render_rife_chunks.
-        cuts, transition_count, _ = _resolve_scene_cuts(in_frames, source_fps, count, config)
-        return FullFrameProvider(in_frames, count), cuts, transition_count, count
+        cuts, transition_count, _, duplicates = _resolve_scene_cuts(in_frames, source_fps, count, config)
+        if duplicates:
+            # Repaired in place once, so every chunk (and a resumed run,
+            # whose detection pass then finds nothing left to repair) sees it.
+            repair_duplicate_frames(rife_path, model_path, in_frames, duplicates,
+                                    rife_timestep_convention(rife_path, model_path))
+            duplicates = []
+        return FullFrameProvider(in_frames, count), cuts, transition_count, count, duplicates
 
     def _execute(plan):
-        provider, cuts, transition_count, input_frame_count = _prepare(plan)
+        provider, cuts, transition_count, input_frame_count, duplicates = _prepare(plan)
         if provider is None:
             print("No frames extracted - nothing to interpolate.")
             return None
@@ -2994,7 +3188,8 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         convention = rife_timestep_convention(rife_path, model_path)
         if not final.stream:
             _render_rife_chunks(rife_path, provider, out_frames, target_count, model_path, run_config,
-                                frames_root / "rife-state.json", cuts=cuts, convention=convention)
+                                frames_root / "rife-state.json", cuts=cuts, convention=convention,
+                                duplicates=duplicates)
             return out_frames, fps, retimed_duration(duration, speed)
 
         encode = {"segment_chunks": final.segment_chunks, "fps": fps,
@@ -3002,7 +3197,7 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
         segments = _render_rife_chunks(rife_path, provider, out_frames, target_count, model_path, run_config,
                                        frames_root / "rife-state.json",
                                        cuts=cuts, input_count=input_frame_count, encode=encode,
-                                       convention=convention)
+                                       convention=convention, duplicates=duplicates)
         _concat_video_segments(segments, joined_video)
         return joined_video, fps, retimed_duration(duration, speed)
 
@@ -3146,7 +3341,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
     # Every detection setting changes which frames get held, so any of them
     # changing must start fresh work rather than reuse held chunks.
     options.update({key: config.get(key) for key in DEFAULT_CONFIG
-                    if key.startswith(("scene_", "transition_", "gradual_"))})
+                    if key.startswith(("scene_", "transition_", "gradual_", "duplicate_"))})
     signature = _job_signature(source, output_file, options)
     durable = config_bool(config, "resume", False)
     work_path = _work_dir_for(output_file, signature, config) if durable else Path(tempfile.mkdtemp(prefix="ffrife-"))
@@ -3420,7 +3615,7 @@ def cmd_config(args, config):
 GENERIC_OVERRIDE_EXCLUDED_KEYS = {"rife_fallback_engine", "hardware_encoder", "video_codec", "video_crf", "video_preset",
                                   "rife_profile", "rife_gpu", "rife_threads", "chunk_frames", "cooldown_seconds",
                                   "resume", "keep_work", "scene_detection", "gradual_transition_detection", "scene_histogram_check",
-                                  "pacing", "rife_tta", "pacing_background_priority",
+                                  "pacing", "rife_tta", "pacing_background_priority", "duplicate_frame_repair",
                                   "container", "keep_subtitles", "keep_chapters", "keep_extra_audio_tracks",
                                   "keep_attachments", "keep_thumbnail", "keep_source_metadata", "space_check",
                                   "stream_segment_chunks", "pipeline_mode", "disk_budget_fraction", "extraction_mode"}
@@ -3521,7 +3716,7 @@ def apply_run_overrides(args, config):
         config["gradual_transition_detection"] = args.gradual_transition_detection
     if getattr(args, "scene_histogram_check", None) is not None:
         config["scene_histogram_check"] = args.scene_histogram_check
-    for key in ("pacing", "rife_tta", "pacing_background_priority"):
+    for key in ("pacing", "rife_tta", "pacing_background_priority", "duplicate_frame_repair"):
         if getattr(args, key, None) is not None:
             config[key] = getattr(args, key)
     for key in EXTRAS_OVERRIDE_KEYS:
@@ -3604,6 +3799,9 @@ def add_processing_arguments(parser, include_trim=True):
     add_bool_flag(parser, "pacing_background_priority", "background-priority",
                  help_on="Lower RIFE/ffmpeg priority while someone works or under heat (default)",
                  help_off="Keep normal priority; adaptive pacing still duty-cycles RIFE")
+    add_bool_flag(parser, "duplicate_frame_repair", "duplicate-frame-repair",
+                 help_on="Re-synthesize repeated frames inside motion before interpolating (default)",
+                 help_off="Interpolate repeated frames as they are")
     add_bool_flag(parser, "scene_histogram_check", "scene-histogram-check",
                  help_on="Rescue cuts the pixel test misses with a colour-histogram second opinion (default)",
                  help_off="Use the pixel-change cut test alone")

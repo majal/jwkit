@@ -381,7 +381,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         self.assertNotIn("-c:a", cmd)  # -af and -c:a copy are mutually exclusive for the audio stream
 
     def test_trim_uses_duration_and_reencodes_zero_based_audio(self) -> None:
-        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false", "duplicate_frame_repair": "false"}
         ffmpeg_calls = []
         subprocess_calls = []
 
@@ -433,7 +433,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         self.assertNotIn("-vf", cmd)
 
     def test_output_filter_is_applied_only_in_the_final_encode(self) -> None:
-        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false", "duplicate_frame_repair": "false"}
         calls = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
@@ -458,7 +458,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         # RIFE installed/configured -> the PNG-extract-then-RIFE-then-merge
         # path. RIFE should generate the retimed count directly, without a
         # setpts filter that would duplicate frames in the merge.
-        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false", "duplicate_frame_repair": "false"}
         calls = []
         target_counts = []
 
@@ -490,7 +490,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
     def test_rife_target_count_matches_a_non_2x_ratio(self) -> None:
         # 24fps source -> 60fps target is a 2.5x ratio, not RIFE's implicit
         # 2x default - target_count has to be computed explicitly.
-        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false", "duplicate_frame_repair": "false"}
         rife_calls = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
@@ -516,7 +516,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
 
     def test_rife_model_path_derives_from_rife_binary_directory(self) -> None:
         config = {"rife_binary_path": "/fake/bin/rife-ncnn-vulkan", "rife_model": "rife-v4.6",
-                  "scene_detection": "false"}
+                  "scene_detection": "false", "duplicate_frame_repair": "false"}
         rife_calls = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
@@ -798,7 +798,7 @@ class FfrifeLongRunTest(unittest.TestCase):
 
     def test_render_rife_frames_reuses_complete_extraction_on_resume(self) -> None:
         config = {"rife_binary_path": "/fake/rife", "chunk_frames": "0",
-                  "scene_detection": "false"}
+                  "scene_detection": "false", "duplicate_frame_repair": "false"}
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             incoming = root / "in"
@@ -822,7 +822,7 @@ class FfrifeLongRunTest(unittest.TestCase):
 
     def test_render_rife_frames_reextracts_incomplete_checkpoint(self) -> None:
         config = {"rife_binary_path": "/fake/rife", "chunk_frames": "0",
-                  "scene_detection": "false"}
+                  "scene_detection": "false", "duplicate_frame_repair": "false"}
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             incoming = root / "in"
@@ -859,7 +859,7 @@ class FfrifeLongRunTest(unittest.TestCase):
         # to plain pixel_scale - the fps/speed contribution itself is pinned
         # separately by test_render_rife_frames_scales_threshold_by_speed.
         config = {"rife_binary_path": "/fake/rife", "chunk_frames": "auto", "cooldown_seconds": "auto",
-                  "rife_threads": "auto", "scene_detection": "false"}
+                  "rife_threads": "auto", "scene_detection": "false", "duplicate_frame_repair": "false"}
         captured = {}
 
         def fake_resolve_rife_policy(cfg, frame_count, workload_scale=1.0):
@@ -892,7 +892,7 @@ class FfrifeLongRunTest(unittest.TestCase):
         # the same input/resolution - workload_scale must pick that up too,
         # not just resolution (test above) or a plain fps upscale ratio.
         config = {"rife_binary_path": "/fake/rife", "chunk_frames": "auto", "cooldown_seconds": "auto",
-                  "rife_threads": "auto", "scene_detection": "false"}
+                  "rife_threads": "auto", "scene_detection": "false", "duplicate_frame_repair": "false"}
         captured = {}
 
         def fake_resolve_rife_policy(cfg, frame_count, workload_scale=1.0):
@@ -1227,7 +1227,7 @@ class FfrifeInterpolateFpsResolutionTest(unittest.TestCase):
         cls.ffrife = load_script_module("ffrife")
 
     def test_relative_fps_spec_probes_source_and_resolves_before_rife(self) -> None:
-        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false"}
+        config = {"rife_binary_path": "/fake/rife", "scene_detection": "false", "duplicate_frame_repair": "false"}
         rife_calls = []
 
         def fake_run_ffmpeg(cmd, duration=None, label="Encoding"):
@@ -1719,6 +1719,26 @@ class FfrifePacingTest(unittest.TestCase):
         self.assertEqual(duty, 0.6)
         self.assertIn("sagging", reason)
 
+    def test_another_app_on_the_gpu_gets_headroom_too(self) -> None:
+        duty, background, reason = self.ffrife.pacing_decision(600, 0, False, self.settings(), gpu_busy=True)
+        self.assertEqual((duty, background), (0.5, True))
+        self.assertIn("another app is using the GPU", reason)
+
+    def test_timestep_cache_keeps_every_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "cache.json"
+            binaries = []
+            for name in ("one", "two"):
+                binary = Path(td) / name
+                binary.write_text(name)
+                binaries.append(binary)
+            with patch.object(self.ffrife, "RIFE_TIMESTEP_CACHE", cache), \
+                 patch.object(self.ffrife, "_probe_rife_timestep_convention", return_value="start"):
+                for binary in binaries:
+                    self.ffrife.rife_timestep_convention(binary, "rife-v4.6")
+            import json
+            self.assertEqual(len(json.loads(cache.read_text())), 2)
+
     def test_profile_rest_is_replaced_but_explicit_rests_stay(self) -> None:
         rest = self.ffrife.fixed_rest_seconds
         config = dict(self.ffrife.DEFAULT_CONFIG, rife_profile="balanced")
@@ -1786,6 +1806,68 @@ class FfrifePacingTest(unittest.TestCase):
         finally:
             child.kill()
             child.wait()
+
+
+class FfrifeDuplicateRepairTest(unittest.TestCase):
+    """Repeated frames inside motion (a dropped frame filled with a copy) are
+    re-synthesized before interpolation - see repair_duplicate_frames."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def test_finds_repeats_inside_motion_only(self) -> None:
+        find = self.ffrife._find_duplicate_runs
+        # frame 3 repeats frame 2 while things move on both sides
+        self.assertEqual(find([0.02, 0.02, 0.0005, 0.04, 0.02], set()), [(2, 4)])
+        self.assertEqual(find([0.02, 0.02, 0.0, 0.0, 0.06, 0.02], set()), [(2, 5)])  # two repeats
+        self.assertEqual(find([0.0, 0.0, 0.0, 0.0], set()), [])  # still scene
+        self.assertEqual(find([0.02, 0.0, 0.0, 0.0, 0.08], set()), [])  # 3 repeats: a freeze frame
+        self.assertEqual(find([0.02, 0.02, 0.0005, 0.04, 0.02], {4}), [])  # cut right after it
+
+    def test_detector_reports_a_dropped_frame_and_not_a_cut(self) -> None:
+        # 10, 20, 30, [30 repeated], 50, 60, ...: the jump out of the repeat
+        # is two frames of motion after a zero step - it must not read as a
+        # cut (which would block the repair and add a hold).
+        # Textured (gradient) frames: flat single-colour frames would jump a
+        # whole histogram bin per step, which real footage never does.
+        def ramp(offset):
+            hist = bytes((x * 4 + offset) % 256 for _ in range(36) for x in range(64) for _ in range(3))
+            row = bytes((x * 8 + offset) % 256 for x in range(32) for _ in range(3)) + bytes(32 * 3)
+            return hist + row * 18
+
+        values = [10, 20, 30, 30, 50, 60, 70, 80, 90]
+        frames = [ramp(v) for v in values]
+        with patch.object(self.ffrife.subprocess, "Popen", return_value=detection_stream(frames)):
+            stats = {}
+            cuts, _, _ = self.ffrife.detect_transitions("frames", source_fps=24, stats=stats, detect_duplicates=True)
+        self.assertEqual(cuts, [])
+        self.assertEqual(stats["duplicate_runs"], [(2, 4)])
+
+    def test_repair_replaces_repeats_with_the_right_timesteps(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            frames = Path(td) / "frames"
+            frames.mkdir()
+            for index in range(12):
+                (frames / f"{index + 1:08d}.png").write_text(f"src:{index}")
+
+            def fake_rife(_binary, pair_in, pair_out, target_count, **_kwargs):
+                sources = [p.read_text().split(":")[1] for p in sorted(Path(pair_in).glob("*.png"))]
+                for k in range(target_count):
+                    fx = self.ffrife.rife_position(k, len(sources), target_count)
+                    x0 = min(int(fx), len(sources) - 1)
+                    t = fx - int(fx)
+                    label = f"blend:{sources[x0]}:{sources[min(x0 + 1, len(sources) - 1)]}:{float(t):.3f}"
+                    (Path(pair_out) / f"{k + 1:08d}.png").write_text(label)
+
+            with patch.object(self.ffrife, "run_rife", fake_rife):
+                repaired = self.ffrife.repair_duplicate_frames("rife", "model", frames, [(1, 3), (5, 8), (9, 11)])
+            self.assertEqual(repaired, 4)
+            self.assertEqual((frames / "00000003.png").read_text(), "blend:1:3:0.500")
+            self.assertEqual((frames / "00000007.png").read_text(), "blend:5:8:0.333")
+            self.assertEqual((frames / "00000008.png").read_text(), "blend:5:8:0.667")
+            self.assertEqual((frames / "00000011.png").read_text(), "blend:9:11:0.500")
+            self.assertEqual((frames / "00000004.png").read_text(), "src:3")  # real frames untouched
 
 
 class FfrifeDetectionInputTest(unittest.TestCase):
@@ -2052,7 +2134,7 @@ class FfrifeStreamingEncodeTest(unittest.TestCase):
 
     def test_interpolate_streams_multiple_segments_and_delivers_output(self) -> None:
         config = {"rife_binary_path": "/fake/rife", "chunk_frames": "3", "stream_segment_chunks": "1",
-                  "cooldown_seconds": "0", "scene_detection": "false"}
+                  "cooldown_seconds": "0", "scene_detection": "false", "duplicate_frame_repair": "false"}
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             output = root / "out.mkv"
