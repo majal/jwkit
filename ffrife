@@ -4286,56 +4286,42 @@ PROVENANCE_CONFIG_KEYS = (
     "scene_histogram_floor", "duplicate_frame_repair", "cadence_detection", "gradual_transition_detection",
     "transition_ranges", "container",
 )
-_JW_MEDIA_NAME = re.compile(r"^(?:\d+(?:-opt)?\s+)?(?:.*?\s-\s)?(?P<pub>[A-Za-z0-9-]+)_(?P<lang>[A-Z]+)_(?P<track>\d+)_r(?P<res>\d+)P\b")
+_JW_MEDIA_NAME = _jwkit_common.JW_MEDIA_NAME
 
 
 def write_run_provenance(source, output, config, start=None, end=None, vf=None, fps=None, speed=None, jwkit_config=None):
     """Provenance record (embedded in the output by default, see
     _jwkit_common's provenance section) recording how a standalone ffrife
-    output was made: the source's name,
-    size and MD5 (jw.org publishes MD5s, so a later check can tell whether it
-    replaced the source), the window/fps/speed/filter, the settings that shape
-    the pixels, and the jwkit commit and RIFE build. Best effort - never fails
-    a run whose video already exists. Skipped for URL inputs."""
-    jwkit_config = jwkit_config if jwkit_config is not None else _jwkit_common.load_jwkit_config()
-    try:
-        source_path = Path(str(source))
-        if not source_path.is_file() or not Path(str(output)).is_file():
-            return
-        argv = ["run", str(source_path)]
-        if start is not None:
-            argv += ["--start", f"{start:.3f}".rstrip("0").rstrip(".")]
-        if end is not None:
-            argv += ["--end", f"{end:.3f}".rstrip("0").rstrip(".")]
-        if fps is not None and str(fps) != "60":
-            argv += ["--fps", str(fps)]
-        if speed:
-            argv += ["--speed", str(speed)]
-        if vf:
-            argv += ["--vf", str(vf)]
-        argv += ["-o", Path(str(output)).name]
-        named = _JW_MEDIA_NAME.match(source_path.name)
-        rife_path = config.get("rife_binary_path") or ""
-        record = {
-            "tool": "ffrife",
-            "tool_commit": _jwkit_common.jwkit_commit(Path(__file__).resolve().parent),
-            "tool_url": f"{_jwkit_common.JWKIT_REPO_URL}/blob/main/ffrife",
-            "source": {
-                "file": source_path.name, "path": str(source_path.resolve()),
-                "size": source_path.stat().st_size,
-                "checksum": _jwkit_common.file_digest(source_path, "md5"), "checksum_algorithm": "md5",
-                "jw_org": ({"publication": named["pub"], "language": named["lang"], "track": int(named["track"]), "resolution": f"{named['res']}p"} if named else None),
-                "window_seconds": [start, end] if start is not None or end is not None else None,
-            },
-            "interpolation": {"engine": "rife", "target_fps": str(fps if fps is not None else 60), "speed": speed, "filter": vf,
-                              "rife_build": Path(rife_path).parent.name or None},
-            "settings": {key: config[key] for key in PROVENANCE_CONFIG_KEYS if key in config},
-            "rebuild": {"argv": argv, "command": "ffrife " + " ".join(shlex.quote(a) for a in argv)},
-            "advert": _jwkit_common.tool_advert("ffrife"),
-        }
-        _jwkit_common.write_provenance(output, record, jwkit_config, ffmpeg=FFMPEG_BIN)
-    except Exception as exc:  # noqa: BLE001 - see docstring
-        print(f"(could not record provenance for {output}: {exc})", file=sys.stderr)
+    output was made: the source's name, size and MD5 (jw.org publishes MD5s,
+    so a later check can tell whether it replaced the source), the
+    window/fps/speed/filter, the settings that shape the pixels, and the
+    jwkit commit and RIFE build. Best effort - never fails a run whose video
+    already exists. Skipped for URL inputs."""
+    source_path = Path(str(source))
+    if not source_path.is_file():
+        return
+    argv = ["run", str(source_path.resolve())]
+    if start is not None:
+        argv += ["--start", f"{start:.3f}".rstrip("0").rstrip(".")]
+    if end is not None:
+        argv += ["--end", f"{end:.3f}".rstrip("0").rstrip(".")]
+    if fps is not None and str(fps) != "60":
+        argv += ["--fps", str(fps)]
+    if speed:
+        argv += ["--speed", str(speed)]
+    if vf:
+        argv += ["--vf", str(vf)]
+    argv += ["-o", Path(str(output)).name]
+    rife_path = config.get("rife_binary_path") or ""
+    entry = _jwkit_common.describe_file(source_path, jwkit_config, FFPROBE_BIN)
+    entry["window_seconds"] = [start, end] if start is not None or end is not None else None
+    _jwkit_common.record_output(
+        output, "ffrife", Path(__file__).resolve().parent, argv, jwkit_config, ffmpeg=FFMPEG_BIN, ffprobe=FFPROBE_BIN,
+        source=entry,
+        interpolation={"engine": "rife", "target_fps": str(fps if fps is not None else 60), "speed": speed, "filter": vf,
+                       "rife_build": Path(rife_path).parent.name or None},
+        settings={key: config[key] for key in PROVENANCE_CONFIG_KEYS if key in config},
+    )
 
 
 def main():

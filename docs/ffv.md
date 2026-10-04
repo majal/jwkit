@@ -43,6 +43,8 @@ In particular, `ffv ... -e TIME` passes `-e` through as `slverse extract --trim-
 - `ffv config ...` delegates to `slverse config ...`, including `path`, `edit`, `reset`, `diff`, and `check`.
 - Configuration belongs to `slverse`, so the launcher cannot drift into a second set of defaults.
 
+- `ffv rebuild ...` and `ffv provenance ...` delegate to `slverse rebuild` / `slverse provenance` (re-create clips from their recorded provenance; move records between embedded/beside/folder storage).
+
 ## Notes / Caveats
 
 This launcher intentionally does not reproduce the original local-video-cache implementation. `slverse` uses JW.org verse-marker metadata and is the sole maintained extraction engine.

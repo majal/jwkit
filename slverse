@@ -3267,28 +3267,19 @@ def write_extract_provenance(out_filename, *, lang, book_name, book_num, chapter
                 })
         output_name = Path(out_filename).name
         argv = extract_rebuild_argv(lang, book_name, chapter, verses_str, output_name, args, config)
-        record = {
-            "tool": "slverse",
-            "tool_commit": _jwkit_common.jwkit_commit(root),
-            "tool_url": f"{_jwkit_common.JWKIT_REPO_URL}/blob/main/slverse",
-            "request": {
-                "language": lang, "book": book_name, "book_num": book_num, "chapter": chapter,
-                "verses": verses_str, "edits": edit_bits,
-            },
-            "source": {
+        previous = _REBUILD_PREVIOUS.pop(str(Path(out_filename).resolve()), None)
+        _jwkit_common.record_output(
+            out_filename, "slverse", root, argv, jwkit_config, args, ffmpeg=FFMPEG_BIN, ffprobe=FFPROBE_BIN, previous=previous,
+            warn=lambda text: print(COLOR.yellow(text)),
+            request={"language": lang, "book": book_name, "book_num": book_num, "chapter": chapter, "verses": verses_str, "edits": edit_bits},
+            source={
                 "publication": "nwt", "language": lang, "book_num": book_num, "chapter": chapter,
                 "url": url, "checksum": checksum, "checksum_algorithm": "md5",
                 "window_seconds": [round(start_time, 3), round(end_time, 3)],
             },
-            "interpolation": interpolation,
-            "settings": {key: config[key] for key in PROVENANCE_SETTING_KEYS if key in config},
-            "rebuild": {"argv": argv, "command": "slverse " + shlex.join(argv)},
-            "advert": _jwkit_common.tool_advert("slverse"),
-        }
-        jwkit_config = dict(jwkit_config) if jwkit_config is not None else _jwkit_common.load_jwkit_config()
-        _jwkit_common.apply_provenance_overrides(jwkit_config, args)
-        previous = _REBUILD_PREVIOUS.pop(str(Path(out_filename).resolve()), None)
-        _jwkit_common.write_provenance(out_filename, record, jwkit_config, ffmpeg=FFMPEG_BIN, previous=previous)
+            interpolation=interpolation,
+            settings={key: config[key] for key in PROVENANCE_SETTING_KEYS if key in config},
+        )
     except Exception as error:  # noqa: BLE001 - see docstring
         print(COLOR.yellow(f"(could not record provenance for {out_filename}: {error})"))
 
@@ -3314,25 +3305,14 @@ def refresh_index_entry(lang, book_num, chapter, data=None):
 def cmd_provenance(args):
     """Move provenance records between storage places (see _jwkit_common's
     provenance section) - e.g. fold existing .jwkit.json sidecars into the
-    videos. Works on any jwkit tool's records."""
+    videos. Works on any jwkit tool's records (also: `jwkit-provenance move`)."""
     jwkit_config = _jwkit_common.apply_provenance_overrides(_jwkit_common.load_jwkit_config(), args)
     mode = args.to or _jwkit_common.provenance_settings(jwkit_config)[0]
     if mode == "none":
         print(COLOR.yellow("provenance_mode is none - pass --to embed, beside or folder."))
         return 1
-    counts = {}
-    for media in _jwkit_common.iter_media_files(args.paths):
-        if not media.is_file():
-            print(COLOR.yellow(f"{media}: media file not found"))
-            continue
-        status, _ = _jwkit_common.relocate_provenance(media, mode, jwkit_config, ffmpeg=FFMPEG_BIN, ffprobe=FFPROBE_BIN, force=args.force, dry_run=args.dry_run)
-        counts[status] = counts.get(status, 0) + 1
-        label = {"moved": COLOR.green("moved"), "already": "already there", "none": "no record", "changed": COLOR.yellow("file changed since it was recorded (use --force)"),
-                 "failed": COLOR.red("FAILED"), "would move": "would move"}[status]
-        if status != "already":
-            print(f"{label}  {media}")
-    print("\n" + ", ".join(f"{count} {status}" for status, count in sorted(counts.items())) if counts else "No media files found.")
-    return 1 if counts.get("failed") or counts.get("changed") else 0
+    return _jwkit_common.move_provenance(args.paths, mode, jwkit_config, ffmpeg=FFMPEG_BIN, ffprobe=FFPROBE_BIN,
+                                         force=args.force, dry_run=args.dry_run, color=COLOR)
 
 
 def cmd_rebuild(args, config, parser):
@@ -3832,11 +3812,7 @@ def cmd_inspect(args):
         print(f"Chapter {item['start_time']}–{item['end_time']}: {title}")
     record, where = _jwkit_common.locate_provenance(args.file, ffprobe=FFPROBE_BIN)
     if record:
-        source = record.get("source", {})
-        print("Provenance: " + ("embedded in the file" if where == "embedded" else f"sidecar {where}"))
-        print(f"  built {record.get('created_at')} by {record.get('tool')} {record.get('tool_commit')}")
-        print(f"  source: {source.get('url')} (md5 {source.get('checksum')})")
-        print(f"  rebuild: {record.get('rebuild', {}).get('command')}")
+        print("\n".join(_jwkit_common.describe_provenance(record, where)))
 
 # --- Main ---
 def build_parser():

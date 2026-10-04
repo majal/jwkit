@@ -17,6 +17,7 @@ Each tool below has its own section covering what it does, what it needs, and th
   - [`ffrife`](#ffrife)
   - [`ffv`](#ffv)
   - [`jwdl`](#jwdl)
+  - [`jwkit-provenance`](#jwkit-provenance)
   - [`jwpl`](#jwpl)
   - [`jwvideo-mux`](#jwvideo-mux)
   - [`register-jwplay-launcher`](#register-jwplay-launcher)
@@ -29,7 +30,7 @@ Each tool below has its own section covering what it does, what it needs, and th
 
 ## Quick Install
 
-One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `ffv`, `jwdl`, `jwpl`, `ffinpaint`, `ffrife`, `jwvideo-mux`, and `register-jwplay-launcher` just work. No manual downloads, no separate setup steps.
+One command sets everything up: Python, `ffmpeg`, and jwkit itself, added to your terminal's `PATH` so `slverse`, `ffv`, `jwdl`, `jwpl`, `ffinpaint`, `ffrife`, `jwvideo-mux`, `jwkit-provenance`, and `register-jwplay-launcher` just work. No manual downloads, no separate setup steps.
 
 Every configurable tool uses TOML under `~/.config/jwkit/<tool>/config.toml`
 and the same management commands: `config list|get|set|path|edit|reset|diff|check`.
@@ -115,6 +116,14 @@ Full docs: [docs/ffv.md](docs/ffv.md)
 `jwdl` downloads JW music, periodicals, and videos from jw.org, one folder per collection.
 
 Full docs: [docs/jwdl.md](docs/jwdl.md)
+
+[↑ TOC](#table-of-contents)
+
+### [`jwkit-provenance`](./jwkit-provenance)
+
+`jwkit-provenance` is the "how was this file made?" record every jwkit tool leaves inside the video or audio it writes (command, inputs with their MD5s, settings, tool commit). It records, shows, verifies and moves those records, and scripts in other repos call it to get the same.
+
+Full docs: [docs/jwkit-provenance.md](docs/jwkit-provenance.md)
 
 [↑ TOC](#table-of-contents)
 

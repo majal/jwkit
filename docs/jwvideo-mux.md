@@ -250,6 +250,8 @@ Persistent mux preferences live in `~/.config/jwkit/jwvideo-mux/config.toml`. Us
   need to ask again.
 - In an `.mp4` export the language of each video, audio, and subtitle stream is written as a three-letter ISO 639-2 code (`eng`, `tgl`, `ceb`, ...). jw.org's language list mixes two- and three-letter codes, and ffmpeg's mov muxer silently turns a two-letter code into `und`, which used to leave English and Tagalog tracks unlabeled. Matroska keeps jw.org's code as given.
 
+- Every merged output (and every `--single-streams` file) gets a provenance record (see [jwkit-provenance](jwkit-provenance.md); embedded in the file by default - for an MKV, a native `jwkit_provenance` tag, with the cover art and timing untouched - and `--provenance beside|folder|none` / `--provenance-dir` for one run). It lists every input with its role (`video:FSL`, `audio:E`, `subtitle:E`, `cover-art`), name, size, MD5, jw.org URL when it was downloaded, and - when an input carries a record of its own, like an `ffrife` render - who made it and how; plus the languages, settings, and a `jwvideo-mux ...` command that repeats the run. In local-file mode every non-base language is pinned to its exact file (`-v FSL,E=/path/to/E.mp4`), so the command doesn't depend on what else sits in the folder.
+
 ## Notes / Caveats
 
 - JW Library currently plays all audio tracks simultaneously when given a multi-audio MP4 file. To avoid this when using JW Library, use the `--single-streams` flag.

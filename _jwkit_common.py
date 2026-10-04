@@ -1101,7 +1101,11 @@ def resolve_output_conflict(path, jwkit_config=None):
 #           from the video. MP4/MOV/M4V get a self-describing top-level `uuid`
 #           box appended after the media data (no remux, nothing else in the
 #           file changes; every player skips unknown boxes). Matroska/WebM get
-#           a native global tag, `jwkit_provenance`, via a stream-copy remux.
+#           a native global tag, `jwkit_provenance`, via a stream-copy remux;
+#           MP3/FLAC/Ogg/Opus get the same tag (an ID3 TXXX frame / a Vorbis
+#           comment). Every remux is verified (packet hash, duration, stream
+#           layout) before it replaces the file. Other containers (AVI, WAV,
+#           TS, images, ...) fall back to `beside`.
 #           Why not ffmpeg's `-movflags +use_metadata_tags`: it moves *all* MP4
 #           tags into the `mdta` namespace, which hides the title/comment in
 #           Finder/QuickTime/AVFoundation.
@@ -1131,7 +1135,8 @@ PROVENANCE_BOX_UUID = uuid.uuid5(uuid.NAMESPACE_URL, JWKIT_REPO_URL + "/provenan
 _COMPRESSED_PREFIX = "jwkit-z1:"
 _ISO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".m4a"}
 _MATROSKA_EXTENSIONS = {".mkv", ".mka", ".webm"}
-MEDIA_EXTENSIONS = tuple(sorted((_ISO_EXTENSIONS - {".m4a"}) | {".mkv", ".webm"}))
+_TAG_EXTENSIONS = {".mp3", ".flac", ".ogg", ".oga", ".opus"}
+MEDIA_EXTENSIONS = tuple(sorted(_ISO_EXTENSIONS | _MATROSKA_EXTENSIONS | _TAG_EXTENSIONS))
 _COMMIT_CACHE = {}
 
 
@@ -1270,6 +1275,7 @@ def _iso_write_record(path, text):
                 try:
                     handle.write(new_box)
                     handle.flush()
+                    os.fsync(handle.fileno())
                 except OSError:
                     handle.truncate(size)
                     raise
@@ -1308,41 +1314,77 @@ class _limited:
         return data
 
 
-# -- Matroska / WebM: a global tag ------------------------------------------
+# -- Matroska / WebM / tag-capable audio: a global tag ------------------------
 
-def _matroska_tag(path, ffprobe=None):
-    try:
-        result = subprocess.run(
-            [ffprobe or shutil.which("ffprobe") or "ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=120)
-        tags = json.loads(result.stdout or "{}").get("format", {}).get("tags", {})
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    for key, value in tags.items():
-        if key.lower() == PROVENANCE_TAG:
-            return value
+def _ffmpeg_bin(ffmpeg):
+    return ffmpeg or shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _ffprobe_bin(ffprobe):
+    return ffprobe or shutil.which("ffprobe") or "ffprobe"
+
+
+def container_kind(path):
+    """How `path` can carry an embedded record: "iso" (MP4 family: a uuid
+    box), "matroska" (Matroska/WebM: a global tag, cover art preserved),
+    "tags" (audio containers with free-form tags: MP3/FLAC/Ogg/Opus), or None
+    (anything else, e.g. AVI/WAV/TS/images - those get a sidecar)."""
+    suffix = Path(path).suffix.lower()
+    if suffix in _ISO_EXTENSIONS:
+        return "iso"
+    if suffix in _MATROSKA_EXTENSIONS:
+        return "matroska"
+    if suffix in _TAG_EXTENSIONS:
+        return "tags"
     return None
 
 
-def _matroska_streams(path, ffprobe=None):
+def _probe_json(path, ffprobe=None, *args):
+    result = subprocess.run([_ffprobe_bin(ffprobe), "-v", "error", *args, "-of", "json", str(path)],
+                            capture_output=True, text=True, timeout=300)
+    return json.loads(result.stdout or "{}")
+
+
+def _tag_text(path, ffprobe=None):
+    """The embedded tag's text. Vorbis comments (Ogg/Opus) surface as stream
+    tags rather than format tags, so both are searched."""
+    try:
+        info = _probe_json(path, ffprobe, "-show_entries", "format_tags:stream_tags")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    candidates = [info.get("format", {}).get("tags", {})] + [stream.get("tags", {}) for stream in info.get("streams", [])]
+    for tags in candidates:
+        for key, value in (tags or {}).items():
+            if key.lower() == PROVENANCE_TAG:
+                return value
+    return None
+
+
+def _stream_layout(path, ffprobe=None):
     """(format duration, sorted per-stream signature, attached-picture streams)
-    for a Matroska file: what a faithful remux must leave unchanged."""
-    result = subprocess.run(
-        [ffprobe or shutil.which("ffprobe") or "ffprobe", "-v", "error", "-show_entries",
-         "format=duration:stream=index,codec_type,codec_name,start_time:stream_disposition=attached_pic:stream_tags",
-         "-of", "json", str(path)], capture_output=True, text=True, timeout=120)
-    info = json.loads(result.stdout or "{}")
+    for a file: what a faithful stream-copy remux must leave unchanged."""
+    info = _probe_json(path, ffprobe, "-show_entries",
+                       "format=duration:stream=index,codec_type,codec_name,start_time:stream_disposition=attached_pic:stream_tags")
     streams, pictures = [], []
     for stream in info.get("streams", []):
         tags = {key.lower(): value for key, value in (stream.get("tags") or {}).items()}
         attached = bool((stream.get("disposition") or {}).get("attached_pic"))
-        streams.append((stream.get("codec_type"), stream.get("codec_name"), stream.get("start_time"), attached))
+        start = stream.get("start_time")
+        streams.append((stream.get("codec_type"), stream.get("codec_name"), f"{float(start):.3f}" if start not in (None, "N/A") else None, attached))
         if attached:
             pictures.append((stream["index"], tags.get("filename") or "cover", tags.get("mimetype") or "image/png"))
-    return info.get("format", {}).get("duration"), sorted(streams, key=str), pictures
+    duration = info.get("format", {}).get("duration")
+    return (float(duration) if duration not in (None, "N/A") else None), sorted(streams, key=str), pictures
 
 
-def _matroska_write_tag(path, text, ffmpeg=None, ffprobe=None, verify=True):
+def _layouts_match(before, after):
+    (d1, s1, _), (d2, s2, _) = before, after
+    if s1 != s2:
+        return False
+    return d1 is None or d2 is None or abs(d1 - d2) <= 0.02
+
+
+def _remux_write_tag(path, text, ffmpeg=None, ffprobe=None, verify=True):
     """Stream-copy remux that sets (text) or clears (None) the global tag.
 
     ffmpeg's defaults aren't a faithful copy of a Matroska file, so this
@@ -1350,13 +1392,15 @@ def _matroska_write_tag(path, text, ffmpeg=None, ffprobe=None, verify=True):
     an attached picture (cover art, which `-map 0` would turn into a plain
     video track) is pulled out and re-attached with `-attach`, the way
     jwvideo-mux wrote it. Unless verify=False, the audio/video packet hash,
-    duration and per-stream signature must match the original or nothing is
+    duration and per-stream layout must match the original or nothing is
     replaced."""
     path = Path(path)
-    ffmpeg = ffmpeg or shutil.which("ffmpeg") or "ffmpeg"
+    ffmpeg = _ffmpeg_bin(ffmpeg)
+    matroska = container_kind(path) == "matroska"
     tmp = path.with_name(f"{path.stem}.jwkit-tmp{path.suffix}")
     before = media_packets_digest(path, ffmpeg)
-    duration, signature, pictures = _matroska_streams(path, ffprobe)
+    layout = _stream_layout(path, ffprobe)
+    pictures = layout[2] if matroska else []
     scratch = Path(tempfile.mkdtemp(prefix="jwkit-art-"))
     try:
         command = [ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(path)]
@@ -1371,19 +1415,168 @@ def _matroska_write_tag(path, text, ffmpeg=None, ffprobe=None, verify=True):
             maps += ["-map", f"-0:{index}"]
             extras += [f"-metadata:s:t:{number}", f"mimetype={mime}", f"-metadata:s:t:{number}", f"filename={filename}"]
         command += maps + ["-c", "copy", "-avoid_negative_ts", "disabled", "-map_metadata", "0", "-map_chapters", "0"] + extras
-        command += ["-metadata", f"{PROVENANCE_TAG}={text or ''}", str(tmp)]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
+        command += ["-metadata", f"{PROVENANCE_TAG}={text or ''}"]
+        if container_kind(path) == "tags":  # Vorbis comments live on the stream: a stale copy there would win over the new global tag
+            command += ["-metadata:s:a:0", f"{PROVENANCE_TAG}={text or ''}"]
+        command.append(str(tmp))
+        result = subprocess.run(command, capture_output=True, text=True, timeout=7200)
         if result.returncode != 0 or not tmp.exists():
             raise RuntimeError((result.stderr or "ffmpeg remux failed").strip().splitlines()[-1])
         if verify:
             if before is not None and media_packets_digest(tmp, ffmpeg) != before:
                 raise RuntimeError("remuxed streams differ from the original")
-            if _matroska_streams(tmp, ffprobe)[:2] != (duration, signature):
+            if not _layouts_match(layout, _stream_layout(tmp, ffprobe)):
                 raise RuntimeError("remuxed duration or stream layout differs from the original")
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _embedded_text(path, ffprobe=None):
+    kind = container_kind(path)
+    if kind == "iso":
+        return _iso_find_record(path)
+    if kind in ("matroska", "tags"):
+        return _tag_text(path, ffprobe)
+    return None
+
+
+def _embed_text(path, text, ffmpeg=None, ffprobe=None):
+    """Write (text) or clear (None) the embedded record; ValueError if the
+    container can't carry one."""
+    kind = container_kind(path)
+    if kind == "iso":
+        _iso_write_record(path, text)
+    elif kind in ("matroska", "tags"):
+        _remux_write_tag(path, text, ffmpeg, ffprobe)
+    else:
+        raise ValueError(f"{Path(path).suffix or 'this'} container can't carry an embedded record")
+
+
+# -- what a record says about the output -------------------------------------
+
+_ENVIRONMENT_CACHE = {}
+
+
+def environment_info(ffmpeg=None):
+    """Versions that shaped the output: ffmpeg, OS, Python (no hostnames)."""
+    ffmpeg = _ffmpeg_bin(ffmpeg)
+    if ffmpeg not in _ENVIRONMENT_CACHE:
+        version = None
+        try:
+            first = subprocess.run([ffmpeg, "-version"], capture_output=True, text=True, timeout=30).stdout.splitlines()[0]
+            version = first.split()[2] if first.startswith("ffmpeg version") else first
+        except (OSError, subprocess.SubprocessError, IndexError):
+            pass
+        _ENVIRONMENT_CACHE[ffmpeg] = {"ffmpeg": version, "platform": f"{platform.system()} {platform.release()} {platform.machine()}",
+                                      "python": platform.python_version()}
+    return dict(_ENVIRONMENT_CACHE[ffmpeg])
+
+
+def media_summary(path, ffprobe=None):
+    """Compact description of a media file: format, duration, and each stream."""
+    try:
+        info = _probe_json(path, ffprobe, "-show_entries",
+                           "format=format_name,duration,bit_rate:stream=codec_type,codec_name,width,height,avg_frame_rate,channels,sample_rate:stream_tags=language,title")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+    summary = {}
+    fmt = info.get("format", {})
+    if fmt.get("format_name"):
+        summary["format"] = fmt["format_name"]
+    if fmt.get("duration") not in (None, "N/A"):
+        summary["duration"] = round(float(fmt["duration"]), 3)
+    streams = []
+    for stream in info.get("streams", []):
+        item = {"type": stream.get("codec_type"), "codec": stream.get("codec_name")}
+        tags = {key.lower(): value for key, value in (stream.get("tags") or {}).items()}
+        if stream.get("codec_type") == "video":
+            item["size"] = f"{stream.get('width')}x{stream.get('height')}"
+            rate = stream.get("avg_frame_rate", "0/0")
+            try:
+                num, den = rate.split("/")
+                if float(den):
+                    item["fps"] = round(float(num) / float(den), 3)
+            except ValueError:
+                pass
+        elif stream.get("codec_type") == "audio":
+            item.update({key: stream[key] for key in ("channels", "sample_rate") if stream.get(key)})
+        for key in ("language", "title"):
+            if tags.get(key):
+                item[key] = tags[key]
+        streams.append(item)
+    if streams:
+        summary["streams"] = streams
+    return summary
+
+
+# -- source / record helpers for the tools -----------------------------------
+
+JW_MEDIA_NAME = re.compile(r"^(?:\d+(?:-opt)?\s+)?(?:.*?\s-\s)?(?P<pub>[A-Za-z0-9-]+)_(?P<lang>[A-Z]+)_(?P<track>\d+)_r(?P<res>\d+)P(?![A-Za-z0-9])")
+
+
+def command_line(tool, argv):
+    return " ".join([tool] + [shlex.quote(str(item)) for item in argv])
+
+
+def describe_file(path, jwkit_config=None, ffprobe=None, hash_input=True):
+    """A record entry for a file a tool read: name, size, md5 (jw.org publishes
+    md5s for its media, so a later check can tell whether it replaced the
+    file), the jw.org publication/language/track when the name follows jw.org's
+    pattern, and - when that file carries a provenance record of its own - who
+    made it and how (`made_by`), so chains (ffrife -> jwvideo-mux) stay traceable."""
+    path = Path(path)
+    entry = {"file": path.name, "path": str(path.resolve())}
+    try:
+        entry["size"] = path.stat().st_size
+        if hash_input:
+            entry["checksum"], entry["checksum_algorithm"] = file_digest(path, "md5"), "md5"
+    except OSError:
+        pass
+    named = JW_MEDIA_NAME.match(path.name)
+    if named:
+        entry["jw_org"] = {"publication": named["pub"], "language": named["lang"], "track": int(named["track"]), "resolution": f"{named['res']}p"}
+    try:
+        upstream = read_provenance(path, jwkit_config, ffprobe)
+    except Exception:  # noqa: BLE001 - a broken input record must not stop the output's own
+        upstream = None
+    if upstream:
+        entry["made_by"] = {"tool": upstream.get("tool"), "tool_commit": upstream.get("tool_commit"),
+                            "created_at": upstream.get("created_at"), "command": (upstream.get("rebuild") or {}).get("command"),
+                            "source_checksum": (upstream.get("source") or {}).get("checksum")}
+    return entry
+
+
+def base_record(tool, root, argv, **fields):
+    """The common skeleton of a record: tool identity (name, commit, URL),
+    the command that reproduces the output, plus the tool-specific fields."""
+    record = {
+        "tool": tool,
+        "tool_commit": jwkit_commit(root),
+        "tool_url": f"{JWKIT_REPO_URL}/blob/main/{tool}",
+        "rebuild": {"argv": [str(item) for item in argv], "command": command_line(tool, argv)},
+        "advert": tool_advert(tool),
+    }
+    record.update(fields)
+    return record
+
+
+def record_output(output, tool, root, argv, jwkit_config=None, args=None, ffmpeg=None, ffprobe=None, previous=None, warn=None, **fields):
+    """Best-effort: record how `output` was made (see the section header for
+    where it goes). Never raises - a provenance problem must not fail a run
+    whose output already exists. Returns where it went, or None."""
+    try:
+        config = dict(jwkit_config) if jwkit_config is not None else load_jwkit_config()
+        if args is not None:
+            apply_provenance_overrides(config, args)
+        if not Path(output).is_file():
+            return None
+        return write_provenance(output, base_record(tool, root, argv, **fields), config, ffmpeg=ffmpeg, ffprobe=ffprobe, previous=previous)
+    except Exception as error:  # noqa: BLE001 - see docstring
+        message = f"(could not record provenance for {output}: {error})"
+        (warn or (lambda text: print(text, file=sys.stderr)))(message)
+        return None
 
 
 # -- sidecar locations -------------------------------------------------------
@@ -1440,9 +1633,8 @@ def locate_provenance(media_path, jwkit_config=None, ffprobe=None):
     if path.name.endswith(PROVENANCE_SUFFIX):
         record = _read_sidecar(path)
         return (record, path) if record else (None, None)
-    suffix = path.suffix.lower()
     try:
-        text = _iso_find_record(path) if suffix in _ISO_EXTENSIONS else _matroska_tag(path, ffprobe) if suffix in _MATROSKA_EXTENSIONS else None
+        text = _embedded_text(path, ffprobe)
     except (OSError, ValueError):
         text = None
     record = decode_provenance(text) if text else None
@@ -1461,9 +1653,26 @@ def read_provenance(media_path, jwkit_config=None, ffprobe=None):
     return locate_provenance(media_path, jwkit_config, ffprobe)[0]
 
 
-def _output_fields(media_path, embedded, ffmpeg):
+def verify_provenance(media_path, record=None, where=None, jwkit_config=None, ffmpeg=None, ffprobe=None):
+    """Does the record still describe this file? "match" (the audio/video
+    packet hash, or the sidecar's whole-file hash, agrees), "changed" (it
+    doesn't - the file was re-encoded or replaced since), or "unknown" (the
+    record carries nothing to compare)."""
+    if record is None:
+        record, where = locate_provenance(media_path, jwkit_config, ffprobe)
+    output = (record or {}).get("output") or {}
+    packets = output.get("av_sha256")
+    if packets:
+        return "match" if media_packets_digest(media_path, ffmpeg) == packets else "changed"
+    if output.get("sha256"):
+        return "match" if file_digest(media_path) == output["sha256"] else "changed"
+    return "unknown"
+
+
+def _output_fields(media_path, embedded, ffmpeg, ffprobe):
     media_path = Path(media_path)
     output = {"file": media_path.name}
+    output.update(media_summary(media_path, ffprobe))
     packets = media_packets_digest(media_path, ffmpeg)
     if packets:
         output["av_sha256"] = packets
@@ -1473,26 +1682,19 @@ def _output_fields(media_path, embedded, ffmpeg):
     return output
 
 
-def _store(media_path, record, mode, directory, ffmpeg):
+def _store(media_path, record, mode, directory, ffmpeg, ffprobe=None):
     """Put an already-built record where `mode` says; returns (mode_used, where).
     An embed that can't happen falls back to a sidecar beside the file."""
     media_path = Path(media_path)
     if mode == "embed":
-        suffix = media_path.suffix.lower()
         try:
-            record = dict(record, output=_output_fields(media_path, True, ffmpeg))
-            text = encode_provenance(record)
-            if suffix in _ISO_EXTENSIONS:
-                _iso_write_record(media_path, text)
-            elif suffix in _MATROSKA_EXTENSIONS:
-                _matroska_write_tag(media_path, text, ffmpeg)
-            else:
-                raise ValueError(f"{suffix or 'this'} container can't carry an embedded record")
+            record = dict(record, output=_output_fields(media_path, True, ffmpeg, ffprobe))
+            _embed_text(media_path, encode_provenance(record), ffmpeg, ffprobe)
             return "embed", "embedded"
-        except (OSError, ValueError, RuntimeError) as error:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             print(f"(couldn't embed the provenance record in {media_path.name}: {error}; writing it beside the file instead)", file=sys.stderr)
             mode = "beside"
-    record = dict(record, output=_output_fields(media_path, False, ffmpeg))
+    record = dict(record, output=_output_fields(media_path, False, ffmpeg, ffprobe))
     path = provenance_path(media_path, mode, directory)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -1518,18 +1720,18 @@ def _drop_stale_sidecars(media_path, keep, directory):
             _trash_sidecar(candidate)
 
 
-def write_provenance(media_path, record, jwkit_config=None, ffmpeg=None, previous=None):
+def write_provenance(media_path, record, jwkit_config=None, ffmpeg=None, previous=None, ffprobe=None):
     """Record how `media_path` was made, in the configured place (see the
-    section header). Adds the schema, timestamp, and the output's hashes. If a
-    record already exists (a rebuild; or `previous`, for a file that was moved
-    aside first), its identifying fields move to `history` so the chain of
-    builds stays visible. Returns where it went ("embedded" or a Path), or None
-    for mode none."""
+    section header). Adds the schema, timestamp, environment, and the output's
+    summary and hashes. If a record already exists (a rebuild; or `previous`,
+    for a file that was moved aside first), its identifying fields move to
+    `history` so the chain of builds stays visible. Returns where it went
+    ("embedded" or a Path), or None for mode none."""
     media_path = Path(media_path)
     mode, directory = provenance_settings(jwkit_config)
     if mode == "none":
         return None
-    previous = previous or read_provenance(media_path, jwkit_config)
+    previous = previous or read_provenance(media_path, jwkit_config, ffprobe)
     record = dict(record)
     if previous:
         history = list(previous.get("history", []))
@@ -1542,7 +1744,8 @@ def write_provenance(media_path, record, jwkit_config=None, ffmpeg=None, previou
         record["history"] = history
     record["schema"] = PROVENANCE_SCHEMA
     record["created_at"] = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
-    mode_used, where = _store(media_path, record, mode, directory, ffmpeg)
+    record.setdefault("environment", environment_info(ffmpeg))
+    mode_used, where = _store(media_path, record, mode, directory, ffmpeg, ffprobe)
     _drop_stale_sidecars(media_path, where if where != "embedded" else None, directory)
     return where
 
@@ -1552,7 +1755,8 @@ def relocate_provenance(media_path, mode, jwkit_config=None, ffmpeg=None, ffprob
     then remove it from where it was (sidecars go to the Trash; an embedded
     record is cleared). Returns (status, where): "moved", "already", "none"
     (no record found), "changed" (the file differs from what a sidecar
-    recorded - skipped unless force), "failed", or, with dry_run, "would move"."""
+    recorded - skipped unless force), "failed", "unsupported" (the container can't carry an embedded
+    record), or, with dry_run, "would move"."""
     media_path = Path(media_path)
     if mode not in PROVENANCE_MODES or mode == "none":
         raise ValueError(f"cannot move a record to mode {mode!r}")
@@ -1570,31 +1774,61 @@ def relocate_provenance(media_path, mode, jwkit_config=None, ffmpeg=None, ffprob
         return "would move", where
     if where == "embedded":  # clear it first, so the sidecar's file hash describes the finished file
         try:
-            _clear_embedded(media_path, ffmpeg)
-        except (OSError, ValueError, RuntimeError) as error:
+            _embed_text(media_path, None, ffmpeg, ffprobe)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             print(f"(couldn't clear the embedded record in {media_path.name}: {error})", file=sys.stderr)
             return "failed", where
-    mode_used, new_where = _store(media_path, record, mode, directory, ffmpeg)
+    mode_used, new_where = _store(media_path, record, mode, directory, ffmpeg, ffprobe)
+    if mode == "embed" and mode_used != "embed" and where != "embedded":
+        return "unsupported", where  # _store already wrote/kept the sidecar beside the file
     if where == "embedded" and mode_used != mode:  # the sidecar couldn't be written either way: put the record back
-        _store(media_path, record, "embed", directory, ffmpeg)
+        _store(media_path, record, "embed", directory, ffmpeg, ffprobe)
         return "failed", where
     if where != "embedded" and Path(where).exists() and new_where != where:
         _trash_sidecar(where)
     return "moved", new_where
 
 
-def _clear_embedded(media_path, ffmpeg=None):
-    if Path(media_path).suffix.lower() in _ISO_EXTENSIONS:
-        _iso_write_record(media_path, None)
-    else:
-        _matroska_write_tag(media_path, None, ffmpeg)
-
-
 def iter_media_files(paths):
-    """Media files named by `paths`: files as given, folders searched recursively."""
+    """Media files named by `paths`: files as given (a .jwkit.json sidecar
+    stands for its media file), folders searched recursively."""
     for raw in paths:
         path = Path(raw).expanduser()
         if path.is_dir():
             yield from sorted(p for p in path.rglob("*") if p.suffix.lower() in MEDIA_EXTENSIONS and not p.name.startswith("."))
         else:
             yield path.with_name(path.name[:-len(PROVENANCE_SUFFIX)]) if path.name.endswith(PROVENANCE_SUFFIX) else path
+
+
+def describe_provenance(record, where):
+    """Human-readable lines for a record (used by `inspect`/`show`)."""
+    source = record.get("source") or {}
+    lines = [f"Provenance: {'embedded in the file' if where == 'embedded' else f'sidecar {where}'}",
+             f"  built {record.get('created_at')} by {record.get('tool')} {record.get('tool_commit')}"]
+    if source.get("url") or source.get("checksum"):
+        lines.append(f"  source: {source.get('url') or source.get('file')} (md5 {source.get('checksum')})")
+    for entry in record.get("inputs") or []:
+        if isinstance(entry, dict):
+            role = ", ".join(entry.get("roles") or []) or "input"
+            lines.append(f"  input [{role}]: {entry.get('file')} (md5 {entry.get('checksum')})" + (f" <- {entry['made_by'].get('tool')} {entry['made_by'].get('tool_commit')}" if entry.get("made_by") else ""))
+    lines.append(f"  rebuild: {(record.get('rebuild') or {}).get('command')}")
+    return lines
+
+
+def move_provenance(paths, mode, jwkit_config=None, ffmpeg=None, ffprobe=None, force=False, dry_run=False, color=None, out=print):
+    """Shared by `slverse provenance` and `jwkit-provenance move`. Returns an
+    exit status (1 when anything failed or was skipped as changed)."""
+    color = color or Colorizer(False)
+    counts = {}
+    labels = {"moved": color.green("moved"), "already": "already there", "none": "no record", "changed": color.yellow("file changed since it was recorded (use --force)"),
+              "failed": color.red("FAILED"), "would move": "would move", "unsupported": color.yellow("container can't embed - kept as a sidecar")}
+    for media in iter_media_files(paths):
+        if not media.is_file():
+            out(color.yellow(f"{media}: media file not found"))
+            continue
+        status, _ = relocate_provenance(media, mode, jwkit_config, ffmpeg=ffmpeg, ffprobe=ffprobe, force=force, dry_run=dry_run)
+        counts[status] = counts.get(status, 0) + 1
+        if status != "already":
+            out(f"{labels[status]}  {media}")
+    out(("\n" + ", ".join(f"{count} {status}" for status, count in sorted(counts.items()))) if counts else "No media files found.")
+    return 1 if counts.get("failed") or counts.get("changed") else 0

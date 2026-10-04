@@ -1657,3 +1657,66 @@ class StreamLanguageTagTest(unittest.TestCase):
         langs = json.loads((Path(__file__).resolve().parents[1] / "jwlangs.json").read_text())
         missing = sorted(iso for iso, _ in langs.values() if len(iso) == 2 and iso not in self.mux.ISO639_1_TO_2)
         self.assertEqual(missing, [])
+
+
+class MuxProvenanceTest(unittest.TestCase):
+    """The record jwvideo-mux leaves in each output: pinned inputs, roles, and a rebuild command."""
+
+    def setUp(self) -> None:
+        self.mux = load_script_module("jwvideo-mux")
+
+    def args(self, **overrides):
+        import argparse
+        base = dict(input="https://www.jw.org/finder?docid=1", res="720p", container="mkv", default_video=None, default_audio=None,
+                    default_sub=None, no_default_subs=False, normalize_mismatched_aspect=False)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_local_mode_pins_every_non_base_language_to_its_exact_file(self) -> None:
+        local = {"FSL": {"video": Path("/m/kms22v_FSL_131_r720P.mp4")},
+                 "E": {"video": Path("/m/E_rife.mp4"), "audio": Path("/m/E_orig.mp4")},
+                 "CV": {"audio": Path("/m/CV.mp4")}}
+        argv = self.mux.mux_rebuild_argv(self.args(), local, True, Path("/m/kms22v_FSL_131_r720P.mp4"), ["FSL", "E"], ["E", "CV"], [])
+        self.assertEqual(argv[:7], ["/m/kms22v_FSL_131_r720P.mp4", "-v", "FSL,E=/m/E_rife.mp4", "-a", "E=/m/E_orig.mp4,CV=/m/CV.mp4", "-s", "NONE"])
+        self.assertIn("--container", argv)
+        self.assertEqual(argv[argv.index("--container") + 1], "mkv")
+
+    def test_api_mode_keeps_the_url_and_plain_language_codes(self) -> None:
+        argv = self.mux.mux_rebuild_argv(self.args(), {"E": {}}, False, None, ["E"], ["E", "TG"], ["E"])
+        self.assertEqual(argv[:5], ["https://www.jw.org/finder?docid=1", "-v", "E", "-a", "E,TG"])
+
+    def test_subtitle_files_found_locally_are_pinned_and_defaults_recorded(self) -> None:
+        local = {"FSL": {"video": Path("/m/a_FSL_1_r720P.mp4"), "sub": Path("/m/a_FSL_1_r720P.srt")}}
+        argv = self.mux.mux_rebuild_argv(self.args(default_audio="E", no_default_subs=True), local, True, Path("/m/a_FSL_1_r720P.mp4"), ["FSL"], [], ["FSL"])
+        self.assertEqual(argv[argv.index("-s") + 1], "FSL=/m/a_FSL_1_r720P.srt")
+        self.assertIn("--no-default-subs", argv)
+        self.assertEqual(argv[argv.index("--default-audio") + 1], "E")
+
+    @unittest.skipUnless(FFMPEG_AVAILABLE and FFPROBE_AVAILABLE, "ffmpeg/ffprobe not installed")
+    def test_a_real_mux_embeds_a_record_with_roles_md5s_and_upstream_makers(self) -> None:
+        common = self.mux._jwkit_common
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            for lang in ("FSL", "E"):
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=d=1:s=64x36:r=10", "-f", "lavfi", "-i", "sine=d=1",
+                                "-shortest", "-c:v", "libx264", "-c:a", "aac", str(tmp / f"kms22v_{lang}_131_r720P.mp4")], check=True)
+            config = dict(common.DEFAULT_JWKIT_CONFIG)
+            common.write_provenance(tmp / "kms22v_FSL_131_r720P.mp4", common.base_record("ffrife", tmp, ["run", "x.mp4"]), config)
+            out = tmp / "out" / "merged.mkv"
+            out.parent.mkdir()
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(tmp / "kms22v_FSL_131_r720P.mp4"), "-i", str(tmp / "kms22v_E_131_r720P.mp4"),
+                            "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", str(out)], check=True)
+            paths = [str(tmp / "kms22v_FSL_131_r720P.mp4"), str(tmp / "kms22v_E_131_r720P.mp4")]
+            local = {"FSL": {"video": Path(paths[0])}, "E": {"audio": Path(paths[1])}}
+            with mock.patch.object(common, "load_jwkit_config", return_value=config):
+                self.mux.record_mux_provenance(
+                    out, self.args(input=paths[0]), paths, {paths[0]: ["video:FSL"], paths[1]: ["audio:E"]}, {}, local, True, Path(paths[0]),
+                    ["FSL"], ["E"], [], ["FSL", "E"],
+                )
+            record, where = common.locate_provenance(out, config)
+        self.assertEqual(where, "embedded")
+        self.assertEqual(record["tool"], "jwvideo-mux")
+        self.assertEqual([entry["roles"] for entry in record["inputs"]], [["video:FSL"], ["audio:E"]])
+        self.assertEqual(record["inputs"][0]["made_by"]["tool"], "ffrife")
+        self.assertEqual(record["inputs"][1]["jw_org"]["language"], "E")
+        self.assertIn("-a E=" + paths[1], record["rebuild"]["command"])

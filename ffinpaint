@@ -147,6 +147,29 @@ def inpaint(source, output, box, config, start=None, end=None):
         shutil.copyfile(generated, output)
     return True
 
+def record_inpaint_provenance(source, output, box, config, args, jwkit_config):
+    """Provenance record for an inpainted clip: the source, the mask box and
+    window, and the exact E2FGVI checkout/checkpoint that produced it (the
+    backend is third-party, so its git commit and the checkpoint's name and
+    size are what make the render attributable). Best effort."""
+    argv = ["run", str(Path(source).resolve()), "--box", ",".join(str(value) for value in box), "-o", Path(output).name]
+    for flag, value in (("--start", args.start), ("--end", args.end)):
+        if value is not None:
+            argv += [flag, f"{value:.3f}".rstrip("0").rstrip(".")]
+    root, checkpoint = Path(config["e2fgvi_root"]), Path(config["e2fgvi_checkpoint"])
+    backend = {"name": config.get("backend"), "checkpoint": checkpoint.name,
+               "checkpoint_size": checkpoint.stat().st_size if checkpoint.is_file() else None,
+               "commit": _jwkit_common.jwkit_commit(root) if (root / ".git").exists() else None}
+    entry = _jwkit_common.describe_file(source, jwkit_config, FFPROBE_BIN)
+    entry["window_seconds"] = [args.start, args.end] if args.start is not None or args.end is not None else None
+    _jwkit_common.record_output(
+        output, "ffinpaint", Path(__file__).resolve().parent, argv, jwkit_config, ffmpeg=FFMPEG_BIN, ffprobe=FFPROBE_BIN,
+        source=entry, request={"box": {"x": box[0], "y": box[1], "width": box[2], "height": box[3]}},
+        backend=backend, settings={"fallback": config.get("fallback")},
+        warn=lambda text: print(COLOR.yellow(text)),
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run an opt-in, locally installed E2FGVI-HQ backend.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -157,6 +180,7 @@ def main(argv=None):
     run.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     run.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
     run.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds, help="Time to wait for an 'ask' answer before falling back")
+    _jwkit_common.add_provenance_arguments(run)
     add_config_flags(run)
     for p in (setup, config_parser, run):
         color_group = p.add_mutually_exclusive_group()
@@ -198,5 +222,6 @@ def main(argv=None):
 
     if not inpaint(args.input, output, box, config, args.start, args.end):
         raise SystemExit("E2FGVI-HQ is not configured; run 'ffinpaint setup'.")
+    record_inpaint_provenance(args.input, output, box, config, args, _jwkit_common.apply_provenance_overrides(dict(jwkit_config), args))
 
 if __name__ == "__main__": main()

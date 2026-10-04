@@ -29,7 +29,7 @@ Run 'slverse extract --help' and
 'slverse find --help' for the complete option set.
 """
 
-PASSTHROUGH_COMMANDS = {"setup", "config", "langs", "sync", "extract", "find", "cache", "inspect", "benchmark", "bulk"}
+PASSTHROUGH_COMMANDS = {"setup", "config", "langs", "sync", "extract", "find", "cache", "inspect", "benchmark", "bulk", "rebuild", "provenance"}
 
 
 def slverse_path() -> str:

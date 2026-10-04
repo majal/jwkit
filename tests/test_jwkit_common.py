@@ -764,11 +764,11 @@ class ProvenanceStorageTest(unittest.TestCase):
         art = self.dir / "art.png"
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=32x32", "-frames:v", "1", str(art)], check=True)
         clip = self.make("clip.mkv", "-attach", str(art), "-metadata:s:t:0", "mimetype=image/png", "-metadata:s:t:0", "filename=cover-x.png", "-c:v", "libx264", "-c:a", "aac")
-        before = (self.packets(clip), self.common._matroska_streams(clip))
+        before = (self.packets(clip), self.common._stream_layout(clip))
         self.common.write_provenance(clip, {"tool": "jwvideo-mux", "source": {"checksum": "m"}}, self.config())
         self.assertEqual(self.common.locate_provenance(clip, self.config())[1], "embedded")
-        self.assertEqual((self.packets(clip), self.common._matroska_streams(clip)), before)
-        self.assertEqual(self.common._matroska_streams(clip)[2][0][1:], ("cover-x.png", "image/png"))
+        self.assertEqual((self.packets(clip), self.common._stream_layout(clip)), before)
+        self.assertEqual(self.common._stream_layout(clip)[2][0][1:], ("cover-x.png", "image/png"))
 
     def test_unsupported_container_falls_back_to_a_sidecar_beside(self) -> None:
         clip = self.make("clip.avi")
@@ -820,3 +820,86 @@ class ProvenanceStorageTest(unittest.TestCase):
         self.assertEqual(self.common.decode_provenance(self.common.encode_provenance(record)), record)
         for junk in ("", "{}", "not json", "jwkit-z1:%%%", '{"schema": "other/1"}'):
             self.assertIsNone(self.common.decode_provenance(junk))
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe not installed")
+class ProvenanceFormatsAndHelpersTest(unittest.TestCase):
+    """Audio containers, verification, input chains, and the shared record helpers."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.object(self.common, "_move_to_trash", side_effect=lambda path: Path(path).unlink())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.config = dict(self.common.DEFAULT_JWKIT_CONFIG)
+
+    def audio(self, name, *extra):
+        out = self.dir / name
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=d=1", "-metadata", "title=Hi", *extra, str(out)], check=True)
+        return out
+
+    def test_audio_containers_embed_replace_and_clear_without_touching_audio(self) -> None:
+        for name in ("a.mp3", "a.flac", "a.ogg", "a.opus", "a.m4a"):
+            with self.subTest(name=name):
+                clip = self.audio(name)
+                before = self.common.media_packets_digest(clip)
+                self.common.write_provenance(clip, {"tool": "one"}, self.config)
+                self.common.write_provenance(clip, {"tool": "two"}, self.config)  # replaces, not stale
+                self.assertEqual(self.common.locate_provenance(clip, self.config), (self.common.read_provenance(clip, self.config), "embedded"))
+                self.assertEqual(self.common.read_provenance(clip, self.config)["tool"], "two")
+                self.assertEqual(self.common.relocate_provenance(clip, "beside", self.config)[0], "moved")
+                self.assertIsNone(self.common._embedded_text(clip))
+                self.assertEqual(self.common.media_packets_digest(clip), before)
+
+    def test_wav_cannot_embed_and_keeps_a_sidecar(self) -> None:
+        clip = self.audio("a.wav")
+        with redirect_stderr(io.StringIO()):
+            self.common.write_provenance(clip, {"tool": "t"}, self.config)
+        self.assertEqual(self.common.relocate_provenance(clip, "embed", self.config)[0], "unsupported")
+        self.assertEqual(self.common.read_provenance(clip, self.config)["tool"], "t")
+
+    def test_record_carries_environment_output_summary_and_verifies(self) -> None:
+        clip = self.audio("a.mp3")
+        self.common.write_provenance(clip, {"tool": "t"}, self.config)
+        record = self.common.read_provenance(clip, self.config)
+        self.assertIn("ffmpeg", record["environment"])
+        self.assertEqual(record["output"]["streams"][0]["type"], "audio")
+        self.assertAlmostEqual(record["output"]["duration"], 1.0, delta=0.1)
+        self.assertEqual(self.common.verify_provenance(clip, jwkit_config=self.config), "match")
+        other = self.audio("b.mp3", "-af", "volume=0.5")
+        other.replace(clip)  # same name, different audio: the record no longer describes it
+        self.assertEqual(self.common.verify_provenance(clip, record, "embedded", self.config), "changed")
+
+    def test_describe_file_names_jw_org_inputs_and_who_made_them(self) -> None:
+        upstream = self.dir / "kms22v_FSL_131_r720P_rife.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=d=1:s=64x36:r=10", "-c:v", "libx264", str(upstream)], check=True)
+        self.common.write_provenance(upstream, self.common.base_record("ffrife", self.dir, ["run", "x.mp4"], source={"checksum": "abc"}), self.config)
+        entry = self.common.describe_file(upstream, self.config)
+        self.assertEqual(entry["jw_org"], {"publication": "kms22v", "language": "FSL", "track": 131, "resolution": "720p"})
+        self.assertEqual(entry["checksum_algorithm"], "md5")
+        self.assertEqual((entry["made_by"]["tool"], entry["made_by"]["command"]), ("ffrife", "ffrife run x.mp4"))
+        self.assertNotIn("made_by", self.common.describe_file(self.audio("plain.mp3"), self.config))
+
+    def test_record_output_never_raises_and_warns(self) -> None:
+        warnings = []
+        self.assertIsNone(self.common.record_output(self.dir / "missing.mp4", "t", self.dir, [], self.config, warn=warnings.append))
+        clip = self.audio("a.mp3")
+        with mock.patch.object(self.common, "write_provenance", side_effect=RuntimeError("boom")):
+            self.assertIsNone(self.common.record_output(clip, "t", self.dir, ["x"], self.config, warn=warnings.append))
+        self.assertIn("boom", warnings[-1])
+
+    def test_move_provenance_reports_counts_and_status(self) -> None:
+        one, two = self.audio("a.mp3"), self.audio("b.mp3")
+        self.common.write_provenance(one, {"tool": "t"}, self.config)
+        lines = []
+        status = self.common.move_provenance([self.dir], "beside", self.config, out=lines.append)
+        self.assertEqual(status, 0)
+        self.assertIn("1 moved, 1 none", lines[-1])
+        self.assertTrue((self.dir / "a.mp3.jwkit.json").exists())
+        self.assertFalse(two.with_name("b.mp3.jwkit.json").exists())

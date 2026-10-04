@@ -1791,6 +1791,67 @@ def find_attached_picture_stream(path: Path) -> tuple[int, str] | None:
     return None
 
 
+def mux_rebuild_argv(args, local_files, is_local_file, base_vid_path, vid_langs, aud_langs, sub_langs):
+    """The `jwvideo-mux` arguments that repeat this run. In local-file mode
+    every non-base language is pinned to the exact file it used (CODE=path), so
+    the command doesn't depend on what else sits in the folder; in API mode the
+    URL/docid and the language lists are enough (jw.org is the source)."""
+    base_lang = vid_langs[0] if vid_langs else (aud_langs[0] if aud_langs else None)
+
+    def tokens(langs, pick):
+        out = []
+        for lang in langs:
+            path = pick(local_files.get(lang, {})) if is_local_file and lang != base_lang else None
+            out.append(f"{lang}={Path(path).absolute()}" if path else lang)
+        return out
+    argv = [str(base_vid_path) if is_local_file else args.input]
+    if vid_langs:
+        argv += ["-v", ",".join(tokens(vid_langs, lambda media: media.get("video")))]
+    if aud_langs:
+        argv += ["-a", ",".join(tokens(aud_langs, lambda media: media.get("audio", media.get("video"))))]
+    sub_tokens = [f"{lang}={Path(local_files[lang]['sub']).absolute()}" if is_local_file else lang for lang in sub_langs if lang in local_files and "sub" in local_files[lang]]
+    argv += ["-s", ",".join(sub_tokens) if sub_tokens else "NONE"]
+    if args.res:
+        argv += ["--res", str(args.res)]
+    argv += ["--container", args.container]
+    for flag, value in (("--default-video", args.default_video), ("--default-audio", args.default_audio), ("--default-sub", args.default_sub)):
+        if value:
+            argv += [flag, str(value)]
+    if args.no_default_subs:
+        argv.append("--no-default-subs")
+    return argv
+
+
+def record_mux_provenance(out_path, args, input_paths, input_roles, source_urls, local_files, is_local_file, base_vid_path,
+                          vid_langs, aud_langs, sub_langs, langs_loaded, art_attached=False, single_stream_language=None):
+    """Provenance record for a merged (or single-stream) output: every input
+    with its md5, role, jw.org URL (when downloaded) and - if it carries a
+    record of its own, like an ffrife render - who made it; plus the exact
+    command. Best effort (see _jwkit_common.record_output)."""
+    root = Path(__file__).resolve().parent
+    inputs = []
+    for path in input_paths:
+        entry = _jwkit_common.describe_file(path)
+        entry["roles"] = input_roles.get(path, [])
+        if path in source_urls:
+            entry["url"] = source_urls[path]
+        inputs.append(entry)
+    argv = mux_rebuild_argv(args, local_files, is_local_file, base_vid_path, vid_langs, aud_langs, sub_langs)
+    argv += ["--output-dir", str(Path(out_path).parent), "--on-exists", "overwrite"]
+    if single_stream_language:
+        argv.append("--single-streams")
+    _jwkit_common.record_output(
+        out_path, "jwvideo-mux", root, argv, args=args,
+        request={"mode": "local files" if is_local_file else "jw.org", "input": str(args.input), "video_languages": vid_langs,
+                 "audio_languages": aud_langs, "subtitle_languages": sub_langs, "languages_muxed": langs_loaded,
+                 "single_stream_language": single_stream_language, "cover_art": bool(art_attached)},
+        inputs=inputs,
+        settings={key: getattr(args, key, None) for key in ("res", "container", "default_video", "default_audio", "default_sub", "no_default_subs",
+                                                              "normalize_mismatched_aspect") if getattr(args, key, None) not in (None, "")},
+        warn=lambda text: color_print(text, "yellow"),
+    )
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         return run_config(sys.argv[2:])
@@ -1808,6 +1869,7 @@ def main():
     parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
     parser.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds, help="Time to wait for an 'ask' answer before falling back")
+    _jwkit_common.add_provenance_arguments(parser)
     default_subs = parser.add_mutually_exclusive_group()
     default_subs.add_argument("--no-default-subs", dest="no_default_subs", action="store_true", default=None, help="Do not set a subtitle track as default")
     default_subs.add_argument("--default-subs", dest="no_default_subs", action="store_false", help="Set the selected subtitle track as default")
@@ -1890,6 +1952,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     local_files = {}
+    source_urls = {}  # downloaded path -> jw.org URL, for the provenance record
 
     if is_local_file:
         color_print("\n>> Local file mode detected. Skipping API downloads...", "header")
@@ -2038,6 +2101,7 @@ def main():
                 dest = out_dir / fname
                 download_file(url, dest)
                 local_files[lang][mtype] = dest
+                source_urls[str(dest)] = url
 
     video_paths = {
         lang: local_files[lang]["video"]
@@ -2168,10 +2232,13 @@ def main():
     
     input_idx = 0
     input_paths = []
-    
-    def get_or_add_input(path):
+    input_roles = {}  # path -> what this run used it for, for the provenance record
+
+    def get_or_add_input(path, role=None):
         nonlocal input_idx
         path_str = str(path)
+        if role and role not in input_roles.setdefault(path_str, []):
+            input_roles[path_str].append(role)
         if path_str in input_paths:
             return input_paths.index(path_str)
         ff_inputs.extend(["-i", path_str])
@@ -2187,7 +2254,7 @@ def main():
         if lang not in local_files or 'video' not in local_files[lang]:
             continue
             
-        idx = get_or_add_input(local_files[lang]['video'])
+        idx = get_or_add_input(local_files[lang]['video'], f"video:{lang}")
         iso, title = get_lang_meta(lang)
         
         ff_maps.extend(["-map", f"{idx}:v:0"])
@@ -2210,7 +2277,7 @@ def main():
         if not path:
             continue
             
-        idx = get_or_add_input(path)
+        idx = get_or_add_input(path, f"audio:{lang}")
         iso, title = get_lang_meta(lang)
         
         ff_maps.extend(["-map", f"{idx}:a:0?"])
@@ -2226,7 +2293,7 @@ def main():
     subtitle_stream_idx = 0
     for lang in all_langs:
         if lang in local_files and 'sub' in local_files[lang]:
-            idx = get_or_add_input(local_files[lang]['sub'])
+            idx = get_or_add_input(local_files[lang]['sub'], f"subtitle:{lang}")
             iso, title = get_lang_meta(lang)
             
             ff_maps.extend(["-map", f"{idx}:s"])
@@ -2314,7 +2381,7 @@ def main():
         if attached_pic is not None:
             art_v_index, art_codec = attached_pic
             if args.container == "mp4":
-                art_input_idx = get_or_add_input(base_vid)
+                art_input_idx = get_or_add_input(base_vid, "cover-art")
                 art_extra_args = ["-map", f"{art_input_idx}:v:{art_v_index}?"]
             elif art_codec in _COVER_ART_MIME_TYPES:
                 fd, art_temp_name = tempfile.mkstemp(
@@ -2347,6 +2414,10 @@ def main():
         art_temp_path.unlink(missing_ok=True)
     if res.returncode == 0:
         color_print("✓ Merged video created successfully.", "green")
+        record_mux_provenance(
+            out_path, args, input_paths, input_roles, source_urls, local_files, is_local_file, base_vid_path,
+            vid_langs, aud_langs, sub_langs, langs_loaded, art_attached=bool(art_extra_args),
+        )
     else:
         color_print("✗ Merged video creation failed.", "red")
 
@@ -2408,8 +2479,15 @@ def main():
                     maps.extend(["-map", f"{sub_idx}:s", "-c:s", "mov_text"])
 
                 cmd_single += maps + ["-c:v", "copy", "-c:a", "copy", str(out_single)]
-                subprocess.run(cmd_single)
+                single_run = subprocess.run(cmd_single)
                 color_print(f"  ✓ Single-stream created: {out_single.name}", "green")
+                if single_run.returncode == 0:
+                    single_inputs = [str(base_vid)] + [str(path) for path in (audio_path, sub_file) if path and str(path) != str(base_vid)]
+                    record_mux_provenance(
+                        out_single, args, single_inputs, {str(base_vid): [f"video:{base_vid_lang}"], **({str(audio_path): [f"audio:{lang}"]} if audio_path and str(audio_path) != str(base_vid) else {}),
+                                                           **({str(sub_file): [f"subtitle:{lang}"]} if sub_file else {})},
+                        source_urls, local_files, is_local_file, base_vid_path, vid_langs, aud_langs, sub_langs, [lang], single_stream_language=lang,
+                    )
 
     # Cleanup
     if args.cleanup:

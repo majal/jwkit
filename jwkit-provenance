@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""jwkit-provenance: record, show, verify and move "how was this file made" records.
+
+Every jwkit tool records, with each file it makes, the exact command, its
+inputs (name, size, md5, the jw.org publication when the name says so, and who
+made each input), the settings, and the tool's git commit - by default inside
+the file itself (see docs/jwkit-provenance.md). This command is the same
+machinery for everything else: scripts in other repos call `record` after they
+write a file, and `show`/`verify`/`move` work on any jwkit record.
+"""
+import argparse
+import json
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _jwkit_common
+
+ROOT = Path(__file__).resolve().parent
+COLOR = _jwkit_common.Colorizer(False)
+
+
+def tool_origin(tool_file):
+    """(commit, URL) of the script a record is for, from the git checkout it
+    lives in - so records from `bin`, `maj-scripts` and other repos point at
+    their own source rather than at jwkit's."""
+    path = Path(tool_file).resolve()
+    commit = _jwkit_common.jwkit_commit(path.parent)
+    url = None
+    try:
+        remote = subprocess.run(["git", "-C", str(path.parent), "remote", "get-url", "origin"], capture_output=True, text=True, timeout=10).stdout.strip()
+        top = subprocess.run(["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=10).stdout.strip()
+        branch = subprocess.run(["git", "-C", str(path.parent), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip() or "main"
+        if remote and top:
+            remote = remote.removesuffix(".git").replace("git@github.com:", "https://github.com/")
+            url = f"{remote}/blob/{branch}/{path.relative_to(top)}"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return commit, url
+
+
+def parse_pairs(items, what):
+    pairs = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise SystemExit(f"jwkit-provenance: {what} must be KEY=VALUE, got {item!r}")
+        try:
+            pairs[key] = json.loads(value)
+        except ValueError:
+            pairs[key] = value
+    return pairs
+
+
+def cmd_record(args, jwkit_config):
+    output = Path(args.output)
+    if not output.is_file():
+        print(f"jwkit-provenance: {output} is not a file - nothing to record.", file=sys.stderr)
+        return 1
+    argv = shlex.split(args.command) if args.command else []
+    if argv and Path(argv[0]).name == args.tool:
+        argv = argv[1:]
+    fields = {}
+    sources = [("", path) for path in args.source or []] + [tuple(item.split("=", 1)) if "=" in item else ("", item) for item in args.input or []]
+    entries = []
+    for role, path in sources:
+        entry = _jwkit_common.describe_file(path, jwkit_config)
+        if role:
+            entry["roles"] = [role]
+        entries.append(entry)
+    if len(entries) == 1 and not args.input:
+        fields["source"] = entries[0]
+        if args.window:
+            start, _, end = args.window.partition("-")
+            fields["source"]["window_seconds"] = [float(start), float(end)] if end else [float(start), None]
+    elif entries:
+        fields["inputs"] = entries
+    request = parse_pairs(args.request, "--request")
+    settings = parse_pairs(args.set, "--set")
+    if args.settings_json:
+        settings = {**json.loads(args.settings_json), **settings}
+    if request:
+        fields["request"] = request
+    if settings:
+        fields["settings"] = settings
+    if args.note:
+        fields["note"] = args.note
+    if args.tool_file:
+        commit, url = tool_origin(args.tool_file)
+    else:
+        commit, url = _jwkit_common.jwkit_commit(ROOT), None
+    record = _jwkit_common.base_record(args.tool, ROOT, argv, **fields)
+    record["tool_commit"] = commit
+    record["tool_url"] = args.tool_url or url or record["tool_url"]
+    record["rebuild"] = {"argv": argv, "command": args.command or None}
+    record["advert"] = f"Made with {args.tool}" + (f" - {record['tool_url']}" if args.tool_url or url else "")
+    try:
+        where = _jwkit_common.write_provenance(output, record, _jwkit_common.apply_provenance_overrides(jwkit_config, args))
+    except Exception as error:  # noqa: BLE001 - never break the calling script's real work
+        print(f"jwkit-provenance: could not record {output}: {error}", file=sys.stderr)
+        return 1 if args.strict else 0
+    if args.verbose and where:
+        print(f"recorded {output} ({'embedded' if where == 'embedded' else where})")
+    return 0
+
+
+def cmd_show(args, jwkit_config):
+    status = 0
+    for media in _jwkit_common.iter_media_files(args.paths):
+        record, where = _jwkit_common.locate_provenance(media, jwkit_config)
+        if record is None:
+            print(f"{media}: no provenance record", file=sys.stderr)
+            status = 1
+            continue
+        verdict = _jwkit_common.verify_provenance(media, record, where, jwkit_config) if args.verify else None
+        if args.json:
+            print(json.dumps({"file": str(media), "where": str(where), "verify": verdict, "record": record}, ensure_ascii=False, indent=2))
+        else:
+            print(f"{media}" + (f"  [{verdict}]" if verdict else ""))
+            print("\n".join(_jwkit_common.describe_provenance(record, where)))
+        if verdict == "changed":
+            status = 1
+    return status
+
+
+def cmd_verify(args, jwkit_config):
+    args.verify, args.json = True, False
+    status = 0
+    for media in _jwkit_common.iter_media_files(args.paths):
+        record, where = _jwkit_common.locate_provenance(media, jwkit_config)
+        if record is None:
+            print(f"no record   {media}")
+            status = 1
+            continue
+        verdict = _jwkit_common.verify_provenance(media, record, where, jwkit_config)
+        print(f"{verdict:<11} {media}")
+        if verdict == "changed":
+            status = 1
+    return status
+
+
+def cmd_move(args, jwkit_config):
+    mode = args.to or _jwkit_common.provenance_settings(jwkit_config)[0]
+    if mode == "none":
+        print("provenance_mode is none - pass --to embed, beside or folder.", file=sys.stderr)
+        return 1
+    return _jwkit_common.move_provenance(args.paths, mode, jwkit_config, force=args.force, dry_run=args.dry_run, color=COLOR)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Record, show, verify and move jwkit provenance records.")
+    color = parser.add_mutually_exclusive_group()
+    color.add_argument("--color", dest="color", action="store_true", default=None, help="Force colored output")
+    color.add_argument("--no-color", dest="color", action="store_false", help="Disable colored output")
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    rec = sub.add_parser("record", help="Record how OUTPUT was made (for scripts that write media)")
+    rec.add_argument("output", help="The file the script just wrote")
+    rec.add_argument("--tool", required=True, help="Name of the script that made OUTPUT")
+    rec.add_argument("--tool-file", help="Path of that script, to record its git commit and a link to its source (default: jwkit's own)")
+    rec.add_argument("--tool-url", help="Link to the script's source (default: derived from --tool-file's git remote)")
+    rec.add_argument("--source", action="append", help="The one file OUTPUT was made from (repeatable only via --input)")
+    rec.add_argument("--input", action="append", metavar="[ROLE=]FILE", help="An input file, optionally with the role it played (video:FSL, audio:E, ...); repeatable")
+    rec.add_argument("--window", metavar="START-END", help="Seconds of --source that were used")
+    rec.add_argument("--command", help="The exact command line that repeats this run")
+    rec.add_argument("--request", action="append", metavar="KEY=VALUE", help="What was asked for (repeatable; values may be JSON)")
+    rec.add_argument("--set", action="append", metavar="KEY=VALUE", help="A setting that shaped the output (repeatable; values may be JSON)")
+    rec.add_argument("--settings-json", metavar="JSON", help="Settings as one JSON object (merged under --set)")
+    rec.add_argument("--note", help="Free-text note")
+    rec.add_argument("--strict", action="store_true", help="Exit 1 when the record couldn't be written (default: warn and exit 0, so a script's real work never fails over it)")
+    rec.add_argument("-v", "--verbose", action="store_true", help="Say where the record went")
+    _jwkit_common.add_provenance_arguments(rec)
+
+    show = sub.add_parser("show", help="Print the record of each file")
+    show.add_argument("paths", nargs="+", help="Media files, or folders searched recursively")
+    show.add_argument("--json", action="store_true", help="Full record as JSON")
+    show.add_argument("--verify", action="store_true", help="Also check the record still describes the file")
+
+    verify = sub.add_parser("verify", help="Check each file still matches its record (exit 1 if any changed or has no record)")
+    verify.add_argument("paths", nargs="+")
+
+    move = sub.add_parser("move", help="Move records between embedded / beside / folder storage")
+    move.add_argument("paths", nargs="+")
+    move.add_argument("--to", choices=("embed", "beside", "folder"), help="Target (default: the configured provenance_mode)")
+    move.add_argument("--dry-run", action="store_true")
+    move.add_argument("--force", action="store_true", help="Also move a sidecar whose file changed since it was recorded")
+    _jwkit_common.add_provenance_arguments(move)
+    return parser
+
+
+def main(argv=None):
+    global COLOR
+    args = build_parser().parse_args(argv)
+    _jwkit_common.maybe_auto_update(ROOT)
+    jwkit_config = _jwkit_common.load_jwkit_config()
+    COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(jwkit_config, cli_override=args.color))
+    _jwkit_common.apply_provenance_overrides(jwkit_config, args)
+    handler = {"record": cmd_record, "show": cmd_show, "verify": cmd_verify, "move": cmd_move}[args.action]
+    return handler(args, jwkit_config)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
