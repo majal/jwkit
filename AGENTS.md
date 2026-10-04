@@ -83,6 +83,14 @@ Every tool that writes a final output file calls `_jwkit_common.resolve_output_c
 - Add matching `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` flags to a new tool's own output-writing subcommand (see `ffrife run`'s `p_run.add_argument` calls for the pattern) so the shared config stays overridable per-run everywhere, not just in `~/.config/jwkit/config.toml`.
 - Not every `path.exists()` check in these tools is a "real" overwrite scenario worth routing through this - see `slverse bulk`'s own `--overwrite` (a cache-hit skip for a rerunnable batch job) and `jwpl init`'s config-scaffold guard for two deliberate exceptions.
 
+## Provenance Records (`_jwkit_common.py`)
+
+A tool that renders a media file from a known source records how it was made - source URL/MD5, settings, exact rebuild command, tool commit - with `_jwkit_common.write_provenance(output, record, jwkit_config, ffmpeg=...)` (see `slverse`'s `write_extract_provenance`, `ffrife`'s `write_run_provenance`). Where it lives is the shared `provenance_mode` (`embed` default, `beside`, `folder`, `none`) plus `provenance_dir`; add `_jwkit_common.add_provenance_arguments(parser)` for the matching `--provenance`/`--provenance-dir` flags and fold them in with `apply_provenance_overrides`. `slverse provenance` moves existing records between places; `locate_provenance`/`read_provenance` find one wherever it is.
+
+- **Embedded means no re-encode, and no collateral damage.** MP4/MOV get a trailing `uuid` box appended in place (never ffmpeg's `-movflags +use_metadata_tags`: it moves every MP4 tag into `mdta`, and AVFoundation then loses the title). Matroska gets a global tag through a stream-copy remux that must reproduce the original: `-avoid_negative_ts disabled` (ffmpeg's default shifts start times) and cover art re-attached with `-attach` (`-map 0` silently turns it into a plain video track). The remux is verified (packet hash, duration, stream layout) before it replaces anything, and an embed that can't be verified falls back to a sidecar rather than altering the file.
+- An embedded record can't contain the file's own hash; it carries `output.av_sha256` (video/audio packet hash) instead.
+- Never let a provenance problem fail a run whose video already exists.
+
 ## Installer (`install.sh` / `install.ps1`)
 
 Root-level one-liner installers for non-technical users (`curl | bash` on macOS/Linux, `irm | iex` on Windows) — see the Quick Install section of `README.md`. They install missing dependencies (Python, `ffmpeg`, `git` via Homebrew/apt/dnf/pacman/winget), download jwkit to `~/.jwkit` (`%USERPROFILE%\.jwkit` on Windows), add it to `PATH`, and drop a `jwkit-update` command that re-runs the same script.
@@ -205,4 +213,4 @@ Same spirit as `maj-scripts`: practical and skimmable, a light touch is fine, bu
 - if the tool has a live external caller (cron/systemd elsewhere), note it under Operational Notes above and coordinate that caller's migration in the same rollout
 - add the tool to the `TOOLS`/`$Tools` list in both `install.sh` and `install.ps1` (see Installer above) so the one-line installers pick it up
 - wire in `_jwkit_common.maybe_auto_update(...)` right after `parse_args()` (see Auto-Update above) so the new tool participates in the shared update check
-- if the tool writes a final output file, call `_jwkit_common.resolve_output_conflict(...)` right before writing it and add the matching `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` flags (see Overwrite Handling above)
+- if the tool renders from a known source, record provenance (see Provenance Records above); if the tool writes a final output file, call `_jwkit_common.resolve_output_conflict(...)` right before writing it and add the matching `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` flags (see Overwrite Handling above)

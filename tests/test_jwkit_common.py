@@ -5,6 +5,8 @@ from argparse import Namespace
 from contextlib import redirect_stderr, redirect_stdout
 import io
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 from unittest import mock
 
@@ -695,3 +697,126 @@ class ConfigOverridesTest(unittest.TestCase):
                 self.assertEqual(config_file.read_text(), "on_output_exists = trash\n")
                 self.assertEqual(common.load_jwkit_config()["on_output_exists"], "trash")
                 self.assertEqual(common.load_jwkit_config()["auto_update"], True)
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe not installed")
+class ProvenanceStorageTest(unittest.TestCase):
+    """provenance_mode: where the record of how a file was made lives."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.common = load_script_module("_jwkit_common.py")
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        # Never touch the real Trash from a test: "trashing" just deletes.
+        patcher = mock.patch.object(self.common, "_move_to_trash", side_effect=lambda path: Path(path).unlink())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def config(self, mode="embed", directory=""):
+        return dict(self.common.DEFAULT_JWKIT_CONFIG, provenance_mode=mode, provenance_dir=directory)
+
+    def make(self, name, *extra):
+        out = self.dir / name
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=d=1:s=64x36:r=10", "-f", "lavfi", "-i", "sine=d=1",
+                        "-shortest", "-metadata", "title=Hello", *extra, str(out)], check=True)
+        return out
+
+    def packets(self, path):
+        return self.common.media_packets_digest(path)
+
+    def test_mp4_embeds_without_touching_streams_or_tags(self) -> None:
+        clip = self.make("clip.mp4", "-c:v", "libx264", "-c:a", "aac")
+        before = self.packets(clip)
+        where = self.common.write_provenance(clip, {"tool": "slverse", "source": {"checksum": "abc"}}, self.config())
+        self.assertEqual(where, "embedded")
+        record, found = self.common.locate_provenance(clip, self.config())
+        self.assertEqual((record["source"]["checksum"], found), ("abc", "embedded"))
+        self.assertEqual(record["output"]["av_sha256"], before)
+        self.assertNotIn("sha256", record["output"])
+        self.assertEqual(self.packets(clip), before)
+        tags = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags=title", "-of", "csv=p=0", str(clip)], capture_output=True, text=True).stdout
+        self.assertEqual(tags.strip(), "Hello")
+        self.assertEqual(list(self.dir.glob("*.jwkit.json")), [])
+
+    def test_embedding_again_replaces_the_box_and_keeps_history(self) -> None:
+        clip = self.make("clip.mp4", "-c:v", "libx264", "-c:a", "aac")
+        self.common.write_provenance(clip, {"tool": "t", "tool_commit": "aaa", "source": {"checksum": "old"}}, self.config())
+        self.common.write_provenance(clip, {"tool": "t", "tool_commit": "bbb", "source": {"checksum": "new"}}, self.config())
+        record = self.common.read_provenance(clip, self.config())
+        self.assertEqual(record["source"]["checksum"], "new")
+        self.assertEqual([h["source_checksum"] for h in record["history"]], ["old"])
+        with open(clip, "rb") as handle:  # replaced, not stacked
+            ours = [box for box in self.common._iso_boxes(handle, clip.stat().st_size) if box[2] == b"uuid"]
+        self.assertEqual(len(ours), 1)
+
+    def test_a_large_record_is_compressed_and_round_trips(self) -> None:
+        clip = self.make("clip.mp4", "-c:v", "libx264", "-c:a", "aac")
+        blob = "settings " * 5000
+        self.common.write_provenance(clip, {"tool": "t", "blob": blob}, self.config())
+        self.assertLess(clip.stat().st_size, 60000)
+        self.assertEqual(self.common.read_provenance(clip, self.config())["blob"], blob)
+
+    def test_mkv_embeds_as_a_tag_and_keeps_cover_art_and_timing(self) -> None:
+        art = self.dir / "art.png"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=32x32", "-frames:v", "1", str(art)], check=True)
+        clip = self.make("clip.mkv", "-attach", str(art), "-metadata:s:t:0", "mimetype=image/png", "-metadata:s:t:0", "filename=cover-x.png", "-c:v", "libx264", "-c:a", "aac")
+        before = (self.packets(clip), self.common._matroska_streams(clip))
+        self.common.write_provenance(clip, {"tool": "jwvideo-mux", "source": {"checksum": "m"}}, self.config())
+        self.assertEqual(self.common.locate_provenance(clip, self.config())[1], "embedded")
+        self.assertEqual((self.packets(clip), self.common._matroska_streams(clip)), before)
+        self.assertEqual(self.common._matroska_streams(clip)[2][0][1:], ("cover-x.png", "image/png"))
+
+    def test_unsupported_container_falls_back_to_a_sidecar_beside(self) -> None:
+        clip = self.make("clip.avi")
+        with redirect_stderr(io.StringIO()):
+            where = self.common.write_provenance(clip, {"tool": "t"}, self.config())
+        self.assertEqual(where, self.dir / "clip.avi.jwkit.json")
+        self.assertEqual(self.common.read_provenance(clip, self.config())["tool"], "t")
+
+    def test_none_writes_nothing(self) -> None:
+        clip = self.make("clip.mp4", "-c:v", "libx264", "-c:a", "aac")
+        size = clip.stat().st_size
+        self.assertIsNone(self.common.write_provenance(clip, {"tool": "t"}, self.config("none")))
+        self.assertEqual((clip.stat().st_size, list(self.dir.glob("*.json"))), (size, []))
+
+    def test_folder_mode_hidden_and_central(self) -> None:
+        clip = self.make("clip.mp4", "-c:v", "libx264", "-c:a", "aac")
+        where = self.common.write_provenance(clip, {"tool": "t"}, self.config("folder"))
+        self.assertEqual(where, self.dir / ".jwkit" / "clip.mp4.jwkit.json")
+        central = self.dir / "central"
+        where = self.common.write_provenance(clip, {"tool": "t"}, self.config("folder", str(central)))
+        self.assertEqual(where.parent, central)
+        self.assertFalse((self.dir / ".jwkit").exists())  # the earlier hidden-folder record was cleaned up
+        self.assertEqual(self.common.read_provenance(clip, self.config("folder", str(central)))["tool"], "t")
+
+    def test_relocate_between_every_storage_place(self) -> None:
+        for name, extra in (("a.mp4", ("-c:v", "libx264", "-c:a", "aac")), ("b.mkv", ("-c:v", "libx264", "-c:a", "aac"))):
+            clip = self.make(name, *extra)
+            before = self.packets(clip)
+            self.common.write_provenance(clip, {"tool": "t", "source": {"checksum": "z"}}, self.config("beside"))
+            for mode in ("embed", "folder", "beside", "embed", "embed"):
+                status, _ = self.common.relocate_provenance(clip, mode, self.config())
+                self.assertIn(status, ("moved", "already"))
+                self.assertEqual(self.common.read_provenance(clip, self.config())["source"]["checksum"], "z")
+            self.assertEqual(self.packets(clip), before)
+            self.assertEqual(self.common.locate_provenance(clip, self.config())[1], "embedded")
+            self.assertEqual(sorted(p.name for p in self.dir.rglob("*.json")), [])
+
+    def test_relocate_skips_a_sidecar_whose_file_changed_unless_forced(self) -> None:
+        clip = self.make("clip.mp4", "-c:v", "libx264", "-c:a", "aac")
+        self.common.write_provenance(clip, {"tool": "t"}, self.config("beside"))
+        with open(clip, "ab") as handle:
+            handle.write(b"\0" * 16)
+        self.assertEqual(self.common.relocate_provenance(clip, "embed", self.config())[0], "changed")
+        self.assertEqual(self.common.relocate_provenance(clip, "embed", self.config(), dry_run=True, force=True)[0], "would move")
+
+    def test_encode_decode_and_garbage(self) -> None:
+        record = {"schema": "jwkit-provenance/1", "text": "é" * 20000}
+        self.assertTrue(self.common.encode_provenance(record).startswith("jwkit-z1:"))
+        self.assertEqual(self.common.decode_provenance(self.common.encode_provenance(record)), record)
+        for junk in ("", "{}", "not json", "jwkit-z1:%%%", '{"schema": "other/1"}'):
+            self.assertIsNone(self.common.decode_provenance(junk))

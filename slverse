@@ -1267,9 +1267,9 @@ def default_extract_filename(book_name, chapter, verses, lang, args, config):
 
 def output_metadata_args(book_name, chapter, verses, lang, source_url, checksum, edit_note="normal-speed full verse window", title_edit=""):
     title = f"{book_name} {chapter}:{verses} {lang}" + (f" ({title_edit})" if title_edit else "")
-    # MP4 keeps only its standard tags, so `comment` carries the source's
-    # checksum and the tool credit; the full record is the provenance
-    # sidecar (see write_extract_provenance).
+    # `comment` carries the source's checksum and the tool credit where any
+    # player can show them; the full record is the provenance record (see
+    # write_extract_provenance), embedded in the file by default.
     comment = f"Source: {source_url}" + (f" (md5 {checksum})" if checksum else "") + f" | {_jwkit_common.tool_advert('slverse')}"
     return ["-metadata", f"title={title}", "-metadata", f"artist=JW.org ({lang})",
             "-metadata", "encoder=jwkit slverse", "-metadata", f"comment={comment}",
@@ -3190,7 +3190,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     return lang, out_filename, None
 
 # Settings that shape the pixels of an extracted clip, recorded in its
-# provenance sidecar. Machine-local paths, cache tuning, and preview/mpv
+# provenance record. Machine-local paths, cache tuning, and preview/mpv
 # options are left out on purpose: they never change the output.
 PROVENANCE_SETTING_KEYS = (
     "interpolate", "interpolation_engine", "interpolation_target_fps",
@@ -3237,14 +3237,20 @@ def extract_rebuild_argv(lang, book_name, chapter, verses_str, output_name, args
     return argv
 
 
+# Records of clips `slverse rebuild` set aside before re-making them, keyed by
+# resolved path, so the new record's `history` still names the previous build.
+_REBUILD_PREVIOUS = {}
+
+
 def write_extract_provenance(out_filename, *, lang, book_name, book_num, chapter, verses_str, valid_verses,
-                             url, checksum, start_time, end_time, args, config, edit_bits):
-    """Sidecar record of how this clip was made (see _jwkit_common's
-    provenance section): the exact request, the source file and jw.org's MD5
-    for it, the settings that shape the pixels, and the tool + interpolation
-    versions - everything `slverse rebuild` needs to re-create the clip and
-    to notice when jw.org replaced the source. Best effort: a sidecar problem
-    must never fail an extract that already produced its video."""
+                             url, checksum, start_time, end_time, args, config, edit_bits, jwkit_config=None):
+    """Record how this clip was made (see _jwkit_common's provenance
+    section; embedded in the clip by default): the exact request, the source
+    file and jw.org's MD5 for it, the settings that shape the pixels, and the
+    tool + interpolation versions - everything `slverse rebuild` needs to
+    re-create the clip and to notice when jw.org replaced the source. Best
+    effort: a provenance problem must never fail an extract that already
+    produced its video."""
     try:
         root = Path(__file__).resolve().parent
         engine = effective_interpolation_engine(config)
@@ -3279,9 +3285,12 @@ def write_extract_provenance(out_filename, *, lang, book_name, book_num, chapter
             "rebuild": {"argv": argv, "command": "slverse " + shlex.join(argv)},
             "advert": _jwkit_common.tool_advert("slverse"),
         }
-        _jwkit_common.write_provenance(out_filename, record)
+        jwkit_config = dict(jwkit_config) if jwkit_config is not None else _jwkit_common.load_jwkit_config()
+        _jwkit_common.apply_provenance_overrides(jwkit_config, args)
+        previous = _REBUILD_PREVIOUS.pop(str(Path(out_filename).resolve()), None)
+        _jwkit_common.write_provenance(out_filename, record, jwkit_config, ffmpeg=FFMPEG_BIN, previous=previous)
     except Exception as error:  # noqa: BLE001 - see docstring
-        print(COLOR.yellow(f"(could not write the provenance sidecar for {out_filename}: {error})"))
+        print(COLOR.yellow(f"(could not record provenance for {out_filename}: {error})"))
 
 
 def refresh_index_entry(lang, book_num, chapter, data=None):
@@ -3302,8 +3311,32 @@ def refresh_index_entry(lang, book_num, chapter, data=None):
     return True
 
 
+def cmd_provenance(args):
+    """Move provenance records between storage places (see _jwkit_common's
+    provenance section) - e.g. fold existing .jwkit.json sidecars into the
+    videos. Works on any jwkit tool's records."""
+    jwkit_config = _jwkit_common.apply_provenance_overrides(_jwkit_common.load_jwkit_config(), args)
+    mode = args.to or _jwkit_common.provenance_settings(jwkit_config)[0]
+    if mode == "none":
+        print(COLOR.yellow("provenance_mode is none - pass --to embed, beside or folder."))
+        return 1
+    counts = {}
+    for media in _jwkit_common.iter_media_files(args.paths):
+        if not media.is_file():
+            print(COLOR.yellow(f"{media}: media file not found"))
+            continue
+        status, _ = _jwkit_common.relocate_provenance(media, mode, jwkit_config, ffmpeg=FFMPEG_BIN, ffprobe=FFPROBE_BIN, force=args.force, dry_run=args.dry_run)
+        counts[status] = counts.get(status, 0) + 1
+        label = {"moved": COLOR.green("moved"), "already": "already there", "none": "no record", "changed": COLOR.yellow("file changed since it was recorded (use --force)"),
+                 "failed": COLOR.red("FAILED"), "would move": "would move"}[status]
+        if status != "already":
+            print(f"{label}  {media}")
+    print("\n" + ", ".join(f"{count} {status}" for status, count in sorted(counts.items())) if counts else "No media files found.")
+    return 1 if counts.get("failed") or counts.get("changed") else 0
+
+
 def cmd_rebuild(args, config, parser):
-    """Re-create slverse clips from their provenance sidecars, or with
+    """Re-create slverse clips from their provenance records, or with
     --check just report which ones have fallen behind jw.org.
 
     A clip is stale when jw.org now publishes a different file (MD5) for the
@@ -3313,18 +3346,16 @@ def cmd_rebuild(args, config, parser):
     --recorded-settings, and replaces the clip in place (the old file goes
     to the Trash unless --on-exists says otherwise)."""
     records = []
-    for raw in args.paths:
-        path = Path(raw).expanduser()
-        found = sorted(path.rglob("*" + _jwkit_common.PROVENANCE_SUFFIX)) if path.is_dir() else [path]
-        for item in found:
-            record = _jwkit_common.read_provenance(item)
-            if record and record.get("tool") == "slverse":
-                sidecar = item if item.name.endswith(_jwkit_common.PROVENANCE_SUFFIX) else _jwkit_common.provenance_path(item)
-                records.append((sidecar.parent / record["output"]["file"], record))
-            elif not path.is_dir():
-                print(COLOR.yellow(f"{item}: no slverse provenance sidecar - cannot rebuild (rebuild it by hand once with the current slverse to create one)."))
+    jwkit_config = _jwkit_common.apply_provenance_overrides(_jwkit_common.load_jwkit_config(), args)
+    explicit = set(_jwkit_common.iter_media_files([raw for raw in args.paths if not Path(raw).expanduser().is_dir()]))
+    for item in _jwkit_common.iter_media_files(args.paths):
+        record = _jwkit_common.read_provenance(item, jwkit_config, FFPROBE_BIN)
+        if record and record.get("tool") == "slverse":
+            records.append((item, record))
+        elif item in explicit:
+            print(COLOR.yellow(f"{item}: no slverse provenance record - cannot rebuild (extract it once by hand with the current slverse to create one)."))
     if not records:
-        print("No slverse provenance sidecars found.")
+        print("No slverse provenance records found.")
         return 1
 
     live_sources = {}
@@ -3372,6 +3403,10 @@ def cmd_rebuild(args, config, parser):
         argv = list(record["rebuild"]["argv"])
         argv[argv.index("--output") + 1] = str(media)
         argv += ["--on-exists", "overwrite", "--no-auto-sync"]
+        for flag, key in (("--provenance", "provenance"), ("--provenance-dir", "provenance_dir")):
+            if getattr(args, key, None) is not None:
+                argv += [flag, getattr(args, key)]
+        _REBUILD_PREVIOUS[str(media.resolve())] = record
         run_args = parser.parse_args(argv)
         run_config = dict(config)
         if args.recorded_settings:
@@ -3795,10 +3830,10 @@ def cmd_inspect(args):
     for item in info.get("chapters", []):
         title = item.get("tags", {}).get("title", "Untitled")
         print(f"Chapter {item['start_time']}–{item['end_time']}: {title}")
-    record = _jwkit_common.read_provenance(args.file)
+    record, where = _jwkit_common.locate_provenance(args.file, ffprobe=FFPROBE_BIN)
     if record:
         source = record.get("source", {})
-        print(f"Provenance sidecar: {_jwkit_common.provenance_path(args.file).name}")
+        print("Provenance: " + ("embedded in the file" if where == "embedded" else f"sidecar {where}"))
         print(f"  built {record.get('created_at')} by {record.get('tool')} {record.get('tool_commit')}")
         print(f"  source: {source.get('url')} (md5 {source.get('checksum')})")
         print(f"  rebuild: {record.get('rebuild', {}).get('command')}")
@@ -3861,6 +3896,7 @@ def build_parser():
         p.add_argument("--codec", choices=["h264", "hevc", "av1"], help="Video codec for this run (default: configured video_codec)")
         p.add_argument("--crf", help="Video quality for this run; use 'auto' for the codec default")
         p.add_argument("--preset", help="FFmpeg encoder preset for this run (e.g. slow, medium, fast)")
+        _jwkit_common.add_provenance_arguments(p)
         p.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
         p.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
         p.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds, help="Time to wait for an 'ask' answer before falling back")
@@ -3907,11 +3943,19 @@ def build_parser():
     p_bulk.add_argument("--preset", help="FFmpeg encoder preset for this run (e.g. slow, medium, fast)")
     add_generic_config_overrides(p_bulk)
 
-    p_rebuild = subparsers.add_parser("rebuild", help="Re-create clips from their provenance sidecars; --check reports which sources jw.org has replaced")
-    p_rebuild.add_argument("paths", nargs="+", help="slverse-made media files, their .jwkit.json sidecars, or folders to search recursively")
+    p_rebuild = subparsers.add_parser("rebuild", help="Re-create clips from their provenance records; --check reports which sources jw.org has replaced")
+    p_rebuild.add_argument("paths", nargs="+", help="slverse-made media files (or their .jwkit.json sidecars), or folders to search recursively")
     p_rebuild.add_argument("--check", action="store_true", help="Only report which clips are out of date (exit 1 if any are); change nothing")
     p_rebuild.add_argument("--force", action="store_true", help="Rebuild every clip found, not just those whose source jw.org replaced")
-    p_rebuild.add_argument("--recorded-settings", action="store_true", help="Rebuild with the settings recorded in each sidecar instead of today's configuration")
+    p_rebuild.add_argument("--recorded-settings", action="store_true", help="Rebuild with the settings recorded in each record instead of today's configuration")
+    _jwkit_common.add_provenance_arguments(p_rebuild)
+
+    p_provenance = subparsers.add_parser("provenance", help="Move jwkit provenance records (slverse's and ffrife's) between embedded / beside / folder storage")
+    p_provenance.add_argument("paths", nargs="+", help="Media files, or folders to search recursively")
+    p_provenance.add_argument("--to", choices=("embed", "beside", "folder"), help="Where the records should live (default: the configured provenance_mode)")
+    p_provenance.add_argument("--force", action="store_true", help="Also move a sidecar whose media file has changed since it was recorded")
+    p_provenance.add_argument("--dry-run", action="store_true", help="Only list what would move")
+    _jwkit_common.add_provenance_arguments(p_provenance)
     return parser
 
 
@@ -3970,6 +4014,10 @@ def main():
         run_extract(args, config)
     elif args.command == "rebuild":
         status = cmd_rebuild(args, config, parser)
+        if status:
+            raise SystemExit(status)
+    elif args.command == "provenance":
+        status = cmd_provenance(args)
         if status:
             raise SystemExit(status)
     elif args.command == "find":

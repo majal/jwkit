@@ -2396,7 +2396,7 @@ if __name__ == "__main__":
 
 
 class FfrifeProvenanceTest(unittest.TestCase):
-    """A standalone ffrife output gets a `.jwkit.json` sidecar naming its
+    """A standalone ffrife output gets a provenance record naming its
     source, the source's MD5 (jw.org publishes MD5s), and the exact run."""
 
     @classmethod
@@ -2411,8 +2411,8 @@ class FfrifeProvenanceTest(unittest.TestCase):
             output = Path(tmp) / "lmd_FSL_07_r720P_rife.mp4"
             output.write_bytes(b"output bytes")
             config = dict(self.ffrife.DEFAULT_CONFIG, rife_binary_path="/x/rife-build/rife-ncnn-vulkan")
-            self.ffrife.write_run_provenance(str(source), str(output), config, start=126.693, end=160.46, fps=60)
-            record = self.ffrife._jwkit_common.read_provenance(output)
+            self.ffrife.write_run_provenance(str(source), str(output), config, start=126.693, end=160.46, fps=60, jwkit_config={"provenance_mode": "beside"})
+            record = self.ffrife._jwkit_common.read_provenance(output, {"provenance_mode": "beside"})
         self.assertEqual(record["tool"], "ffrife")
         self.assertEqual(record["source"]["checksum"], hashlib.md5(b"source bytes").hexdigest())
         self.assertEqual(record["source"]["jw_org"], {"publication": "lmd", "language": "FSL", "track": 7, "resolution": "720p"})
@@ -2425,7 +2425,7 @@ class FfrifeProvenanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "out.mp4"
             output.write_bytes(b"x")
-            self.ffrife.write_run_provenance("https://example.com/a.mp4", str(output), dict(self.ffrife.DEFAULT_CONFIG))
+            self.ffrife.write_run_provenance("https://example.com/a.mp4", str(output), dict(self.ffrife.DEFAULT_CONFIG), jwkit_config={"provenance_mode": "beside"})
             self.assertFalse(self.ffrife._jwkit_common.provenance_path(output).exists())
 
     def test_jw_org_name_pattern_handles_numbered_and_prefixed_names(self) -> None:

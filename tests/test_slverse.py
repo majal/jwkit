@@ -3152,13 +3152,16 @@ if __name__ == "__main__":
 
 
 class SlverseProvenanceTest(unittest.TestCase):
-    """The provenance sidecar + `slverse rebuild`: a clip's exact request,
-    source checksum, and tool version live beside it, because MP4 drops any
-    custom tag (source_checksum/editing never survive the final mux)."""
+    """The provenance record + `slverse rebuild`: a clip's exact request,
+    source checksum, and tool version are recorded with it (inside the file by
+    default), because MP4 drops any custom ffmpeg tag (source_checksum/editing
+    never survive the final mux)."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.slverse = load_script_module("slverse")
+
+    BESIDE = {"provenance_mode": "beside"}  # these tests write placeholder bytes, not real media
 
     def ns(self, **overrides):
         base = dict(clip_window=None, trim_start=None, trim_end=None, keep_end_transition=None,
@@ -3208,8 +3211,9 @@ class SlverseProvenanceTest(unittest.TestCase):
                     str(media), lang="FSL", book_name="Luke", book_num=42, chapter=4, verses_str="6", valid_verses=[6],
                     url="https://cfp2.jw-cdn.org/a/82d3a3/1/o/nwt_42_Lu_FSL_04_r720P.mp4", checksum="abc123",
                     start_time=10.0, end_time=22.5, args=self.ns(trim_end=6.24), config=config, edit_bits=["cut end 6.24s"],
+                    jwkit_config=self.BESIDE,
                 )
-            record = self.slverse._jwkit_common.read_provenance(media)
+            record = self.slverse._jwkit_common.read_provenance(media, self.BESIDE)
         self.assertEqual(record["tool"], "slverse")
         self.assertEqual(record["source"]["checksum"], "abc123")
         self.assertEqual(record["source"]["window_seconds"], [10.0, 22.5])
@@ -3224,10 +3228,10 @@ class SlverseProvenanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             media = Path(tmp) / "clip.mp4"
             media.write_bytes(b"one")
-            common.write_provenance(media, {"tool": "slverse", "tool_commit": "aaa", "source": {"checksum": "old"}})
+            common.write_provenance(media, {"tool": "slverse", "tool_commit": "aaa", "source": {"checksum": "old"}}, self.BESIDE)
             media.write_bytes(b"two!")
-            common.write_provenance(media, {"tool": "slverse", "tool_commit": "bbb", "source": {"checksum": "new"}})
-            record = common.read_provenance(media)
+            common.write_provenance(media, {"tool": "slverse", "tool_commit": "bbb", "source": {"checksum": "new"}}, self.BESIDE)
+            record = common.read_provenance(media, self.BESIDE)
         self.assertEqual(record["source"]["checksum"], "new")
         self.assertEqual(len(record["history"]), 1)
         self.assertEqual(record["history"][0]["source_checksum"], "old")
@@ -3245,13 +3249,13 @@ class SlverseProvenanceTest(unittest.TestCase):
                     "request": {"language": "FSL", "book": "Luke", "book_num": 42, "chapter": 4, "verses": "6"},
                     "source": {"language": "FSL", "book_num": 42, "chapter": 4, "checksum": checksum},
                     "rebuild": {"argv": ["extract", "FSL", "Luke 4:6", "--write", "--output", media.name]},
-                })
+                }, self.BESIDE)
             live = {"files": {"FSL": {"MP4": [{"track": 4, "file": {"url": "u", "checksum": "same"}}]}}}
             with mock.patch.object(self.slverse, "get_pub_media_links", return_value=live), \
                  mock.patch.object(self.slverse, "find_track", return_value={"file": {"url": "u", "checksum": "same"}}), \
                  mock.patch.object(self.slverse, "COLOR", self.slverse._jwkit_common.Colorizer(False)), \
                  mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-                args = parser.parse_args(["rebuild", "--check", tmp])
+                args = parser.parse_args(["rebuild", "--check", "--provenance", "beside", tmp])
                 status = self.slverse.cmd_rebuild(args, dict(self.slverse.DEFAULT_CONFIG), parser)
         self.assertEqual(status, 1)
         self.assertIn("SOURCE UPDATED  b.mp4", out.getvalue())

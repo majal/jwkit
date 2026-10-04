@@ -4219,6 +4219,7 @@ def add_processing_arguments(parser, include_trim=True):
     parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"])
     parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"])
     parser.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds)
+    _jwkit_common.add_provenance_arguments(parser)
     add_generic_config_overrides(parser)
 
 def build_parser():
@@ -4288,13 +4289,15 @@ PROVENANCE_CONFIG_KEYS = (
 _JW_MEDIA_NAME = re.compile(r"^(?:\d+(?:-opt)?\s+)?(?:.*?\s-\s)?(?P<pub>[A-Za-z0-9-]+)_(?P<lang>[A-Z]+)_(?P<track>\d+)_r(?P<res>\d+)P\b")
 
 
-def write_run_provenance(source, output, config, start=None, end=None, vf=None, fps=None, speed=None):
-    """Sidecar (`<output>.jwkit.json`, see _jwkit_common's provenance section)
-    recording how a standalone ffrife output was made: the source's name,
+def write_run_provenance(source, output, config, start=None, end=None, vf=None, fps=None, speed=None, jwkit_config=None):
+    """Provenance record (embedded in the output by default, see
+    _jwkit_common's provenance section) recording how a standalone ffrife
+    output was made: the source's name,
     size and MD5 (jw.org publishes MD5s, so a later check can tell whether it
     replaced the source), the window/fps/speed/filter, the settings that shape
     the pixels, and the jwkit commit and RIFE build. Best effort - never fails
     a run whose video already exists. Skipped for URL inputs."""
+    jwkit_config = jwkit_config if jwkit_config is not None else _jwkit_common.load_jwkit_config()
     try:
         source_path = Path(str(source))
         if not source_path.is_file() or not Path(str(output)).is_file():
@@ -4330,9 +4333,9 @@ def write_run_provenance(source, output, config, start=None, end=None, vf=None, 
             "rebuild": {"argv": argv, "command": "ffrife " + " ".join(shlex.quote(a) for a in argv)},
             "advert": _jwkit_common.tool_advert("ffrife"),
         }
-        _jwkit_common.write_provenance(output, record)
+        _jwkit_common.write_provenance(output, record, jwkit_config, ffmpeg=FFMPEG_BIN)
     except Exception as exc:  # noqa: BLE001 - see docstring
-        print(f"(could not write the provenance sidecar for {output}: {exc})", file=sys.stderr)
+        print(f"(could not record provenance for {output}: {exc})", file=sys.stderr)
 
 
 def main():
@@ -4382,7 +4385,7 @@ def main():
         try:
             ok = interpolate(args.input, output, config, start=start, end=end, vf=args.vf, fps=args.fps, speed=args.speed)
             if ok:
-                write_run_provenance(args.input, output, config, start=start, end=end, vf=args.vf, fps=args.fps, speed=args.speed)
+                write_run_provenance(args.input, output, config, start=start, end=end, vf=args.vf, fps=args.fps, speed=args.speed, jwkit_config=_jwkit_common.apply_provenance_overrides(dict(jwkit_config), args))
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -4421,7 +4424,7 @@ def main():
                 continue
             try:
                 if interpolate(source, output, config, vf=args.vf, fps=args.fps, speed=args.speed):
-                    write_run_provenance(source, output, config, vf=args.vf, fps=args.fps, speed=args.speed)
+                    write_run_provenance(source, output, config, vf=args.vf, fps=args.fps, speed=args.speed, jwkit_config=_jwkit_common.apply_provenance_overrides(dict(jwkit_config), args))
                     completed += 1
                 else:
                     failures.append((source, "interpolation unavailable"))
