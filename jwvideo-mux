@@ -61,8 +61,17 @@ DEFAULT_CONFIG = {
     "scan_small_regions": False, "region_count": 8, "dedupe_identical_video": False,
     "dedupe_visually_same": False, "adaptive_mpv_library": False,
     "launchers_in_video_folder": False, "normalize_mismatched_aspect": False,
+    "ffmpeg_binary": "", "ffprobe_binary": "",
 }
 CONFIG_HELP = {key: key.replace("_", " ") for key in DEFAULT_CONFIG}
+CONFIG_HELP.update({
+    "ffmpeg_binary": "Override ffmpeg executable detection",
+    "ffprobe_binary": "Override ffprobe executable detection",
+})
+
+# Resolved once at startup by main() -> _jwkit_common.resolve_ffmpeg_binary/resolve_ffprobe_binary.
+FFMPEG_BIN = "ffmpeg"
+FFPROBE_BIN = "ffprobe"
 
 def load_config():
     config = dict(DEFAULT_CONFIG)
@@ -100,6 +109,9 @@ def run_config(argv):
         if key == "variant_min_seconds" and float(value) < 0:
             return "must be non-negative"
         return None
+    def check_extra(config):
+        return [f"{key}: executable not found: {config[key]}" for key in ("ffmpeg_binary", "ffprobe_binary")
+                if config.get(key) and not (Path(config[key]).is_file() or shutil.which(config[key]))]
     def parse_value(key, raw):
         if key == "variant_min_seconds":
             return _jwkit_common.parse_time_seconds(raw)
@@ -108,6 +120,7 @@ def run_config(argv):
         tool="jwvideo-mux", args=args, config=config, defaults=DEFAULT_CONFIG,
         config_file=CONFIG_FILE, save_config=save_config,
         descriptions=CONFIG_HELP, parse_value=parse_value, validate=validate,
+        check_extra=check_extra,
     )
 
 
@@ -218,7 +231,7 @@ def color_print(msg: str, color: str = ""):
     print(rendered.encode(encoding, errors="replace").decode(encoding))
 
 def check_dependencies():
-    if not shutil.which("ffmpeg"):
+    if not shutil.which(FFMPEG_BIN):
         color_print("ffmpeg is not installed or not in PATH.", "red")
         ans = input("Would you like to try installing ffmpeg now? [Y/n] ")
         if ans.lower() not in ("n", "no"):
@@ -229,7 +242,7 @@ def check_dependencies():
             elif sys.platform == "win32":
                 os.system("winget install -e --id Gyan.FFmpeg")
             
-            if not shutil.which("ffmpeg"):
+            if not shutil.which(FFMPEG_BIN):
                 color_print("Failed to install ffmpeg automatically. Please install it manually.", "red")
                 sys.exit(1)
         else:
@@ -352,7 +365,7 @@ def command_output(cmd: list[str]) -> str:
 def probe_video(path: Path) -> dict:
     """Return video properties required for safe variant comparison."""
     raw = command_output([
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=codec_name,width,height,pix_fmt,avg_frame_rate,duration:format=duration",
         "-of", "json", str(path),
     ])
@@ -373,7 +386,7 @@ def probe_video(path: Path) -> dict:
 def elementary_video_hash(path: Path) -> str:
     """Hash copied video packets; this is the exact-reuse test."""
     output = command_output([
-        "ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0",
+        FFMPEG_BIN, "-v", "error", "-i", str(path), "-map", "0:v:0",
         "-c", "copy", "-f", "hash", "-hash", "sha256", "-",
     ])
     if not output.startswith("SHA256="):
@@ -418,7 +431,7 @@ def trailing_freeze_start(path: Path, *, noise_db: float = -30.0, min_freeze_s: 
     """
     try:
         result = subprocess.run(
-            ["ffmpeg", "-v", "info", "-i", str(path), "-vf", f"freezedetect=n={noise_db}dB:d={min_freeze_s}",
+            [FFMPEG_BIN, "-v", "info", "-i", str(path), "-vf", f"freezedetect=n={noise_db}dB:d={min_freeze_s}",
              "-f", "null", "-"],
             capture_output=True, text=True, timeout=timeout,
         )
@@ -610,7 +623,7 @@ def analyze_video_variants(
                         spec.index: Path(tmp) / f"{reference}-{lang}.region{spec.index}.psnr.log" for spec in region_specs
                     } if region_specs else {}
                     cmd = [
-                        "ffmpeg", "-v", "error", "-i", str(video_paths[reference]), "-i", str(video_paths[lang]),
+                        FFMPEG_BIN, "-v", "error", "-i", str(video_paths[reference]), "-i", str(video_paths[lang]),
                         "-filter_complex", _comparison_filtergraph(
                             ref_fps, Path(ssim_stats.name), Path(psnr_stats.name),
                             region_specs=region_specs,
@@ -915,7 +928,7 @@ def _intersect_intervals(a: list[tuple[float, float]], b: list[tuple[float, floa
 def keyframe_times(path: Path) -> list[float]:
     """Return presentation timestamps (seconds) of every keyframe in the video stream."""
     raw = command_output([
-        "ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+        FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
         "-show_entries", "frame=pts_time", "-of", "csv=print_section=0", str(path),
     ])
     times = []
@@ -1015,7 +1028,7 @@ def video_frame_count(path: Path) -> int:
     is one frame here, and this runs in milliseconds even on an 80-minute file, where -count_frames
     would mean a full decode."""
     raw = command_output([
-        "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+        FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-count_packets",
         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path),
     ]).strip()
     return int(raw) if raw.isdigit() else 0
@@ -1058,7 +1071,7 @@ def split_reference_into_segments(
 
     if not cutpoints:
         subprocess.run([
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path),
+            FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path),
             "-map", "0:v:0", "-c", "copy", str(out_paths[0]),
         ], check=True)
         return [video_frame_count(out_paths[0])]
@@ -1079,7 +1092,7 @@ def split_reference_into_segments(
     with tempfile.TemporaryDirectory(prefix="jwvideo-mux-segments-") as tmp:
         pattern = str(Path(tmp) / "part%05d.mkv")
         subprocess.run([
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path),
+            FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path),
             "-map", "0:v:0", "-c", "copy", "-f", "segment",
             "-segment_times", segment_times, "-reset_timestamps", "1", pattern,
         ], check=True)
@@ -1149,7 +1162,7 @@ def extract_localized_segment(
     filters = [video_filter] if video_filter else []
     filters.append(f"fps={fps:.10f}")
     subprocess.run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
         "-ss", f"{start:.6f}", "-i", str(video_path), "-map", "0:v:0",
         "-vf", ",".join(filters), "-frames:v", str(frames),
         "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", str(out_path),
@@ -1166,7 +1179,7 @@ def extract_localized_segment(
 def extract_audio_track(source_path: Path, out_path: Path):
     """Stream-copy the full-duration audio into a standalone Matroska audio file."""
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source_path),
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source_path),
         "-map", "0:a:0", "-vn", "-c", "copy", str(out_path),
     ]
     subprocess.run(cmd, check=True)
@@ -1288,8 +1301,8 @@ def tool_version_string(cmd: list[str]) -> str | None:
 
 def collect_tool_versions() -> dict:
     versions = {}
-    if shutil.which("ffmpeg"):
-        versions["ffmpeg"] = tool_version_string(["ffmpeg", "-version"])
+    if shutil.which(FFMPEG_BIN):
+        versions["ffmpeg"] = tool_version_string([FFMPEG_BIN, "-version"])
     if shutil.which("mpv"):
         versions["mpv"] = tool_version_string(["mpv", "--version"])
     return versions
@@ -1778,7 +1791,7 @@ def find_attached_picture_stream(path: Path) -> tuple[int, str] | None:
     dropped from the merged output even though nothing asked for that."""
     try:
         raw = command_output([
-            "ffprobe", "-v", "error", "-select_streams", "v",
+            FFPROBE_BIN, "-v", "error", "-select_streams", "v",
             "-show_entries", "stream=index,codec_name:stream_disposition=attached_pic",
             "-of", "json", str(path),
         ])
@@ -1841,7 +1854,7 @@ def record_mux_provenance(out_path, args, input_paths, input_roles, source_urls,
     if single_stream_language:
         argv.append("--single-streams")
     _jwkit_common.record_output(
-        out_path, "jwvideo-mux", root, argv, args=args,
+        out_path, "jwvideo-mux", root, argv, args=args, ffmpeg=FFMPEG_BIN, ffprobe=FFPROBE_BIN,
         request={"mode": "local files" if is_local_file else "jw.org", "input": str(args.input), "video_languages": vid_langs,
                  "audio_languages": aud_langs, "subtitle_languages": sub_langs, "languages_muxed": langs_loaded,
                  "single_stream_language": single_stream_language, "cover_art": bool(art_attached)},
@@ -1880,6 +1893,8 @@ def main():
     parser.add_argument("--variant-min-seconds", type=_jwkit_common.parse_time_seconds, help="Minimum sustained localized-difference duration")
     parser.add_argument("--scan-small-regions", action=argparse.BooleanOptionalAction, default=None, help="Compare horizontal frame bands too")
     parser.add_argument("--region-count", type=int, help="Horizontal bands used by --scan-small-regions")
+    parser.add_argument("--ffmpeg-binary", help="ffmpeg executable to use (default: auto-detect, preferring ffmpeg-full)")
+    parser.add_argument("--ffprobe-binary", help="ffprobe executable to use (default: auto-detect, preferring ffprobe-full)")
     parser.add_argument("--manual-overrides", type=Path, help="TOML file (ground-truth.toml schema: talks -> videos -> differences, with an optional fallback_ok flag per difference) of human-confirmed evidence for local-file-mode SCE-layout input; always wins over automatic detection for the languages/windows it covers. Matched by exact talk-folder-name + anchor-filename, so reuse one file across a whole library.")
     parser.add_argument("--dedupe-identical-video", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dedupe-visually-same", action=argparse.BooleanOptionalAction, default=None)
@@ -1895,9 +1910,11 @@ def main():
     for key in DEFAULT_CONFIG:
         if getattr(args, key, None) is None:
             setattr(args, key, config[key])
-    global COLOR
+    global COLOR, FFMPEG_BIN, FFPROBE_BIN
     COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config(), cli_override=args.color))
     _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
+    FFMPEG_BIN = _jwkit_common.resolve_ffmpeg_binary({"ffmpeg_binary": args.ffmpeg_binary})
+    FFPROBE_BIN = _jwkit_common.resolve_ffprobe_binary({"ffprobe_binary": args.ffprobe_binary})
     check_dependencies()
     
     vid_langs, vid_overrides, vid_bare = parse_lang_tokens(args.video) if args.video and args.video.upper() != "NONE" else ([], {}, {})
@@ -2375,7 +2392,7 @@ def main():
     # so for mkv the single frame is extracted to a standalone temp image and added via
     # ffmpeg's dedicated -attach mechanism instead, which matroska does mark correctly.
     art_extra_args: list[str] = []
-    art_temp_path: Path | None = None
+    art_temp_dir: Path | None = None
     if base_vid:
         attached_pic = find_attached_picture_stream(base_vid)
         if attached_pic is not None:
@@ -2384,34 +2401,34 @@ def main():
                 art_input_idx = get_or_add_input(base_vid, "cover-art")
                 art_extra_args = ["-map", f"{art_input_idx}:v:{art_v_index}?"]
             elif art_codec in _COVER_ART_MIME_TYPES:
-                fd, art_temp_name = tempfile.mkstemp(
-                    suffix=_COVER_ART_EXTENSIONS[art_codec], prefix="jwvideo-mux-art-",
-                )
-                os.close(fd)
-                art_temp_path = Path(art_temp_name)
+                # A fixed name inside a private temp dir, not a random temp file name: ffmpeg
+                # records the attachment's filename in the MKV, so a random one made two
+                # otherwise identical rebuilds differ in that tag.
+                art_temp_dir = Path(tempfile.mkdtemp(prefix="jwvideo-mux-art-"))
+                art_path = art_temp_dir / f"cover{_COVER_ART_EXTENSIONS[art_codec]}"
                 extract = subprocess.run([
-                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(base_vid),
-                    "-map", f"0:v:{art_v_index}", "-frames:v", "1", "-c", "copy", str(art_temp_path),
+                    FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", str(base_vid),
+                    "-map", f"0:v:{art_v_index}", "-frames:v", "1", "-c", "copy", str(art_path),
                 ])
                 if extract.returncode == 0:
                     attachment_index = video_stream_idx + audio_stream_idx + subtitle_stream_idx
                     art_extra_args = [
-                        "-attach", str(art_temp_path),
+                        "-attach", str(art_path),
                         f"-metadata:s:{attachment_index}", f"mimetype={_COVER_ART_MIME_TYPES[art_codec]}",
                     ]
                 else:
-                    art_temp_path.unlink(missing_ok=True)
-                    art_temp_path = None
+                    shutil.rmtree(art_temp_dir, ignore_errors=True)
+                    art_temp_dir = None
 
     cmd = (
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + ff_inputs + ff_maps + ff_meta
+        [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y"] + ff_inputs + ff_maps + ff_meta
         + art_extra_args + ["-c:v", "copy", "-c:a", "copy", str(out_path)]
     )
 
     color_print(f"Creating merged {args.container.upper()}: {out_name}", "cyan")
     res = subprocess.run(cmd)
-    if art_temp_path is not None:
-        art_temp_path.unlink(missing_ok=True)
+    if art_temp_dir is not None:
+        shutil.rmtree(art_temp_dir, ignore_errors=True)
     if res.returncode == 0:
         color_print("✓ Merged video created successfully.", "green")
         record_mux_provenance(
@@ -2456,7 +2473,7 @@ def main():
                     continue
                 out_single = resolved_out_single
 
-                cmd_single = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(base_vid)]
+                cmd_single = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", str(base_vid)]
                 maps = ["-map", "0:v"]
 
                 media = local_files.get(lang, {})

@@ -18,7 +18,7 @@ It downloads a jw.org video and merges the language tracks you want into one fil
 - Can create single-stream audio/video files instead of merged ones, replacing the base track, which helps with platforms that play all audio streams simultaneously.
 - If you include a language in both `--video` and `--audio` (e.g., `--video E --audio E,TG`), the script is smart enough to download the MP4 exactly once and map its video and audio streams seamlessly.
 - **Sign Language:** If a language does not have an MP3 (common for sign languages), the script will automatically fall back to downloading its MP4 to use as the track source.
-- Carries over an embedded cover-art/thumbnail stream from the base video into the merged output, if it has one (common in jw.org's own MP4s) -- it would otherwise be silently dropped, since each language's video is normally mapped by its own first (real) video stream only.
+- Carries over an embedded cover-art/thumbnail stream from the base video into the merged output, if it has one (common in jw.org's own MP4s) -- it would otherwise be silently dropped, since each language's video is normally mapped by its own first (real) video stream only. In an MKV the art is attached under the fixed name `cover.png` / `cover.jpg`, so two rebuilds of the same inputs don't differ in that tag.
 
 ## Supported Platforms
 
@@ -86,7 +86,7 @@ A bare filename (no `CODE=` prefix) works too, as long as it follows the same `{
 
 ## Important Behavior / Defaults
 
-Persistent mux preferences live in `~/.config/jwkit/jwvideo-mux/config.toml`. Use `jwvideo-mux config list|get|set|path|edit|reset|diff|check`; every persistent key also has a same-named per-run flag. Boolean preferences have positive and negative forms. The input identifier, manual evidence files, analysis actions, and overwrite decisions are deliberately one-run inputs rather than saved defaults.
+Persistent mux preferences live in `~/.config/jwkit/jwvideo-mux/config.toml`. Use `jwvideo-mux config list|get|set|path|edit|reset|diff|check`; every persistent key also has a same-named per-run flag. `ffmpeg_binary` / `ffprobe_binary` (`--ffmpeg-binary` / `--ffprobe-binary`) pick the executables; left empty, jwvideo-mux auto-detects them the way `slverse`/`ffrife` do, preferring an `ffmpeg-full` build over the stock one. Boolean preferences have positive and negative forms. The input identifier, manual evidence files, analysis actions, and overwrite decisions are deliberately one-run inputs rather than saved defaults.
 
 - `-v, --video`: Comma-separated languages for video tracks (default: `E`)
 - `-a, --audio`: Comma-separated languages for audio tracks (default: `E,TG,CV,HV,SA`)
