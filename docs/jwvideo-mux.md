@@ -39,7 +39,7 @@ Make the script executable if your checkout did not preserve executable bits:
 chmod +x jwvideo-mux
 ```
 
-For a simpler, double-click experience without using the command line, create a wrapper script as detailed in the [Friendly Launchers](../README.md#friendly-launchers) section.
+For a simpler, double-click experience without using the command line, create a wrapper script as detailed in the [Friendly Launchers](https://github.com/majal/maj-scripts#friendly-launchers) section of the `maj-scripts` README.
 
 ## Common Usage Examples
 

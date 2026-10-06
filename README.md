@@ -165,15 +165,17 @@ Most people should just use [Quick Install](#quick-install) above. This section 
 
 ### [Python](https://www.python.org/downloads/)
 
-Most tools in this repo are expected to use Python 3.
+These tools need Python **3.11 or newer** (`jwdl` and `jwvideo-mux` use the standard-library `tomllib`).
 
-Check whether Python 3 is already available:
+Check whether a suitable Python is already available:
 
 ```bash
 python3 --version
 ```
 
-If not, install it with your platform's package manager (see [Package Managers](#package-managers) below), or the [official installer](https://www.python.org/downloads/).
+On Windows use `py -3 --version` instead. If `python --version` just opens the Microsoft Store, that's Windows' placeholder `python.exe`, not a real Python: install one with `winget install Python.Python.3.13`.
+
+If you need one, install it with your platform's package manager (see [Package Managers](#package-managers) below), or the [official installer](https://www.python.org/downloads/).
 
 [↑ TOC](#table-of-contents)
 
