@@ -18,6 +18,8 @@ $RepoZip = "$RepoUrl/archive/refs/heads/main.zip"
 $JwkitHome = if ($env:JWKIT_HOME) { $env:JWKIT_HOME } else { Join-Path $HOME ".jwkit" }
 $Tools = @("ffinpaint", "ffrife", "ffv", "jwdl", "jwkit-provenance", "jwpl", "jwvideo-mux", "register-jwplay-launcher", "slverse")
 $InstalledPackageIds = @()
+# jwdl and jwvideo-mux import tomllib, which is Python 3.11+.
+$PythonPackageId = "Python.Python.3.13"
 
 function Write-Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg) { Write-Host $msg -ForegroundColor Green }
@@ -26,6 +28,29 @@ function Write-Err($msg) { Write-Host $msg -ForegroundColor Red }
 
 function Test-Command($name) {
     return [bool](Get-Command $name -ErrorAction SilentlyContinue)
+}
+
+function Test-RealPython {
+    # Command *existence* proves nothing on a fresh Windows box: the
+    # Microsoft Store ships python.exe/python3.exe stubs in WindowsApps that
+    # "exist" but only print "Python was not found" (exit 9009). So run the
+    # candidate and ask it for its version instead.
+    param([string]$Exe, [string[]]$PreArgs = @())
+    if (-not (Test-Command $Exe)) { return $false }
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $out = & $Exe @PreArgs -c "import sys; print(int(sys.version_info >= (3, 11)))" 2>$null
+        return ($LASTEXITCODE -eq 0 -and "$out".Trim() -eq "1")
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $oldEap
+    }
+}
+
+function Test-PythonUsable {
+    return (Test-RealPython "py" @("-3")) -or (Test-RealPython "python")
 }
 
 function Install-WingetPackage($id) {
@@ -54,11 +79,11 @@ try {
     }
 
     Write-Step "Checking Python, ffmpeg, git"
-    $havePython = (Test-Command py) -or (Test-Command python)
+    $havePython = Test-PythonUsable
     if (-not $havePython) {
-        Write-Warn "Installing Python..."
-        Install-WingetPackage "Python.Python.3"
-        $InstalledPackageIds += "Python.Python.3"
+        Write-Warn "Installing Python (a usable Python 3.11+ wasn't found; the Microsoft Store python.exe stub doesn't count)..."
+        Install-WingetPackage $PythonPackageId
+        $InstalledPackageIds += $PythonPackageId
     }
     if (-not (Test-Command ffmpeg)) {
         Write-Warn "Installing ffmpeg..."
@@ -70,7 +95,7 @@ try {
         Install-WingetPackage "Git.Git"
         $InstalledPackageIds += "Git.Git"
     }
-    if ($havePython -and (Test-Command ffmpeg) -and (Test-Command git)) {
+    if ($InstalledPackageIds.Count -eq 0) {
         Write-Ok "Already have Python, ffmpeg, and git."
     }
 
@@ -80,7 +105,9 @@ try {
     $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
     $env:Path = "$machinePath;$userPath"
 
-    $pyLauncher = if (Test-Command py) { "py" } elseif (Test-Command python) { "python" } else { "py" }
+    if (-not (Test-PythonUsable)) {
+        throw "Python 3.11+ still isn't runnable after setup. Install it from https://www.python.org/downloads/windows/ (tick 'Add python.exe to PATH'), then re-run this installer."
+    }
 
     # --- Fetch jwkit ---
     Write-Step "Getting jwkit"
@@ -130,7 +157,11 @@ try {
         $toolPath = Join-Path $JwkitHome $tool
         if (Test-Path $toolPath) {
             $shimPath = Join-Path $JwkitHome "$tool.cmd"
-            Set-Content -Path $shimPath -Value "@echo off`r`n$pyLauncher `"%~dp0$tool`" %*" -Encoding ASCII
+            # Resolve Python at run time, not install time: prefer the py
+            # launcher (python.org/winget installs always add it), fall back
+            # to python on PATH.
+            $shim = "@echo off`r`nwhere py >nul 2>nul`r`nif not errorlevel 1 (`r`n  py -3 `"%~dp0$tool`" %*`r`n  exit /b %errorlevel%`r`n)`r`npython `"%~dp0$tool`" %*`r`nexit /b %errorlevel%`r`n"
+            Set-Content -Path $shimPath -Value $shim -Encoding ASCII -NoNewline
         }
     }
 
@@ -150,10 +181,18 @@ try {
     $updateShim = Join-Path $JwkitHome "jwkit-update.cmd"
     Set-Content -Path $updateShim -Value "@echo off`r`npowershell -NoProfile -Command `"irm https://raw.githubusercontent.com/majal/jwkit/main/install.ps1 | iex`"" -Encoding ASCII
 
+    # --- Smoke test: run a real shim, the way a new terminal will ---
+    Write-Step "Checking that jwdl runs"
+    $smoke = & (Join-Path $JwkitHome "jwdl.cmd") --help 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "jwdl.cmd --help failed (exit $LASTEXITCODE): $smoke"
+    }
+    Write-Ok "jwdl runs."
+
     Write-Step "All set!"
     Write-Ok "jwkit is installed at $JwkitHome"
     Write-Host ""
-    Write-Host "Close and reopen your terminal (PowerShell picks up the new PATH there), then try:"
+    Write-Host "Close ALL open PowerShell / Terminal windows and open a new one (an already-running Windows Terminal keeps the old PATH), then try:"
     Write-Host "  slverse --help" -ForegroundColor White
     Write-Host "  jwdl list" -ForegroundColor White
     Write-Host ""

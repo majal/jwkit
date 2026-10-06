@@ -49,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/majal/jwkit/main/install.sh | bash
 irm https://raw.githubusercontent.com/majal/jwkit/main/install.ps1 | iex
 ```
 
-Then open a **new** terminal window and try:
+Then close **every** open terminal window and open a new one — PATH changes only reach terminals started after the install (on Windows, a new tab inside an already-running Windows Terminal isn't enough). Try:
 
 ```bash
 slverse --help
@@ -213,7 +213,7 @@ brew install git
 #### [winget](https://learn.microsoft.com/windows/package-manager/winget/) and [Chocolatey](https://chocolatey.org/) (Windows)
 
 ```powershell
-winget install Python.Python.3
+winget install Python.Python.3.13
 winget install Gyan.FFmpeg
 winget install Git.Git
 ```

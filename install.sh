@@ -23,6 +23,13 @@ step()     { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# python3 merely existing isn't enough: macOS's /usr/bin/python3 is 3.9, and
+# jwdl/jwvideo-mux import tomllib (Python 3.11+).
+python_ok() {
+    command_exists python3 &&
+        python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
+}
+
 safe_install_dir() {
     case "$JWKIT_HOME" in
         ""|/|"$HOME")
@@ -54,7 +61,7 @@ ensure_macos_deps() {
 
     step "Checking Python, ffmpeg, git"
     local missing=()
-    command_exists python3 || missing+=(python3)
+    python_ok || missing+=(python3)
     command_exists ffmpeg || missing+=(ffmpeg)
     command_exists git || missing+=(git)
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -70,7 +77,7 @@ ensure_macos_deps() {
 ensure_linux_deps() {
     step "Checking Python, ffmpeg, git"
     local missing=()
-    command_exists python3 || missing+=(python3)
+    python_ok || missing+=(python3)
     command_exists ffmpeg || missing+=(ffmpeg)
     command_exists git || missing+=(git)
 
@@ -99,6 +106,11 @@ ensure_linux_deps() {
         exit 1
     fi
     INSTALLED_DEPENDENCIES+=("${missing[@]}")
+    if ! python_ok; then
+        c_red "Your system's Python is older than 3.11, which jwkit needs."
+        c_red "Install a newer one (for example via pyenv or your distro's python3.11+ package), then re-run this installer."
+        exit 1
+    fi
 }
 
 os="$(uname -s)"
