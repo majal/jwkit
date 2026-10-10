@@ -4,7 +4,7 @@ Guidance for future contributors and AI agents working in this repo.
 
 Repo name: `jwkit`
 
-Template compliance: repo-template-standard.md v1.2.0, reviewed 2026-08-31 (previously v1.0.0). Config-first/flag-parity retrofit, Unix-style config comments, and UNIX-philosophy/modularity refactor for existing code are tracked in `ags/docs/reports/2026-08-31-cross-repo-standards-rollout-handoff.md` -- not yet applied here.
+Template compliance: repo-template-standard.md v1.3.0 (reviewed 2026-10-10: item 11 n/a, no operator CLIs reaching tenant state; was v1.2.0), reviewed 2026-08-31 (previously v1.0.0). Config-first/flag-parity retrofit, Unix-style config comments, and UNIX-philosophy/modularity refactor for existing code are tracked in `ags/docs/reports/2026-08-31-cross-repo-standards-rollout-handoff.md` -- not yet applied here.
 Check `bin/new-agent-repo.d/repo-template-standard.md` for the current
 version and re-review this repo against its changelog when they diverge.
 
