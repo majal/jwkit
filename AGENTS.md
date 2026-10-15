@@ -120,10 +120,15 @@ Root-level one-liner installers for non-technical users (`curl | bash` on macOS/
 
 ## Local Memory
 
-See `memory/README.md` for the full contract. Short version:
-`memory/MEMORY.md` is the only file to load by default; `memory/topics/*.md`
-holds the actual entries, opened only when relevant. Gitignored — public
-GitHub repo, same as `bin`/`maj-scripts`.
+One shared store for every agent (Claude, Codex, Gemini): `memory/`. Contract and cleanup
+rules: `~/dig/ags/docs/memory-standard.md`; tool: `~/dig/ags/bin/memory-check`.
+
+- Read `memory/MEMORY.md` (small, generated index) first; open a topic only when its hook
+  fits the task. Not listed? `memory-check find <keyword>` searches topics + archive.
+- Record durable facts the same turn: search first, update or add a topic with a short
+  `description`, run `memory-check reindex`, commit. Never hand-edit `MEMORY.md`.
+- Finished incident or project: lift the lasting rule out, set `status=resolved`, run
+  `memory-check archive`. Never store secrets, tokens, or raw transcripts.
 
 ## Public Repo And Secrets
 
