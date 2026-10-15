@@ -64,12 +64,8 @@ No `jw` prefix by default (the repo scopes it). Don't rename `jwdl` or `jwvideo-
 - Normal file edits inside this checkout are pre-approved. Still ask before escalated actions: destructive commands,
   writes outside this repo/writable roots, GUI/system-level actions, sandbox-blocked network commands.
 
-## Local Memory
-One shared store for every agent: `memory/`. Rules: `~/dig/ags/docs/memory-standard.md`; tool: `~/dig/ags/bin/memory-check`.
-- Read `memory/MEMORY.md` (generated) first; open a topic only when its hook fits; else `memory-check find <kw>`.
-- Record durable facts the same turn: search first, add/update a topic with a short `description`,
-  `memory-check reindex`, commit. Never hand-edit `MEMORY.md`. Finished incidents: `status=resolved` +
-  `memory-check archive`. Never store secrets, tokens or raw transcripts.
+## Local memory
+Shared store `memory/`: read `memory/MEMORY.md` first, `memory-check find <keyword>` for the rest. Workflow in the global `AGENTS.md`; rules `~/dig/ags/docs/memory-standard.md`.
 
 ## When Adding A Tool (checklist; README/doc templates in `docs/contributor-reference.md`)
 - add the tool file; README table of contents entry + short `## Tools` subsection (name, blurb, `Full docs:` link) +
