@@ -1,221 +1,83 @@
 # AGENTS.md
 
-Guidance for future contributors and AI agents working in this repo.
+Guidance for contributors and AI agents. Repo: `jwkit` -- tools for pulling/processing jw.org content: `slverse`
+(Bible sign-language clips), `jwdl` (music/periodicals/video), `jwvideo-mux` (multi-language video mux), `ffrife`
+(AI frame interpolation library). Split from `majal/maj-scripts` 2026-08-13. History, `jwdl video` vs `jwvideo-mux`
+rationale, and full detail on the shared-module features below: `docs/contributor-reference.md`.
 
-Repo name: `jwkit`
-
-Template compliance: repo-template-standard.md v1.3.0 (reviewed 2026-10-10: item 11 n/a, no operator CLIs reaching tenant state; was v1.2.0), reviewed 2026-08-31 (previously v1.0.0). Config-first/flag-parity retrofit, Unix-style config comments, and UNIX-philosophy/modularity refactor for existing code are tracked in `ags/docs/reports/2026-08-31-cross-repo-standards-rollout-handoff.md` -- not yet applied here.
-Check `bin/new-agent-repo.d/repo-template-standard.md` for the current
-version and re-review this repo against its changelog when they diverge.
-
-## Purpose
-
-`jwkit` holds tools for pulling and processing content from jw.org: Bible sign-language clips (`slverse`), music/periodicals/video (`jwdl`), multi-language video downloading and muxing (`jwvideo-mux`), and AI frame interpolation (`ffrife`, used as a library by `slverse` but not jw.org-specific itself).
-
-Split out of [`majal/maj-scripts`](https://github.com/majal/maj-scripts) on 2026-08-13, once the jw.org-specific tools there outnumbered the general-purpose ones. `maj-scripts` keeps its own disparate utility scripts (`gmail-cleanup`, `whisper`, `wh`, `printing-mode`, `ubuntu-hibernate`, etc.); this repo is scoped to jw.org content tools only.
-
-`jwget` (a legacy, unauthenticated bash periodicals scraper) was absorbed into `jwdl` as `jwdl periodicals` on the same day, then retired to `bin-archive-2026` — jw.org's modern `pub-media` API (checksummed, already used by `jwdl` for music) covers the periodicals that are still actually published; two of `jwget`'s four (`wp`, `g`) turned out to be discontinued jw.org-side years ago, not just stale locally.
-
-`jwdl video` and `jwvideo-mux` both touch video but solve different problems, and that's intentional, not overlap to clean up: `jwdl video` bulk-downloads by category (Bible, Dramas, Latest Videos, ...) at one resolution, one language at a time - browsing jw.org's own catalog tree via its `mediator` API. `jwvideo-mux` downloads *one specific, already-known* video and merges multiple language audio/subtitle tracks into a single file. Reach for `jwdl video` to explore/bulk-fetch; reach for `jwvideo-mux` when you already have a docid/URL and want several languages muxed together.
+Template compliance: repo-template-standard.md v1.3.0 (reviewed 2026-10-10: item 11 n/a). Config-first/flag-parity and
+modularity retrofits tracked in `ags/docs/reports/2026-08-31-cross-repo-standards-rollout-handoff.md`.
 
 ## Naming
-
-Tools here don't carry a `jw` prefix by default — the repo name already scopes them. `slverse` (sign-language verse extraction, formerly `jwsl`) follows this. `jwdl` and `jwvideo-mux` kept their existing names on the move rather than being renamed along with the repo split — don't rename them without explicit direction, since `jwdl` in particular has a live external caller (see Operational Notes below).
+No `jw` prefix by default (the repo scopes it). Don't rename `jwdl` or `jwvideo-mux`: `jwdl` has a live external caller.
 
 ## Configuration
+- One config namespace: `~/.config/jwkit/<tool>/` (retired pre-jwkit paths are not read). New tools follow it from the start.
+- Config-first: every persisted setting has a long CLI flag for a one-run override (short aliases for the common ones);
+  keep config, CLI help, docs and tests in sync; never hardcode one operator's language order, paths or workflow.
+  Positional ids and one-shot actions need no config.
+- Canonical interface: `config list|get|set|path|edit|reset|diff|check`; tool-local TOML at
+  `~/.config/jwkit/<tool>/config.toml`, shared settings at `~/.config/jwkit/config.toml`. Unix-style output/exit
+  status, `$VISUAL` then `$EDITOR`, reject unknown keys/invalid values, `config check` is non-mutating. Reuse
+  `_jwkit_common.py` helpers. Persist only overrides (`save_config` filters through `_jwkit_common.config_overrides`).
+  When retiring a key/path, migrate active installs first, then remove the compat branch.
 
-All tools share one config namespace, `~/.config/jwkit/<tool>/` (e.g. `~/.config/jwkit/slverse/`, `~/.config/jwkit/jwdl/`, `~/.config/jwkit/ffrife/`). This is the only supported layout; retired pre-jwkit paths are not read at runtime. New tools must follow this layout from the start rather than inventing their own.
-
-Design tools config-first whenever behavior is reasonably user-customizable. Every persisted config setting must have a corresponding long CLI flag for a one-run override, and the most common flags should also have short aliases. Keep config, CLI help, docs, and tests in sync; do not hardcode one operator's language order, player layout, paths, or workflow preferences as universal behavior. Positional identifiers and intrinsically one-shot actions do not need persisted config merely for symmetry.
-
-Configuration management is part of the design of every new configurable
-script and every substantial edit to an existing one. Follow the repository's
-canonical interface: `config list|get|set|path|edit|reset|diff|check`. Store
-tool-local configuration as TOML under the XDG-style
-`~/.config/jwkit/<tool>/config.toml`; reserve `~/.config/jwkit/config.toml` for
-settings that genuinely apply to every tool. Use Unix-style text output and
-exit statuses, honor `$VISUAL` then `$EDITOR` for `config edit`, reject unknown
-keys and invalid values, and make `config check` safe and non-mutating. Reuse
-the helpers in `_jwkit_common.py` instead of cloning config-command logic. Persist only overrides: every tool's `save_config` filters through
-`_jwkit_common.config_overrides`, so a saved file never pins defaults and
-improved defaults reach existing installs.
-Keep every persisted setting paired with a long per-run flag, add short flags
-only for frequent operations, and update help, documentation, and tests in the
-same change. When retiring a key or path, migrate active installations first,
-then remove the compatibility branch rather than carrying it indefinitely.
-
-## Push cadence
-
-**Smart batched deploy, with "push" as the deploy step** — this repo has
-no separate server-side deploy; a push to `main` is what goes live, since
-`jwdl-weekly.service`/`slverse-sync-weekly.service` on `emeth4` auto-update
-by fast-forwarding against `origin` before every unattended run (see
-"Auto-Update" above). Commit continuously as work lands; test locally and
-push right away once you're happy with a verified change, rather than
-holding it "just in case" — but hold the push (keep committing locally)
-if you already know concrete follow-up is coming in the same session and
-nothing needs the fix live yet. This is `repo-template-standard.md`'s
-named "smart batched deploy" pattern, just with push standing in for
-deploy.
+## Push cadence and rules
+- **Commit is automatic** (operator-directed 2026-08-14): commit each verified change right away, narrow, one logical
+  change per commit.
+- **Push is deliberately batched, and a push to `main` IS the deploy**: `jwdl-weekly.service` /
+  `slverse-sync-weekly.service` on `emeth4` fast-forward from `origin` before every unattended run. Push once you have
+  verified a batch as a whole, when asked, or before ending a session; hold it if concrete follow-up is coming and
+  nothing needs the fix live. Never push with unresolved errors or unpassed verification (leave a status note with
+  the next step). Run `python3 -m tests` before pushing tool/test/README/AGENTS changes.
+- Never force-push or rewrite history without the user's explicit go-ahead.
 
 ## Operational Notes
+- **`jwdl` is called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwdl-weekly.service` + `.timer`,
+  `jwdl all`, weekly). Coordinate changes to the music CLI surface (`jwdl <pub> [lang]`, `jwdl all`, `jwdl list`) with
+  that unit in the same rollout; don't keep an obsolete CLI solely for the service.
+- **`slverse` also has one** (`slverse-sync-weekly.service`, `slverse sync all`). Keep the unit source in the `bin` repo
+  aligned with the deployed copy. When auditing live callers inspect `ExecStart=` across ALL
+  `~/.config/systemd/user/*.service` and (`sudo`) `/etc/systemd/system/*.service`.
+- Auto-update (default on) fast-forwards the checkout BEFORE these unattended jobs, so a bad push to `main` reaches the
+  hosts on their next scheduled run with no review. Test before pushing.
 
-- **`jwdl` is called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/jwdl-weekly.service` + `.timer`, `ExecStart=... %h/MyFiles/Digitalis/jwkit/jwdl all`, weekly). Coordinate changes to the music CLI surface (`jwdl <pub> [lang]`, `jwdl all`, `jwdl list`) with that unit in the same rollout; do not retain an obsolete CLI solely for the service. `jwdl periodicals ...` remains a separate command path because it is a distinct workflow.
-- **`slverse` is also called by a live systemd user timer on `emeth4`** (`~/.config/systemd/user/slverse-sync-weekly.service` + `.timer`, `ExecStart=... %h/MyFiles/Digitalis/jwkit/slverse sync all`). Keep the unit source in the `bin` repo aligned with the deployed copy. When auditing live callers, inspect `ExecStart=` across **all** `~/.config/systemd/user/*.service` and (`sudo`) `/etc/systemd/system/*.service`, not only the expected unit.
-- **Auto-update (see below) runs before these unattended jobs too.** `jwdl-weekly.service` and `slverse-sync-weekly.service` both call a jwkit tool directly, so if auto-update is on (the default) that command will `git fetch`+fast-forward jwkit *before* doing its actual job, unattended, with nobody reviewing the diff first. Fast-forward-only means it can't silently discard anything, but it does mean a bad push to `main` reaches these hosts on their very next scheduled run. Test before pushing to `main`, same as always — this isn't a reason to relax that, just a reminder the blast radius includes unattended jobs, not only interactive users.
-
-## Auto-Update (`_jwkit_common.py`)
-
-Every tool calls `_jwkit_common.maybe_auto_update(jwkit_root)` right after its own `argparse.parse_args()` call (so `--help`/`-h` exits before ever reaching it — no network activity just to check usage). At most once every `auto_update_interval_hours` (default 24) on a *real* invocation, it does a `git fetch` + fast-forward-only merge of the jwkit checkout against `origin`'s default branch, controlled by the shared (not per-tool) `~/.config/jwkit/config.toml` (`auto_update = true/false`, on by default). The check-timestamp in `~/.config/jwkit/update-state.json` is written *before* attempting the update, so a bad connection doesn't retry — and pause a command — on every run for the rest of the day.
-
-- `_jwkit_common.py` is loaded as a sibling module (`sys.path.insert(0, ...)` + `import _jwkit_common`) rather than via `SourceFileLoader`, unlike `ffrife` — it has a real `.py` extension so Python's normal import machinery can find it, `ffrife`/`jwdl` don't and need the loader dance.
-- Fast-forward only, on purpose: it will never discard a local edit someone made to their own checkout, and never touches a tarball install (no `.git` present) — those rely on re-running `install.sh`/`install.ps1`/`jwkit-update` by hand.
-- `slverse setup` is the one place a user is asked about this interactively (writes to the *shared* `~/.config/jwkit/config.toml` via `_jwkit_common.save_jwkit_config`, not to `slverse`'s own per-tool config) — `ffrife`/`jwdl`/`jwvideo-mux` don't duplicate the question, they just read whatever's already there (or the default, if nothing's been set yet).
-- Never let this raise out into a tool's real command — the whole check is wrapped in a broad `except Exception: pass`. An update check must never be the reason someone's actual command fails.
-
-## Overwrite Handling (`_jwkit_common.py`)
-
-Every tool that writes a final output file calls `_jwkit_common.resolve_output_conflict(path, jwkit_config)` right before writing it, and uses whatever `Path` it returns (or aborts/skips if it returns `None`) instead of writing straight to the caller-supplied path. Controlled by the shared `~/.config/jwkit/config.toml` (`on_output_exists`, default `ask`; `on_output_exists_unattended`, default `rename`; `overwrite_prompt_timeout`, default 20 seconds) - not per-tool config, since this is a cross-cutting concern, same as `auto_update`/`color_output` above.
-
-- `ask` only prompts when `sys.stdin.isatty()` - a cron/systemd invocation (see the unattended jobs noted under Operational Notes) has no TTY to prompt, so it silently falls through to `on_output_exists_unattended` instead. A prompt that goes unanswered for `overwrite_prompt_timeout` seconds (implemented via a daemon reader thread + `queue.Queue(timeout=...)`, since `input()` has no native cross-platform timeout) falls through the same way, as does an explicit "no" answer.
-- `trash` moves the *existing* file to the real OS Trash/Recycle Bin (macOS: `osascript`/Finder delete; Linux: `gio trash`, falling back to a hand-written freedesktop.org trash-spec implementation; Windows: `ctypes` `SHFileOperationW`, unverified on a real machine - same caveat as `install.ps1` above) before the fresh write lands at the canonical path. A same-named collision already in the trash gets a datetime-tagged rename first, not silently clobbered.
-- `rename` returns the first free `name (1).ext`, `name (2).ext`, ... sibling instead of touching the existing file.
-- Add matching `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` flags to a new tool's own output-writing subcommand (see `ffrife run`'s `p_run.add_argument` calls for the pattern) so the shared config stays overridable per-run everywhere, not just in `~/.config/jwkit/config.toml`.
-- Not every `path.exists()` check in these tools is a "real" overwrite scenario worth routing through this - see `slverse bulk`'s own `--overwrite` (a cache-hit skip for a rerunnable batch job) and `jwpl init`'s config-scaffold guard for two deliberate exceptions.
-
-## Provenance Records (`_jwkit_common.py`)
-
-A tool that renders a media file from a known source records how it was made - source URL/MD5, settings, exact rebuild command, tool commit - with `_jwkit_common.write_provenance(output, record, jwkit_config, ffmpeg=...)` (see `slverse`'s `write_extract_provenance`, `ffrife`'s `write_run_provenance`). Where it lives is the shared `provenance_mode` (`embed` default, `beside`, `folder`, `none`) plus `provenance_dir`; add `_jwkit_common.add_provenance_arguments(parser)` for the matching `--provenance`/`--provenance-dir` flags and fold them in with `apply_provenance_overrides`. `slverse provenance` / `jwkit-provenance move` move existing records between places; `locate_provenance`/`read_provenance` find one wherever it is. Tools build records with `base_record`/`record_output`/`describe_file` (inputs get their md5, jw.org name parse, and `made_by` when they carry a record). Scripts in other repos (bash or Python) call the `jwkit-provenance record` CLI instead of importing anything: `bin`'s `lib/jwkit-record.sh` and `maj-scripts`' `ffcut` already do, as a soft dependency that does nothing when jwkit isn't installed. Writers that deliberately don't record: `jwdl` and the sources `jwvideo-mux` downloads (verbatim copies of jw.org's files - embedding would change them and break their MD5 freshness checks).
-
-- **Embedded means no re-encode, and no collateral damage.** MP4/MOV/M4A get a trailing `uuid` box appended in place (never ffmpeg's `-movflags +use_metadata_tags`: it moves every MP4 tag into `mdta`, and AVFoundation then loses the title). Matroska and MP3/FLAC/Ogg/Opus get a global tag through a stream-copy remux that must reproduce the original: `-avoid_negative_ts disabled` (ffmpeg's default shifts start times) and cover art re-attached with `-attach` (`-map 0` silently turns it into a plain video track). The remux is verified (packet hash, duration, stream layout) before it replaces anything, and an embed that can't be verified falls back to a sidecar rather than altering the file.
-- An embedded record can't contain the file's own hash; it carries `output.av_sha256` (video/audio packet hash) instead.
-- Never let a provenance problem fail a run whose video already exists.
-
-## Installer (`install.sh` / `install.ps1`)
-
-Root-level one-liner installers for non-technical users (`curl | bash` on macOS/Linux, `irm | iex` on Windows) — see the Quick Install section of `README.md`. They install missing dependencies (Python, `ffmpeg`, `git` via Homebrew/apt/dnf/pacman/winget), download jwkit to `~/.jwkit` (`%USERPROFILE%\.jwkit` on Windows), add it to `PATH`, and drop a `jwkit-update` command that re-runs the same script.
-
-`uninstall.sh` / `uninstall.ps1` remove that installed copy and the matching PATH entry. They preserve the source checkout and `~/.config/jwkit` configuration/downloads. New installs record only dependencies that the installer itself added, allowing uninstalls to remove those without guessing about pre-existing dependencies; legacy installs without a record preserve dependencies.
-
-- Both scripts hardcode a `TOOLS`/`$Tools` list of the top-level commands to make runnable (`ffinpaint`, `ffrife`, `ffv`, `jwdl`, `jwpl`, `jwvideo-mux`, `register-jwplay-launcher`, `slverse`). **Add new tools to that list in both scripts** when they're added to the repo, or the installer won't make them executable/shimmed.
-- `install.sh` is tested locally by overriding `HOME` to a scratch directory (`HOME=/tmp/fake bash install.sh`) so it never touches a real shell profile during testing.
-- `install.ps1` is **not verified on a real Windows machine** as of 2026-08-13 — it was written to the same patterns as `install.sh` (idempotent, guarded PATH edits, friendly error trap) but there was no Windows environment available to test it in. Treat changes to it with extra care and prefer a real Windows test before relying on it.
-- Windows needs `.cmd` shims (`slverse.cmd`, etc.) alongside the actual scripts, since Windows doesn't run a `#!/usr/bin/env python3` shebang line directly the way macOS/Linux do — `install.sh` doesn't need this, since the scripts are already directly executable there once `chmod +x`'d.
-- Both scripts are designed to be safe to re-run (used as the update mechanism) — don't add steps that aren't idempotent (e.g. that fail or duplicate on a second run) without guarding them.
+## Shared-module contracts (`_jwkit_common.py`; detail in the reference doc)
+- Auto-update: every tool calls `maybe_auto_update(jwkit_root)` right after `parse_args()`; fast-forward only; must never
+  raise into a tool's real command (broad `except Exception: pass`).
+- Overwrite handling: any tool writing a final output file calls `resolve_output_conflict(path, jwkit_config)` right before
+  writing and honors its result (`None` = abort/skip); add `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout`
+  flags (pattern: `ffrife run`).
+- Provenance: tools rendering media from a known source call `write_provenance(...)` and add
+  `add_provenance_arguments(parser)`; embedding must not re-encode or damage the file (fall back to a sidecar if the
+  remux can't be verified); never let a provenance problem fail a run whose video exists; `jwdl` and `jwvideo-mux`
+  sources are deliberately not recorded (verbatim jw.org files, MD5 freshness checks).
+- Installers (`install.sh`/`install.ps1`): idempotent (also the update mechanism); `install.ps1` is unverified on real
+  Windows (extra care); both hardcode a `TOOLS`/`$Tools` list that must include every new tool, alphabetically.
 
 ## Agent Working Rules
-
-- **CLI tools before GUI tools.** Default to CLI/API tools for anything in
-  this repo — more context density, fewer tokens, more composable than
-  GUI or browser automation. Reach for GUI/browser automation only when a
-  task genuinely has no CLI/API path. (Distinct from the tools' own
-  config-first CLI design under Configuration above — that's about how
-  jwkit's tools expose settings to their end users, this is about how an
-  agent should work in the repo.)
-- **Artifacts stay local by default.** Reports, audits, and sweeps touching
-  this repo go in `docs/reports/`, never a hosted `claude.ai` artifact,
-  gist, pastebin, or similar — unless the operator explicitly asks for a
-  shareable link. Not that this repo is likely to produce much of this
-  kind of writeup, given its scope, but the scaffold costs nothing.
+- CLI/API tools before GUI/browser automation.
+- Reports/audits/sweeps touching this repo go in `docs/reports/`, never a hosted `claude.ai` artifact, gist or
+  pastebin unless the operator explicitly asks for a shareable link.
+- **Public repo**: anything committed is world-readable; never store secrets, API keys or sensitive local state here
+  (use OS-local config, env vars or home paths).
+- Normal file edits inside this checkout are pre-approved. Still ask before escalated actions: destructive commands,
+  writes outside this repo/writable roots, GUI/system-level actions, sandbox-blocked network commands.
 
 ## Local Memory
+One shared store for every agent: `memory/`. Rules: `~/dig/ags/docs/memory-standard.md`; tool: `~/dig/ags/bin/memory-check`.
+- Read `memory/MEMORY.md` (generated) first; open a topic only when its hook fits; else `memory-check find <kw>`.
+- Record durable facts the same turn: search first, add/update a topic with a short `description`,
+  `memory-check reindex`, commit. Never hand-edit `MEMORY.md`. Finished incidents: `status=resolved` +
+  `memory-check archive`. Never store secrets, tokens or raw transcripts.
 
-One shared store for every agent (Claude, Codex, Gemini): `memory/`. Contract and cleanup
-rules: `~/dig/ags/docs/memory-standard.md`; tool: `~/dig/ags/bin/memory-check`.
-
-- Read `memory/MEMORY.md` (small, generated index) first; open a topic only when its hook
-  fits the task. Not listed? `memory-check find <keyword>` searches topics + archive.
-- Record durable facts the same turn: search first, update or add a topic with a short
-  `description`, run `memory-check reindex`, commit. Never hand-edit `MEMORY.md`.
-- Finished incident or project: lift the lasting rule out, set `status=resolved`, run
-  `memory-check archive`. Never store secrets, tokens, or raw transcripts.
-
-## Public Repo And Secrets
-
-This repository is public. Treat anything committed here as readable by others.
-
-Do not store secrets, API keys, or other sensitive local state in this repo. Prefer OS-local config, environment variables, or user home paths outside the repo for secrets and machine-specific state.
-
-## Agent Permission Rules
-
-Normal file edits inside this repository checkout are pre-approved. Do not ask for user permission before creating or modifying files in this repo as part of the requested work.
-
-Still ask for approval before escalated actions, including destructive commands, writes outside this repo or the configured writable roots, GUI/system-level actions, or network-dependent commands that the sandbox blocks.
-
-## README Rules
-
-When adding a new top-level tool to the repo:
-
-1. Add the tool file.
-2. Add the tool to the README table of contents.
-3. Add a short subsection under `## Tools` (name, 1-3 sentence blurb, `Full docs:` link) — see Doc Template below.
-4. Create `docs/<tool>.md` with the full template.
-5. Keep the `## Tools` section above the shared Your Local Setup section.
-6. End each major section with `↑ TOC`.
-
-Do not add a new tool without updating the README.
-
-## Test Rules
-
-Run `python3 -m tests` before pushing changes that affect tools, tests, or README/AGENTS documentation.
-
-## Commit And Push Rules
-
-Commit is automatic (2026-08-14, operator-directed): once a change is good and verified, commit it right away so history captures every change and checkpoint. Don't ask first, and don't leave verified work sitting uncommitted "for later." Keep commits narrow — one logical change per commit, not batched unrelated edits.
-
-Push is separate and intentionally batched, not automatic on every commit — see the auto-update note above (`jwdl-weekly.service`/`slverse-sync-weekly.service` fast-forward from `origin/main` unattended, so a push reaches those hosts on their next scheduled run with nobody reviewing the diff first). Push when you've verified a batch of commits as a whole, when the user asks, or before ending a work session — not reflexively after each individual commit. Never push when there are unresolved errors or relevant verification has not passed. In those cases, leave a clear status note with the next step.
-
-Never force-push or rewrite history without the user's explicit go-ahead.
-
-## Doc Template
-
-Full per-tool docs live in `docs/<tool>.md`, not inline in `README.md` — this repo started with the split already applied (see `maj-scripts`' Growth Rule for the history of why).
-
-**README section** (short):
-1. Tool name — heading links directly to the tool file.
-2. A short (1-3 sentence) description.
-3. A `Full docs: [docs/<tool>.md](docs/<tool>.md)` link.
-4. `↑ TOC`.
-
-**`docs/<tool>.md`** (full):
-1. `# <tool>` title, then `[← Back to README](../README.md#table-of-contents)`.
-2. `## What It Does`
-3. `## Supported Platforms`
-4. `## Dependencies`
-5. `## Install / First Run Summary`
-6. `## Common Usage Examples`
-7. `## Important Behavior / Defaults`
-8. `## Notes / Caveats`
-9. `[↑ Back to README TOC](../README.md#table-of-contents)` at the end.
-
-Doc filename: `docs/<tool-name>.md`, stripping a trailing `.sh` if the tool has one.
-
-Keep examples short, practical, and copy-pasteable.
-
-## Tone Rules
-
-Same spirit as `maj-scripts`: practical and skimmable, a light touch is fine, but don't let it make setup instructions vague. Prefer friendly, calm wording in user-facing tool output too.
-
-## Heading And TOC Rules
-
-- Keep README headings stable and predictable so anchors remain valid.
-- Prefer `## Tools` as the parent section and `### <tool-name>` for each tool.
-- Prefer `### [<tool-name>](./<tool-file>)` when the tool file lives at the repo root.
-- Keep the tool list **alphabetical** everywhere it appears: the README TOC, the `## Tools` section itself, and the `TOOLS`/`$Tools` arrays in `install.sh`/`install.ps1`. Insert new tools in alphabetical position rather than appending them at the end.
-- Use `↑ TOC` for major sections and primary subsections.
-- If a new shared subsection is added, it must also be added to the README TOC in the same order it appears in the file.
-
-## When Adding A Tool Checklist
-
-- add the tool file
-- update the README table of contents
-- add the short tool subsection (name, blurb, `Full docs:` link) under `## Tools`
-- create `docs/<tool>.md` with the full template and a back-link to the README TOC
-- keep `## Tools` above Your Local Setup
-- use `↑ TOC` consistently in README, and the back-link in `docs/<tool>.md`
-- keep examples concise and copy-pasteable
-- store config/state under `~/.config/jwkit/<tool>/` (see Configuration above), with a migration helper if you're renaming/moving an existing tool
-- if the tool has a live external caller (cron/systemd elsewhere), note it under Operational Notes above and coordinate that caller's migration in the same rollout
-- add the tool to the `TOOLS`/`$Tools` list in both `install.sh` and `install.ps1` (see Installer above) so the one-line installers pick it up
-- wire in `_jwkit_common.maybe_auto_update(...)` right after `parse_args()` (see Auto-Update above) so the new tool participates in the shared update check
-- if the tool renders from a known source, record provenance (see Provenance Records above); if the tool writes a final output file, call `_jwkit_common.resolve_output_conflict(...)` right before writing it and add the matching `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` flags (see Overwrite Handling above)
+## When Adding A Tool (checklist; README/doc templates in `docs/contributor-reference.md`)
+- add the tool file; README table of contents entry + short `## Tools` subsection (name, blurb, `Full docs:` link) +
+  `docs/<tool>.md` full template with back-link; keep `## Tools` above Your Local Setup; `↑ TOC` consistently
+- keep tool lists **alphabetical** everywhere (README TOC, `## Tools`, `TOOLS`/`$Tools` in `install.sh`/`install.ps1`);
+  add the tool to both installers
+- store config/state under `~/.config/jwkit/<tool>/` (migration helper when renaming/moving)
+- if it has a live external caller (cron/systemd elsewhere), note it under Operational Notes and coordinate the migration
+- call `maybe_auto_update(...)` after `parse_args()`; record provenance if rendering from a known source; call
+  `resolve_output_conflict(...)` before writing a final output (plus the three flags)
+- keep examples short, practical, copy-pasteable; tone practical and skimmable; keep README headings stable
