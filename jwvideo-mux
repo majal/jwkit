@@ -220,6 +220,32 @@ def get_lang_meta(code: str) -> tuple[str, str]:
     # Fallback
     return (code.lower()[:3], code_upper)
 
+
+def probe_subtitle_streams(path: Path) -> list[dict]:
+    """Return the embedded subtitle streams in a local media file.
+
+    Stream indexes here are subtitle ordinals (the selector used by ffmpeg's
+    ``:s:N`` syntax), not the file-wide stream indexes returned by ffprobe.
+    """
+    result = subprocess.run(
+        [FFPROBE_BIN, "-v", "error", "-select_streams", "s", "-show_streams", "-of", "json", str(path)],
+        capture_output=True, text=True,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or f"ffprobe exited {result.returncode}"
+        raise RuntimeError(f"Could not inspect subtitle streams in {path}: {detail}")
+    streams = json.loads(result.stdout).get("streams", [])
+    return [
+        {
+            "stream_index": ordinal,
+            "language": stream.get("tags", {}).get("language", ""),
+            "title": stream.get("tags", {}).get("title", ""),
+            "handler_name": stream.get("tags", {}).get("handler_name", ""),
+        }
+        for ordinal, stream in enumerate(streams)
+        if stream.get("codec_type") == "subtitle"
+    ]
+
 def color_print(msg: str, color: str = ""):
     """`color` names a _jwkit_common.Colorizer method (red, green, yellow,
     cyan, header, ...) rather than a raw ANSI code, so jwvideo-mux's colors
@@ -1822,7 +1848,11 @@ def mux_rebuild_argv(args, local_files, is_local_file, base_vid_path, vid_langs,
         argv += ["-v", ",".join(tokens(vid_langs, lambda media: media.get("video")))]
     if aud_langs:
         argv += ["-a", ",".join(tokens(aud_langs, lambda media: media.get("audio", media.get("video"))))]
-    sub_tokens = [f"{lang}={Path(local_files[lang]['sub']).absolute()}" if is_local_file else lang for lang in sub_langs if lang in local_files and "sub" in local_files[lang]]
+    sub_tokens = [
+        f"{lang}={Path(local_files[lang]['sub']).absolute()}" if is_local_file and "sub" in local_files[lang] else lang
+        for lang in sub_langs
+        if lang in local_files and ("sub" in local_files[lang] or local_files[lang].get("embedded_subs"))
+    ]
     argv += ["-s", ",".join(sub_tokens) if sub_tokens else "NONE"]
     if args.res:
         argv += ["--res", str(args.res)]
@@ -2047,7 +2077,7 @@ def main():
     parser.add_argument("input", help="URL, docid, or local file pattern to process")
     parser.add_argument("-v", "--video", help="Comma-separated language codes for video tracks; an entry may instead be CODE=path/to/file.mp4 to pin an exact local file, or a bare path/to/file.mp4 to have its language code inferred from its filename (local file mode only)")
     parser.add_argument("-a", "--audio", help="Comma-separated language codes for audio tracks; an entry may instead be CODE=path/to/file to pin an exact local file, or a bare path/to/file to have its language code inferred from its filename (local file mode only)")
-    parser.add_argument("-s", "--subs", help="Comma-separated subtitle languages; empty uses video/audio languages; an entry may instead be CODE=path/to/file.vtt to pin an exact local file, or a bare path/to/file.vtt to have its language code inferred from its filename (local file mode only)")
+    parser.add_argument("-s", "--subs", help="Comma-separated subtitle languages; omitted uses video/audio languages and discovers embedded subtitles in local-file mode; an entry may instead be CODE=path/to/file.vtt to pin an exact local file, or a bare path/to/file.vtt to have its language code inferred from its filename (local file mode only)")
     parser.add_argument("-r", "--res", "--resolution", dest="res", help="Target resolution")
     parser.add_argument("-c", "--container", choices=["mkv", "mp4"], help="Export container format")
     parser.add_argument("-S", "--single-streams", action=argparse.BooleanOptionalAction, default=None, help="Produce separate single-stream videos")
@@ -2242,6 +2272,26 @@ def main():
                 color_print(f"  [{lang}] Found local: {', '.join(local_files[lang].keys())}", "green")
             else:
                 color_print(f"  [{lang}] No matching local files found.", "yellow")
+
+        # A local MP4 may carry captions as a subtitle stream without a matching
+        # .vtt/.srt sidecar. When no explicit or adjacent sidecar won above,
+        # preserve those embedded tracks for the requested subtitle languages.
+        for lang in sub_langs:
+            media = local_files.get(lang, {})
+            if "sub" in media:
+                continue
+            embedded_subs = []
+            seen_paths = set()
+            for key in ("video", "audio"):
+                path = media.get(key)
+                if not path or str(path) in seen_paths:
+                    continue
+                seen_paths.add(str(path))
+                for stream in probe_subtitle_streams(Path(path)):
+                    embedded_subs.append({"path": Path(path), **stream})
+            if embedded_subs:
+                media["embedded_subs"] = embedded_subs
+                color_print(f"  [{lang}] Found {len(embedded_subs)} embedded subtitle track(s).", "green")
                 
     else:
         # API Mode
@@ -2484,11 +2534,25 @@ def main():
         
     subtitle_stream_idx = 0
     for lang in all_langs:
-        if lang in local_files and 'sub' in local_files[lang]:
-            idx = get_or_add_input(local_files[lang]['sub'], f"subtitle:{lang}")
+        media = local_files.get(lang, {})
+        if "sub" in media:
+            subtitle_sources = [{"path": media["sub"], "stream_index": None, "language": "", "title": ""}]
+        else:
+            subtitle_sources = media.get("embedded_subs", [])
+
+        for subtitle in subtitle_sources:
+            path = Path(subtitle["path"])
+            idx = get_or_add_input(path, f"subtitle:{lang}")
             iso, title = get_lang_meta(lang)
-            
-            ff_maps.extend(["-map", f"{idx}:s"])
+            source_language = str(subtitle.get("language") or "").strip().lower()
+            if source_language and source_language not in {"und", "unknown"}:
+                iso = source_language
+            source_title = str(subtitle.get("title") or "").strip()
+            if source_title and source_title.lower() not in {"subtitlehandler", "subtitle handler"}:
+                title = source_title
+
+            selector = f"{idx}:s" if subtitle["stream_index"] is None else f"{idx}:s:{subtitle['stream_index']}"
+            ff_maps.extend(["-map", selector])
             ff_meta.extend([
                 f"-metadata:s:s:{subtitle_stream_idx}", f"language={stream_language_tag(iso, args.container)}",
                 f"-metadata:s:s:{subtitle_stream_idx}", f"title={title}"
@@ -2497,13 +2561,14 @@ def main():
                 ff_meta.extend([f"-c:s:{subtitle_stream_idx}", "mov_text"])
             else:
                 ff_meta.extend([f"-c:s:{subtitle_stream_idx}", "srt"])
-                
+
             if not args.no_default_subs:
                 if (args.default_sub and args.default_sub.upper() == lang) or (not args.default_sub and subtitle_stream_idx == 0):
                     ff_meta.extend([f"-disposition:s:{subtitle_stream_idx}", "default"])
-                
+
             subtitle_stream_idx += 1
-            if lang not in langs_loaded: langs_loaded.append(lang)
+            if lang not in langs_loaded:
+                langs_loaded.append(lang)
 
     if not langs_loaded:
         color_print("No media to mux. Exiting.", "red")
@@ -2597,7 +2662,7 @@ def main():
 
     cmd = (
         [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y"] + ff_inputs + ff_maps + ff_meta
-        + art_extra_args + ["-c:v", "copy", "-c:a", "copy", str(out_path)]
+        + art_extra_args + ["-avoid_negative_ts", "disabled", "-c:v", "copy", "-c:a", "copy", str(out_path)]
     )
 
     color_print(f"Creating merged {args.container.upper()}: {out_name}", "cyan")
@@ -2650,6 +2715,8 @@ def main():
 
                 cmd_single = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", str(base_vid)]
                 maps = ["-map", "0:v"]
+                single_inputs = [str(base_vid)]
+                single_roles = {str(base_vid): [f"video:{base_vid_lang}"]}
 
                 media = local_files.get(lang, {})
                 audio_path = media.get('audio', media.get('video'))
@@ -2659,25 +2726,40 @@ def main():
                     if str(audio_path) != str(base_vid):
                         cmd_single.extend(["-i", str(audio_path)])
                         maps.extend(["-map", "1:a?"])
+                        single_inputs.append(str(audio_path))
+                        single_roles.setdefault(str(audio_path), []).append(f"audio:{lang}")
                     else:
                         maps.extend(["-map", "0:a?"])
 
-                # Embed subtitle if present for this language, else use base subtitle
-                sub_file = media.get('sub', local_files.get(base_vid_lang, {}).get('sub'))
-                if sub_file:
-                    used_source_paths.add(str(sub_file))
-                    sub_idx = 2 if (audio_path and str(audio_path) != str(base_vid)) else 1
-                    cmd_single.extend(["-i", str(sub_file)])
-                    maps.extend(["-map", f"{sub_idx}:s", "-c:s", "mov_text"])
+                # Prefer this language's sidecar or embedded captions, then fall
+                # back to the base video's captions as the classic behavior did.
+                subtitle_media = media if (media.get("sub") or media.get("embedded_subs")) else local_files.get(base_vid_lang, {})
+                subtitle_sources = (
+                    [{"path": subtitle_media["sub"], "stream_index": None, "language": "", "title": ""}]
+                    if "sub" in subtitle_media else subtitle_media.get("embedded_subs", [])
+                )
+                for subtitle in subtitle_sources:
+                    sub_path = Path(subtitle["path"])
+                    used_source_paths.add(str(sub_path))
+                    if str(sub_path) in single_inputs:
+                        sub_input_idx = single_inputs.index(str(sub_path))
+                    else:
+                        cmd_single.extend(["-i", str(sub_path)])
+                        sub_input_idx = len(single_inputs)
+                        single_inputs.append(str(sub_path))
+                    single_roles.setdefault(str(sub_path), []).append(f"subtitle:{lang}")
+                    selector = f"{sub_input_idx}:s" if subtitle["stream_index"] is None else f"{sub_input_idx}:s:{subtitle['stream_index']}"
+                    maps.extend(["-map", selector])
 
-                cmd_single += maps + ["-c:v", "copy", "-c:a", "copy", str(out_single)]
+                if subtitle_sources:
+                    maps.extend(["-c:s", "mov_text"])
+
+                cmd_single += maps + ["-avoid_negative_ts", "disabled", "-c:v", "copy", "-c:a", "copy", str(out_single)]
                 single_run = subprocess.run(cmd_single)
                 color_print(f"  ✓ Single-stream created: {out_single.name}", "green")
                 if single_run.returncode == 0:
-                    single_inputs = [str(base_vid)] + [str(path) for path in (audio_path, sub_file) if path and str(path) != str(base_vid)]
                     record_mux_provenance(
-                        out_single, args, single_inputs, {str(base_vid): [f"video:{base_vid_lang}"], **({str(audio_path): [f"audio:{lang}"]} if audio_path and str(audio_path) != str(base_vid) else {}),
-                                                           **({str(sub_file): [f"subtitle:{lang}"]} if sub_file else {})},
+                        out_single, args, single_inputs, single_roles,
                         source_urls, local_files, is_local_file, base_vid_path, vid_langs, aud_langs, sub_langs, [lang], single_stream_language=lang,
                     )
 
@@ -2687,6 +2769,8 @@ def main():
         skipped_unused = []
         for lang, media in local_files.items():
             for mtype, path in media.items():
+                if mtype == "embedded_subs":
+                    continue
                 if str(path) not in used_source_paths:
                     skipped_unused.append(path.name)
                     continue
