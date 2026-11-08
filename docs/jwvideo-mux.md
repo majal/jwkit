@@ -114,6 +114,15 @@ Persistent mux preferences live in `~/.config/jwkit/jwvideo-mux/config.toml`. Us
 - `-f, --force` skips the output-already-exists check entirely (same as `--on-exists overwrite` for this run). Without it, an existing output file goes through the shared `on_output_exists` policy (default: ask, with a non-interactive fallback for cron/unattended runs - see the README) - `--on-exists`/`--on-exists-unattended`/`--overwrite-timeout` override it for one run.
 - Spoken languages prefer downloading the much smaller MP3 files. Sign languages download the MP4 file to preserve the video track.
 - Automatically tags audio and video streams with ISO 639-2 codes and display names.
+
+### Multi-video-track playback on Windows
+
+An MP4 can contain several H.264 video tracks and an AAC audio track, but the player must expose track selection. mpv supports cycling video tracks with `_` and audio tracks with `#`; VLC's Windows Video menu also has a video-track selector ([mpv manual](https://mpv.io/manual/stable/), [VLC Windows menu guide](https://docs.videolan.me/vlc-user/desktop/3.0/en/gettingstarted/desktopoverview/windows_and_linux/menu_bar.html)). Community reports also confirm VLC and ffplay playback of multi-video MP4s, though those reports are anecdotal ([Stack Overflow example](https://stackoverflow.com/questions/59638584/how-to-play-video-with-multiple-video-streams)).
+
+Windows Media Foundation can parse MP4, and its application API exposes selectable video tracks through `MediaPlaybackItem`; that describes what an app can implement, not a guarantee that every built-in Windows player shows a track picker ([MP4 source](https://learn.microsoft.com/en-us/windows/win32/medfound/mpeg-4-file-source), [multiple-track app API](https://learn.microsoft.com/en-us/windows/apps/develop/media-playback/media-playback-with-mediasource)). So for sharing, use mpv or VLC when viewers need to switch languages. The end-aligned MP4s also use delayed track start times; they have been tested in mpv, but Windows playback of those offsets still needs a real-device check.
+
+The Windows jwkit installer includes `jwvideo-mux` and ffmpeg but does not install mpv. Opening a prebuilt MP4 in VLC or mpv needs no jwkit installation; running `jwvideo-mux song` for temporary playback requires mpv to be installed separately and available on PATH.
+
 - `--analyze-video-variants` compares selected video-language files without
   muxing or deleting media. It reports byte-identical video groups and only
   sustained, per-pair visual-difference *candidates*; candidates must be

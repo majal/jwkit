@@ -49,6 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/majal/jwkit/main/install.sh | bash
 irm https://raw.githubusercontent.com/majal/jwkit/main/install.ps1 | iex
 ```
 
+The installer does not install a video player. To run `jwvideo-mux song` in its temporary-playback mode, install mpv separately; prebuilt multi-video files can also be opened in VLC.
+
 Then close **every** open terminal window and open a new one — PATH changes only reach terminals started after the install (on Windows, a new tab inside an already-running Windows Terminal isn't enough). Try:
 
 ```bash
