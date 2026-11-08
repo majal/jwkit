@@ -1659,6 +1659,30 @@ class StreamLanguageTagTest(unittest.TestCase):
         self.assertEqual(missing, [])
 
 
+class SongEndAlignmentTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.mux = load_script_module("jwvideo-mux")
+
+    def test_hearing_track_is_delayed_only_when_sign_video_is_longer(self) -> None:
+        self.assertAlmostEqual(self.mux.song_alignment_offset(173.2, 169.1), 4.1)
+        self.assertEqual(self.mux.song_alignment_offset(169.1, 173.2), 0.0)
+        self.assertEqual(self.mux.song_alignment_offset(169.1, 169.1), 0.0)
+
+    def test_audio_duration_uses_selected_stream_and_falls_back_to_format(self) -> None:
+        with mock.patch.object(
+            self.mux, "command_output",
+            return_value='{"streams":[{"duration":"166.3"}],"format":{"duration":"169.1"}}',
+        ) as command:
+            self.assertEqual(self.mux.probe_media_duration(Path("song.mp4"), "a"), 166.3)
+        self.assertIn("a:0", command.call_args.args[0])
+
+        with mock.patch.object(
+            self.mux, "command_output",
+            return_value='{"streams":[{"duration":"N/A"}],"format":{"duration":"169.1"}}',
+        ):
+            self.assertEqual(self.mux.probe_media_duration(Path("song.mp4"), "a"), 169.1)
+
+
 class MuxProvenanceTest(unittest.TestCase):
     """The record jwvideo-mux leaves in each output: pinned inputs, roles, and a rebuild command."""
 

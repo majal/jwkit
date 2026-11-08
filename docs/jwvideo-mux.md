@@ -54,6 +54,21 @@ Download and merge a video by URL using the default languages:
 ./jwvideo-mux 502015752 -v E -a E,TG,CV
 ```
 
+Play a song immediately with one sign-language video and the English meeting instrumental. The mux is temporary and removed when playback exits:
+
+```bash
+./jwvideo-mux song 81 FSL
+```
+
+Save that compact mux as an MP4 without launching playback, or include the E, TG, and CV lyric videos as selectable video tracks:
+
+```bash
+./jwvideo-mux song 81 FSL --save --no-play --container mp4
+./jwvideo-mux song 81 FSL --all-videos --save
+```
+
+`song` downloads from the public JW media API: sign video from `sjj`, and hearing lyric videos plus the English meeting instrumental from `sjjm`. For PSS programming, continue using the JW Docs versions already selected for the class because a private JW Docs edition can differ from the public edition. It takes the instrumental audio from the English `sjjm` MP4 so its timing matches that edition. If the sign video is longer, each hearing video and audio track is delayed to end with it; if the sign video is equal or shorter, all tracks start at zero and the sign video can finish first. No stream is stretched or re-encoded. The default temporary-playback mode needs `mpv`; `--save` keeps the mux in the output directory, and `--no-play` builds it without opening a player.
+
 Download and merge specific languages (e.g., French base video with English, Spanish, and French audio), output to MP4, and clean up source files:
 
 ```bash

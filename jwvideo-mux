@@ -1865,10 +1865,185 @@ def record_mux_provenance(out_path, args, input_paths, input_roles, source_urls,
     )
 
 
+def song_alignment_offset(sign_duration: float, track_duration: float) -> float:
+    """Delay a hearing song track only when the sign video runs longer, aligning their ends."""
+    return max(0.0, sign_duration - track_duration)
+
+
+def probe_media_duration(path: Path, stream_type: str | None = None) -> float:
+    """Read a media or selected-stream duration used for song end-alignment."""
+    entries = "stream=duration:format=duration" if stream_type else "format=duration"
+    command = [FFPROBE_BIN, "-v", "error"]
+    if stream_type:
+        command.extend(["-select_streams", f"{stream_type}:0"])
+    command.extend(["-show_entries", entries, "-of", "json", str(path)])
+    raw = command_output(command)
+    payload = json.loads(raw)
+    value = None
+    if stream_type:
+        streams = payload.get("streams", [])
+        if streams:
+            value = streams[0].get("duration")
+    if value in (None, "N/A"):
+        value = payload.get("format", {}).get("duration")
+    duration = float(value)
+    if duration <= 0:
+        raise ValueError(f"No positive duration found for {path}")
+    return duration
+
+
+def run_song_command(argv: list[str]) -> int:
+    """Fetch a JW song's sign video, hearing lyric videos, and English meeting instrumental."""
+    parser = argparse.ArgumentParser(
+        prog="jwvideo-mux song",
+        description="Play or save a song with sign and hearing tracks aligned by their ending time.",
+    )
+    parser.add_argument("number", type=int, help="Song number, e.g. 81")
+    parser.add_argument("sign_language", help="Sign-language video code, e.g. FSL or ASL")
+    parser.add_argument("--all-videos", action="store_true", help="Include E, TG, and CV lyric videos (default: sign video plus English instrumental only)")
+    parser.add_argument("--videos", help="Comma-separated hearing lyric-video languages (default with --all-videos: E,TG,CV)")
+    parser.add_argument("-r", "--res", choices=["240p", "360p", "480p", "720p", "1080p"], help="Video resolution")
+    parser.add_argument("-c", "--container", choices=["mkv", "mp4"], help="Output container")
+    parser.add_argument("-o", "--output-dir", help="Directory for a saved mux (default: configured output directory)")
+    parser.add_argument("--save", action="store_true", help="Keep the muxed song in the output directory; without this, play a temporary mux")
+    parser.add_argument("--no-play", action="store_true", help="Build the saved mux without launching mpv (requires --save)")
+    parser.add_argument("-f", "--force", action="store_true", help="Overwrite if the output already exists")
+    parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override output conflict handling for this run")
+    parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override unattended output conflict handling")
+    parser.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds, help="Wait time for an interactive overwrite decision")
+    args = parser.parse_args(argv)
+    _jwkit_common.maybe_auto_update(Path(__file__).resolve().parent)
+    if args.number < 1:
+        parser.error("song number must be a positive integer")
+    if args.no_play and not args.save:
+        parser.error("--no-play requires --save")
+    sign_lang = args.sign_language.upper()
+    if not re.fullmatch(r"[A-Z0-9-]+", sign_lang):
+        parser.error("sign_language must be a language code")
+
+    config = load_config()
+    res = args.res or config["res"]
+    container = args.container or config["container"]
+    output_dir = Path(args.output_dir or config["output_dir"]).expanduser().resolve()
+    hearing_videos = [part.strip().upper() for part in (args.videos or ("E,TG,CV" if args.all_videos else "")).split(",") if part.strip()]
+    if len(set(hearing_videos)) != len(hearing_videos) or any(not re.fullmatch(r"[A-Z0-9-]+", lang) for lang in hearing_videos):
+        parser.error("--videos must be a comma-separated list of distinct language codes")
+    if sign_lang in hearing_videos:
+        parser.error("the sign language cannot also be listed in --videos")
+    if not args.save and not args.no_play and not shutil.which("mpv"):
+        color_print("Error: mpv is required for temporary playback; install mpv or use --save --no-play.", "red")
+        return 1
+
+    global COLOR, FFMPEG_BIN, FFPROBE_BIN
+    COLOR = _jwkit_common.Colorizer(_jwkit_common.resolve_color_enabled(_jwkit_common.load_jwkit_config()))
+    FFMPEG_BIN = _jwkit_common.resolve_ffmpeg_binary({"ffmpeg_binary": config.get("ffmpeg_binary")})
+    FFPROBE_BIN = _jwkit_common.resolve_ffprobe_binary({"ffprobe_binary": config.get("ffprobe_binary")})
+    check_dependencies()
+
+    track = f"{args.number:03d}"
+    sign_links = get_media_links({"pub": "sjj", "track": track}, sign_lang, res)
+    if not sign_links.get("mp4"):
+        color_print(f"No {sign_lang} sign-language video is available for song {track}.", "red")
+        return 1
+    hearing_links = {}
+    for lang in hearing_videos:
+        links = get_media_links({"pub": "sjjm", "track": track}, lang, res)
+        if not links.get("mp4"):
+            color_print(f"No {lang} lyric video is available for song {track}.", "red")
+            return 1
+        hearing_links[lang] = links["mp4"]
+    instrumental_links = get_media_links({"pub": "sjjm", "track": track}, "E", res)
+    if not instrumental_links.get("mp4"):
+        color_print(f"No English meeting instrumental source is available for song {track}.", "red")
+        return 1
+
+    video_langs = [sign_lang] + hearing_videos
+    language_group = "-".join(video_langs) + "+E"
+    output_name = f"sjj_{language_group}_{track}_r{res.upper()}.{container}"
+    out_path = output_dir / output_name
+    if args.save:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        jwkit_config = {"on_output_exists": "overwrite"} if args.force else _jwkit_common.load_jwkit_config()
+        for arg_name, config_key in (("on_exists", "on_output_exists"), ("on_exists_unattended", "on_output_exists_unattended"), ("overwrite_timeout", "overwrite_prompt_timeout")):
+            value = getattr(args, arg_name, None)
+            if value is not None:
+                jwkit_config[config_key] = value
+        resolved = _jwkit_common.resolve_output_conflict(out_path, jwkit_config)
+        if resolved is None:
+            return 0
+        out_path = resolved
+
+    with tempfile.TemporaryDirectory(prefix="jwvideo-mux-song-") as temp_name:
+        temp_dir = Path(temp_name)
+        sources: dict[str, Path] = {}
+        source_urls = {sign_lang: sign_links["mp4"], **hearing_links, "E-audio": instrumental_links["mp4"]}
+        for key, url in source_urls.items():
+            path = temp_dir / get_filename_from_url(url)
+            download_file(url, path)
+            if not path.is_file() or path.stat().st_size == 0:
+                color_print(f"Failed to download the {key} source for song {track}.", "red")
+                return 1
+            sources[key] = path
+
+        sign_duration = probe_media_duration(sources[sign_lang])
+        track_inputs: list[tuple[str, str, Path, float]] = [("video", sign_lang, sources[sign_lang], 0.0)]
+        for lang in hearing_videos:
+            path = sources[lang]
+            offset = song_alignment_offset(sign_duration, probe_media_duration(path))
+            track_inputs.append(("video", lang, path, offset))
+        audio_path = sources["E-audio"]
+        audio_offset = song_alignment_offset(sign_duration, probe_media_duration(audio_path, "a"))
+        track_inputs.append(("audio", "E", audio_path, audio_offset))
+
+        ff_inputs: list[str] = []
+        ff_maps: list[str] = []
+        ff_meta: list[str] = []
+        for index, (kind, lang, path, offset) in enumerate(track_inputs):
+            if offset > 0:
+                ff_inputs.extend(["-itsoffset", f"{offset:.6f}"])
+            ff_inputs.extend(["-i", str(path)])
+            stream_index = sum(1 for role, *_ in track_inputs[:index] if role == kind)
+            ff_maps.extend(["-map", f"{index}:{'v:0' if kind == 'video' else 'a:0'}"])
+            iso, title = get_lang_meta(lang)
+            ff_meta.extend([f"-metadata:s:{'v' if kind == 'video' else 'a'}:{stream_index}", f"language={stream_language_tag(iso, container)}"])
+            ff_meta.extend([f"-metadata:s:{'v' if kind == 'video' else 'a'}:{stream_index}", f"title={title}"])
+            ff_meta.extend([
+                f"-disposition:{'v' if kind == 'video' else 'a'}:{stream_index}",
+                "default" if (kind == "audio" or stream_index == 0) else "0",
+            ])
+
+        mux_path = out_path if args.save else temp_dir / output_name
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y"] + ff_inputs + ff_maps + ff_meta + [
+            "-map_metadata", "-1", "-map_chapters", "-1", "-c:v", "copy", "-c:a", "copy", "-dn",
+        ]
+        if container == "mp4":
+            cmd += ["-use_editlist", "1", "-avoid_negative_ts", "disabled", "-movflags", "+faststart"]
+        cmd.append(str(mux_path))
+        offsets = [f"{lang}={offset:.3f}s" for kind, lang, _path, offset in track_inputs if offset > 0]
+        color_print(f"Creating {container.upper()} song {track}; end-alignment offsets: {', '.join(offsets) or 'none'}", "cyan")
+        result = subprocess.run(cmd)
+        if result.returncode:
+            color_print(f"Muxing song {track} failed.", "red")
+            return result.returncode
+        if args.save:
+            color_print(f"Saved: {mux_path}", "green")
+        if not args.no_play:
+            player = shutil.which("mpv")
+            if player:
+                return subprocess.run([player, str(mux_path)]).returncode
+            color_print("mpv was not found; the saved mux is ready.", "yellow")
+        return 0
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         return run_config(sys.argv[2:])
-    parser = argparse.ArgumentParser(description="jwvideo-mux: Merge videos, audio, and subtitles from jw.org")
+    if len(sys.argv) > 1 and sys.argv[1] == "song":
+        sys.exit(run_song_command(sys.argv[2:]))
+    parser = argparse.ArgumentParser(
+        description="jwvideo-mux: Merge videos, audio, and subtitles from jw.org, or play/save an end-aligned song.",
+        epilog="Song mode: jwvideo-mux song --help",
+    )
     parser.add_argument("input", help="URL, docid, or local file pattern to process")
     parser.add_argument("-v", "--video", help="Comma-separated language codes for video tracks; an entry may instead be CODE=path/to/file.mp4 to pin an exact local file, or a bare path/to/file.mp4 to have its language code inferred from its filename (local file mode only)")
     parser.add_argument("-a", "--audio", help="Comma-separated language codes for audio tracks; an entry may instead be CODE=path/to/file to pin an exact local file, or a bare path/to/file to have its language code inferred from its filename (local file mode only)")
