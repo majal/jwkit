@@ -2116,7 +2116,11 @@ class SlverseExtractVerseInpaintTest(unittest.TestCase):
         # Input 0 is the plain trimmed source (also where audio comes from -
         # the inpainted intermediate is video-only); input 1 is the short
         # inpainted patch.
-        self.assertEqual(cmd[:6], ["-ss", "10.0", "-to", "20.0", "-i", "http://example/vid.mp4"])
+        # The end is an output-side -t after the last -i (input-side -to over-reads).
+        self.assertEqual(cmd[:4], ["-ss", "10.0", "-i", "http://example/vid.mp4"])
+        self.assertNotIn("-to", cmd)
+        self.assertGreater(cmd.index("-t"), cmd.index("-i") + 2)
+        self.assertEqual(cmd[cmd.index("-t") + 1], "10.0")
         self.assertIn("-filter_complex", cmd)
         fc = cmd[cmd.index("-filter_complex") + 1]
         self.assertIn("[1:v]setpts=PTS+3.000/TB[patch]", fc)  # 13.0 - 10.0 (start_time)

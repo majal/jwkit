@@ -1753,7 +1753,7 @@ def preview_verse(source, start_time, end_time, book_name, chapter, verse_window
                 return
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_out = Path(tmp_dir) / "preview.mkv"
-                cmd = ["-ss", str(start_time), "-t", str(duration), "-i", str(source)]
+                cmd = ["-ss", str(start_time), "-i", str(source), "-t", str(duration)]
                 if overlay:
                     cmd += ["-vf", overlay]
                 cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "copy", "-f", "matroska", str(tmp_out)]
@@ -1917,7 +1917,7 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
                     filters.append(f"[patched]{text_overlay}[final]")
                     out_label = "[final]"
                 audio = has_audio_stream(source)
-                cmd = ["-ss", str(start_time), "-to", str(end_time), "-i", str(source), "-i", str(inpainted)]
+                cmd = ["-ss", str(start_time), "-i", str(source), "-i", str(inpainted), "-t", str(duration)]
                 cmd += ["-filter_complex", ";".join(filters), "-map", out_label]
                 if audio:
                     cmd += ["-map", "0:a", "-c:a", "copy"]
@@ -1961,7 +1961,9 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
     # -ss before -i does an input-side seek; on a remote URL that means the
     # CDN is only asked for bytes from roughly that point on, which is what
     # keeps onthefly mode from pulling the whole chapter over the network.
-    cmd = ["-ss", str(start_time), "-to", str(end_time), "-i", str(source)]
+    # The end is an output-side -t after the last -i: an input-side -to
+    # over-reads the source (see ffrife's source_window_args).
+    cmd = ["-ss", str(start_time), "-i", str(source), "-t", str(duration)]
     if len(segments) > 1:
         audio = has_audio_stream(source)
         fc = build_trim_concat_filter_complex(segments, audio=audio)
@@ -2167,8 +2169,11 @@ def encode_rife_frame_sections(source, output_file, sections, target_fps, config
                 inputs += ["-framerate", f"{target_fps:g}", "-i", str(value / "%08d.png")]
                 normalize = "settb=AVTB,setpts=PTS-STARTPTS"
             else:
-                inputs += ["-ss", str(seg_start), "-t", str(seg_end - seg_start), "-i", str(value)]
-                normalize = f"fps={target_fps:g},settb=AVTB,setpts=PTS-STARTPTS"
+                # Seek on the input, cut the length with trim after the
+                # rebase: an input-side -t over-reads the source.
+                inputs += ["-ss", str(seg_start), "-i", str(value)]
+                normalize = (f"fps={target_fps:g},settb=AVTB,setpts=PTS-STARTPTS,"
+                             f"trim=duration={seg_end - seg_start:.6f}")
             filters += f"[{i}:v]{normalize}[p{i}];"
             labels.append(f"[p{i}]")
         audio = has_audio_stream(source)
@@ -2276,10 +2281,11 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
         fc += f";{out_label}{overlay}[final]"
         map_label = "[final]"
 
-    # -ss/-to before -i: same input-side seek extract_verse uses, so
+    # -ss before -i (same input-side seek extract_verse uses), so
     # `boundaries` stay relative to the verse's own start (0) rather than
-    # needing the caller to add start_time to each one.
-    cmd = ["-ss", str(start_time), "-t", str(end_time - start_time), "-i", str(source), "-filter_complex", fc, "-map", map_label]
+    # needing the caller to add start_time to each one. The length is an
+    # output-side -t after the input: an input-side -t over-reads.
+    cmd = ["-ss", str(start_time), "-i", str(source), "-t", str(end_time - start_time), "-filter_complex", fc, "-map", map_label]
     if audio:
         cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]
     cmd += build_encode_args(config) + (metadata_args or []) + [str(output_file)]
@@ -2587,7 +2593,7 @@ def find_or_generate_bench_sample(config, tmp_dir):
     candidate = next(cache_dir.rglob("*.mp4"), None) if cache_dir.exists() else None
     sample = Path(tmp_dir) / "bench_sample.mp4"
     if candidate:
-        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-ss", "5", "-t", "8", "-i", str(candidate),
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-ss", "5", "-i", str(candidate), "-t", "8",
                "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-an", str(sample)]
         try:
             subprocess.run(cmd, check=True, timeout=60)
