@@ -1749,9 +1749,17 @@ def detect_verse_end(source, *, verse_start, marker_end, local_offset, config):
         if frame_count < 3:
             result["reason"] = "too few frames before the marker end to scan"
             return result
-        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-ss", f"{scan_start + local_offset:.3f}", "-i", str(source),
-               "-frames:v", str(frame_count), "-vf", f"crop={width}:{height}:{left}:{top},format=gray", "-f", "rawvideo", "pipe:1"]
-        raw = subprocess.run(cmd, check=True, capture_output=True, timeout=60).stdout
+        # showinfo logs each frame's real timestamp (seconds after the -ss point)
+        # to stderr, so the cut can sit between two actual frames instead of on
+        # an estimated grid.
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "info", "-ss", f"{scan_start + local_offset:.3f}", "-i", str(source),
+               "-frames:v", str(frame_count), "-vf", f"crop={width}:{height}:{left}:{top},format=gray,showinfo",
+               # passthrough: the default constant-rate output duplicates or drops frames
+               # wherever the source timestamps have a gap, which would shift every index.
+               "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"]
+        proc = subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+        raw = proc.stdout
+        pts = [float(m) for m in re.findall(r"\bn:\s*\d+\s+pts:\s*-?\d+\s+pts_time:\s*(-?[0-9.]+)", (getattr(proc, "stderr", b"") or b"").decode("utf-8", "replace"))]
         frame_size = width * height
         frames = [raw[i:i + frame_size] for i in range(0, len(raw) - frame_size + 1, frame_size)]
         result["frames_scanned"] = len(frames)
@@ -1771,8 +1779,21 @@ def detect_verse_end(source, *, verse_start, marker_end, local_offset, config):
         if len(tail) < 2 or stable * 2 <= len(tail) or sum(departed[first:]) * 2 <= len(tail):
             result["reason"] = "label change not stable through the marker end (marker kept)"
             return result
-        result["boundary"] = scan_start + first / fps
-        result["reason"] = f"label changed {(marker_end - result['boundary']) * fps:.1f} frames before the marker end"
+        # showinfo can log one more frame than reaches the pipe (the one in flight
+        # when -frames:v stops), so extra trailing timestamps are ignored.
+        if len(pts) >= len(frames):
+            pts = pts[:len(frames)]
+            # Cut midway between the last frame of this verse and the first frame
+            # of the next. The extract's own frame grid can sit up to a frame off
+            # this scan's and the markers are rounded to milliseconds, so a cut
+            # on the first next-verse frame's timestamp can keep that frame.
+            result["boundary"] = scan_start + (pts[first - 1] + pts[first]) / 2
+            in_window = sum(1 for t in pts if scan_start + t < marker_end)
+            result["frames_cut"] = max(0, in_window - first)
+        else:
+            result["boundary"] = scan_start + (first - 0.5) / fps
+            result["frames_cut"] = max(0, round((marker_end - result["boundary"]) * fps - 0.5))
+        result["reason"] = f"label changed {result['frames_cut']} frames before the marker end"
         return result
     except Exception as exc:  # decode/probe problems: keep the marker, never fail the run
         result["reason"] = f"label scan failed ({type(exc).__name__}); marker kept"
@@ -1799,25 +1820,37 @@ def record_verse_end_decision(lang, book_num, chapter, start, end, checksum, url
     can be checked against the source it was made on. Written atomically (tmp
     file, then os.replace). Callers decide whether a failure matters; this
     raises on I/O errors."""
-    key = f"{lang}:{book_num}_{chapter}:{round(start * 1000)}-{round(end * 1000)}"
+    prefix = f"{lang}:{book_num}_{chapter}:"
+    key = f"{prefix}{round(start * 1000)}-{round(end * 1000)}"
     ledger = load_verse_end_ledger()
     previous = ledger.get(key) if isinstance(ledger.get(key), dict) else {}
+    # The checksum is the chapter video's, and a re-edited video usually moves
+    # its markers too, which makes a new key. So a changed checksum is also
+    # looked for in the other entries of this chapter when this window is new.
+    seen = [previous.get("checksum")] if previous.get("checksum") else [
+        value.get("checksum") for name, value in ledger.items()
+        if name.startswith(prefix) and isinstance(value, dict)
+    ]
+    older = next((c for c in seen if c and checksum and c != checksum), None)
     boundary = result.get("boundary")
     fps = result.get("fps")
     entry = {
         "url": url,
         "checksum": checksum,
-        "source_changed": bool(previous.get("checksum") and checksum and previous["checksum"] != checksum),
+        "source_changed": older is not None,
         "settings": {key_: config.get(key_) for key_ in ("verse_end", "verse_end_search", "verse_label_crop")},
         "marker_end": round(end, 4),
         "boundary": None if boundary is None else round(boundary, 4),
-        "frames_cut": round((end - boundary) * fps) if boundary is not None and fps else 0,
+        "frames_cut": int(result.get("frames_cut") or 0) if boundary is not None else 0,
         "fps": fps,
         "reason": result.get("reason"),
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    if entry["source_changed"]:
-        entry["previous_checksum"] = previous["checksum"]
+    if older is not None:
+        entry["previous_checksum"] = older
+    elif previous.get("previous_checksum"):
+        # Same source again: keep the record that it once changed.
+        entry["previous_checksum"] = previous["previous_checksum"]
     ledger[key] = entry
     VERSE_END_LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = VERSE_END_LEDGER_FILE.with_name(VERSE_END_LEDGER_FILE.name + ".tmp")
@@ -1867,7 +1900,7 @@ class VerseEndProbe:
         """The confirmed cut, if any: (frames removed, fps), else None."""
         for result in self.outcomes:
             if result["boundary"] is not None and result["fps"]:
-                return round((result["marker_end"] - result["boundary"]) * result["fps"]), result["fps"]
+                return int(result.get("frames_cut") or 0), result["fps"]
         return None
 
 

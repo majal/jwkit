@@ -44,8 +44,23 @@ class SlverseDetectVerseEndTest(unittest.TestCase):
     def test_boundary_is_first_frame_after_label_change(self) -> None:
         values = [50] * 20 + [200] * 25
         result, _ = self._run(values)
-        self.assertAlmostEqual(result["boundary"], 8.5 + 20 / 30.0)
+        self.assertAlmostEqual(result["boundary"], 8.5 + 19.5 / 30.0)
+        self.assertEqual(result["frames_cut"], 25)
         self.assertEqual(result["frames_scanned"], 45)
+
+    def test_boundary_uses_real_frame_timestamps_when_logged(self) -> None:
+        # Frames land 10 ms off the 1/30 s grid; the cut goes midway between the
+        # last frame of the verse (index 19) and the first of the next (20).
+        values = [50] * 20 + [200] * 25
+        pts = [-0.001 + i / 30.0 for i in range(45)]  # a seek leaves the first frame just before 0
+        stderr = "".join(f"[Parsed_showinfo_2 @ 0x1] n:{i:3d} pts:{i} pts_time:{t:.6f}\n" for i, t in enumerate(pts)).encode()
+        raw = _frames_raw(values)
+        with mock.patch.object(self.slverse.subprocess, "run", return_value=argparse.Namespace(stdout=raw, stderr=stderr)):
+            result = self.slverse.detect_verse_end(
+                "source.mp4", verse_start=0.0, marker_end=10.0, local_offset=0.0, config=self.config,
+            )
+        self.assertAlmostEqual(result["boundary"], 8.5 + (pts[19] + pts[20]) / 2)
+        self.assertEqual(result["frames_cut"], 25)
 
     def test_no_label_change_keeps_marker(self) -> None:
         result, _ = self._run([50] * 45)
@@ -136,7 +151,7 @@ class SlverseVerseEndProbeTest(unittest.TestCase):
         probe = self.slverse.VerseEndProbe("FSL", 19, 119, dict(self.slverse.DEFAULT_CONFIG), {})
         probe.outcomes = [
             {"boundary": None, "marker_end": 5.0, "reason": "no label change", "fps": 29.97, "frames_scanned": 45},
-            {"boundary": 181.4582, "marker_end": 181.757, "reason": "label changed", "fps": 29.97002997, "frames_scanned": 45},
+            {"boundary": 181.4582, "marker_end": 181.757, "reason": "label changed", "fps": 29.97002997, "frames_scanned": 45, "frames_cut": 9},
         ]
         self.assertEqual(probe.applied(), (9, 29.97002997))
 
@@ -184,10 +199,15 @@ class SlverseVerseEndRealSegmentTest(unittest.TestCase):
             local_offset=-seg_start, config=dict(self.slverse.DEFAULT_CONFIG),
         )
         self.assertIsNotNone(result["boundary"], result["reason"])
-        self.assertAlmostEqual(result["boundary"], 181.4582, delta=0.01)
-        self.assertAlmostEqual(result["boundary"] - seg_start, 11.679, delta=0.01)
-        cut = round((seg_start + 11.978 - result["boundary"]) * result["fps"])
-        self.assertEqual(cut, 9)
+        self.assertEqual(result["frames_cut"], 9)
+        # Segment frame 349 (11.645 s) still reads 97 and frame 350 (11.678 s) reads
+        # 98, so the cut sits between them: the -t cut keeps 349 and drops 350.
+        frame_len = 1001 / 30000
+        local = result["boundary"] - seg_start
+        self.assertGreater(local, 349 * frame_len)
+        self.assertLess(local, 350 * frame_len)
+        self.assertAlmostEqual(local, 349.5 * frame_len, delta=0.002)
+        self.assertAlmostEqual(local, 349.5 * frame_len, delta=0.002)
 
 
 class SlverseVerseEndLedgerTest(unittest.TestCase):
@@ -203,7 +223,7 @@ class SlverseVerseEndLedgerTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.config = dict(self.slverse.DEFAULT_CONFIG)
-        self.confirmed = {"boundary": 181.4582, "reason": "label changed", "fps": 29.97002997, "frames_scanned": 45}
+        self.confirmed = {"boundary": 181.4582, "reason": "label changed", "fps": 29.97002997, "frames_scanned": 45, "frames_cut": 9}
 
     def _record(self, checksum, result=None, url="http://example/fsl.mp4"):
         return self.slverse.record_verse_end_decision(
@@ -243,6 +263,29 @@ class SlverseVerseEndLedgerTest(unittest.TestCase):
         self.assertTrue(entry["source_changed"])
         self.assertEqual(entry["previous_checksum"], "abc")
         self.assertEqual(self._ledger()["FSL:19_119:169779-181757"]["checksum"], "def")
+
+    def test_changed_source_with_moved_markers_is_still_flagged(self) -> None:
+        # A re-edited video usually moves its markers, so the window key differs.
+        self._record("abc")
+        entry = self.slverse.record_verse_end_decision(
+            "FSL", 19, 119, 169.9, 181.9, "def", "http://example/fsl.mp4", self.config, self.confirmed,
+        )
+        self.assertTrue(entry["source_changed"])
+        self.assertEqual(entry["previous_checksum"], "abc")
+
+    def test_rescan_on_same_new_source_keeps_the_change_record(self) -> None:
+        self._record("abc")
+        self._record("def")
+        entry = self._record("def")
+        self.assertFalse(entry["source_changed"])
+        self.assertEqual(entry["previous_checksum"], "abc")
+
+    def test_new_window_on_unchanged_chapter_is_not_flagged(self) -> None:
+        self._record("abc")
+        entry = self.slverse.record_verse_end_decision(
+            "FSL", 19, 119, 181.758, 193.770, "abc", "http://example/fsl.mp4", self.config, self.confirmed,
+        )
+        self.assertFalse(entry["source_changed"])
 
     def test_corrupt_ledger_is_replaced_not_fatal(self) -> None:
         self.ledger_path.write_text("{not json")
