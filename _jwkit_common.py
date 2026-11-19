@@ -1034,6 +1034,18 @@ def _move_to_trash_windows(path):
 
 
 def _move_to_trash(path):
+    # JWKIT_TRASH_DIR redirects "trash" into a plain folder (tests, headless hosts) instead of the
+    # OS trash.
+    override = os.environ.get("JWKIT_TRASH_DIR")
+    if override:
+        dest_dir = Path(override)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path = Path(path)
+        dest = dest_dir / path.name
+        if dest.exists():
+            dest = _datetime_tagged(dest)
+        shutil.move(str(path), str(dest))
+        return
     system = platform.system()
     if system == "Darwin":
         _move_to_trash_macos(path)

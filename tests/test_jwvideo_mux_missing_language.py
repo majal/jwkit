@@ -60,6 +60,16 @@ class DownloadMissingLanguageTest(unittest.TestCase):
                 entry, _ = self.mux.download_missing_language({"pub": "mwbv"}, "FSL", "720p", True, Path(tmp))
             self.assertEqual(entry, {"video": Path(tmp) / "mwbv_FSL_202311_02_r720P.mp4"})
 
+    def test_subtitles_are_fetched_when_wanted(self) -> None:
+        links = {"mp4": "https://x/mwbv_CV_202311_02_r720P.mp4", "vtt": "https://x/mwbv_CV_202311_02_r720P.vtt"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(self.mux, "download_file", return_value=True), \
+                mock.patch.object(self.mux, "get_media_links", return_value=links):
+            entry, _ = self.mux.download_missing_language({}, "CV", "720p", True, Path(tmp), want_sub=True)
+            self.assertEqual(entry["sub"], Path(tmp) / "mwbv_CV_202311_02_r720P.vtt")
+            entry, _ = self.mux.download_missing_language({}, "CV", "720p", True, Path(tmp), want_sub=False)
+            self.assertNotIn("sub", entry)
+
     def test_nothing_on_jworg_or_failed_download_gives_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(self.mux, "get_media_links", return_value={}):
@@ -120,6 +130,44 @@ class InputIsNeverClobberedTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("would replace one of its own inputs", result.stdout)
             self.assertEqual(src.read_bytes(), before)
+
+
+@unittest.skipUnless(FFMPEG_AVAILABLE, "ffmpeg not installed")
+class CleanupTrashesAndProtectsOwnInputsTest(unittest.TestCase):
+    def _setup(self, root: Path) -> Path:
+        src = root / "prefix_TG_test.mp4"
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(src),
+        ], check=True)
+        return src
+
+    def _run(self, root: Path, src: Path, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, JWVIDEOMUX, "-v", "TG", "-a", "TG", "-s", "NONE", "-C", *extra, str(src)],
+            cwd=root, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+            env={**__import__("os").environ, "JWKIT_TRASH_DIR": str(root / ".trash"), "HOME": str(root)},
+        )
+
+    def test_unattended_cleanup_keeps_own_input(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jwvideo-mux-keep-") as tmp:
+            root = Path(tmp)
+            src = self._setup(root)
+            result = self._run(root, src)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(src.exists())
+            self.assertIn("Kept 1 of your own input", result.stdout)
+
+    def test_force_trashes_own_input_recoverably(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jwvideo-mux-force-") as tmp:
+            root = Path(tmp)
+            src = self._setup(root)
+            result = self._run(root, src, "--force")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(src.exists())
+            self.assertTrue((root / ".trash" / src.name).exists())
 
 
 if __name__ == "__main__":

@@ -1249,6 +1249,7 @@ class CleanupOnlyDeletesUsedFilesTest(unittest.TestCase):
                 [sys.executable, self.JWVIDEOMUX, str(anchor), "-v", "TG", "-a", "TG", "-s", "TG,E",
                  "--cleanup", "--force"],
                 cwd=root, capture_output=True, text=True, timeout=120,
+                env={**__import__("os").environ, "JWKIT_TRASH_DIR": str(root / ".trash")},
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -1294,6 +1295,7 @@ class LocalFileModeSrtSubtitleTest(unittest.TestCase):
                 [sys.executable, self.JWVIDEOMUX, str(anchor), "-v", "E", "-a", "E", "-s", "E",
                  "--cleanup", "--force"],
                 cwd=root, capture_output=True, text=True, timeout=120,
+                env={**__import__("os").environ, "JWKIT_TRASH_DIR": str(root / ".trash")},
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(

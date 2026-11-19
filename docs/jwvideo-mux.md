@@ -14,7 +14,7 @@ It downloads a jw.org video and merges the language tracks you want into one fil
 - Defaults to MKV as the export container, with an option to export to MP4.
 - Embeds VTT subtitles directly into the video container.
 - Offers to automatically install `ffmpeg` if not found.
-- Has an optional cleanup flag to delete the source files that went into the output after a successful mux.
+- Has an optional cleanup flag to move the source files that went into the output to the Trash after a successful mux.
 - Can create single-stream audio/video files instead of merged ones, replacing the base track, which helps with platforms that play all audio streams simultaneously.
 - If you include a language in both `--video` and `--audio` (e.g., `--video E --audio E,TG`), the script is smart enough to download the MP4 exactly once and map its video and audio streams seamlessly.
 - **Sign Language:** If a language does not have an MP3 (common for sign languages), the script will automatically fall back to downloading its MP4 to use as the track source.
@@ -279,10 +279,10 @@ The Windows jwkit installer includes `jwvideo-mux` and ffmpeg but does not insta
 ## Notes / Caveats
 
 - JW Library currently plays all audio tracks simultaneously when given a multi-audio MP4 file. To avoid this when using JW Library, use the `--single-streams` flag.
-- `--cleanup` permanently deletes (it does not trash) the source files that were actually used, and only after every output was written successfully; a failed mux leaves everything in place. In local-file mode that includes your own input file.
+- `--cleanup` (`-C`) moves the source files that were actually used to the Trash (recoverable), and only after every output was written successfully; a failed mux leaves everything in place. Files the tool downloaded are always eligible. In local-file mode your own input files (and their sidecars) are asked about first (`Move them to the Trash too? [y/N]`); unattended runs keep them, and `-f/--force` trashes them without asking. `cleanup` is off by default and is not set in any config unless you add it. `JWKIT_TRASH_DIR` redirects the trash into a plain folder (used by the tests).
 - Output naming: the output reuses the input's name with its language token replaced by the loaded languages (`mwbv_FSL_202311_02_r720P_rife.mp4` with `-v FSL -a CV` becomes `mwbv_FSL+CV_202311_02_r720P_rife.mp4`). The `merged_<langs>_<name>` form is only the fallback for names without `pub_LANG_x` structure.
 - The tool refuses to run when the output path is one of its own inputs (e.g. only the base language loaded, same container), and errors out instead of silently dropping a language you passed on the command line (`-v`/`-a`) that has no file.
-- Local-file mode and missing languages: an explicitly requested `-v`/`-a` language with no local file is downloaded from jw.org when the input is named like a jw.org file (`pub_LANG_[issue_]track_rNNNP...`; the `_rife` suffix is fine). Resolution follows the input's `rNNNP` token. Audio-only languages use the MP3 if there is one, else the smallest MP4. Downloads go to a temporary folder that is removed when the run ends; `--keep-downloads` keeps them next to the input instead. `--no-download-missing` (config `download_missing`) turns this off. Subtitles are not fetched for downloaded languages. Config-default languages (not typed on the command line) are never downloaded.
+- Local-file mode and missing languages: an explicitly requested `-v`/`-a` language with no local file is downloaded from jw.org when the input is named like a jw.org file (`pub_LANG_[issue_]track_rNNNP...`; the `_rife` suffix is fine). Resolution follows the input's `rNNNP` token. Audio-only languages use the MP3 if there is one, else the smallest MP4. Downloads go to a temporary folder that is removed when the run ends; `--keep-downloads` keeps them next to the input instead. `--no-download-missing` (config `download_missing`) turns this off. Subtitles (`.vtt`) are fetched too when that language's subtitles are selected (`-s`, or by default when `-s` is omitted). Config-default languages (not typed on the command line) are never downloaded.
 
 Example: FSL video from a local RIFE file plus Cebuano audio from jw.org, leaving only the new mp4:
 

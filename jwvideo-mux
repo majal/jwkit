@@ -411,7 +411,7 @@ def infer_media_params_from_filename(name: str, base_lang: str) -> dict | None:
     return None
 
 
-def download_missing_language(params: dict, lang: str, res: str, want_video: bool, dest_dir: Path) -> dict:
+def download_missing_language(params: dict, lang: str, res: str, want_video: bool, dest_dir: Path, want_sub: bool = False) -> tuple[dict, str | None]:
     """Fetch what a local-file run is missing for `lang`. Returns the local_files entry
     ({'video': path} or {'audio': path}, source url), ({}, None) when jw.org has nothing or the download failed."""
     links = get_media_links(params, lang, res)
@@ -425,7 +425,14 @@ def download_missing_language(params: dict, lang: str, res: str, want_video: boo
         color_print(f"  [{lang}] jw.org has no {'video' if want_video else 'audio'} for this item.", "yellow")
         return {}, None
     dest = dest_dir / get_filename_from_url(url)
-    return ({kind: dest}, url) if download_file(url, dest) else ({}, None)
+    if not download_file(url, dest):
+        return {}, None
+    entry = {kind: dest}
+    if want_sub and links.get('vtt'):
+        sub_dest = dest_dir / get_filename_from_url(links['vtt'])
+        if download_file(links['vtt'], sub_dest):
+            entry['sub'] = sub_dest
+    return entry, url
 
 
 
@@ -2126,9 +2133,9 @@ def main():
     parser.add_argument("-r", "--res", "--resolution", dest="res", help="Target resolution")
     parser.add_argument("-c", "--container", choices=["mkv", "mp4"], help="Export container format")
     parser.add_argument("-S", "--single-streams", action=argparse.BooleanOptionalAction, default=None, help="Produce separate single-stream videos")
-    parser.add_argument("-C", "--cleanup", action=argparse.BooleanOptionalAction, default=None, help="Delete the source files that went into the output after a successful mux")
+    parser.add_argument("-C", "--cleanup", action=argparse.BooleanOptionalAction, default=None, help="Move the source files that went into the output to the Trash after a successful mux (your own local inputs need confirmation, or -f)")
     parser.add_argument("-o", "--output-dir", help="Directory to save output files")
-    parser.add_argument("-f", "--force", action="store_true", help="Force overwrite if output file exists without asking (equivalent to --on-exists overwrite for this run)")
+    parser.add_argument("-f", "--force", action="store_true", help="Force overwrite if output file exists without asking (equivalent to --on-exists overwrite for this run); with --cleanup, also trash your own local inputs without asking")
     parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
     parser.add_argument("--on-exists-unattended", choices=["overwrite", "rename", "trash", "fail"], help="Override on_output_exists_unattended for this run")
     parser.add_argument("--overwrite-timeout", type=_jwkit_common.parse_time_seconds, help="Time to wait for an 'ask' answer before falling back")
@@ -2233,6 +2240,7 @@ def main():
     local_files = {}
     source_urls = {}  # downloaded path -> jw.org URL, for the provenance record
     downloaded_paths = set()  # files this run auto-downloaded in local-file mode
+    temp_dl_dirs = []  # private folders for those downloads; removed at exit, so never worth trashing
 
     if is_local_file:
         color_print("\n>> Local file mode detected. Skipping API downloads...", "header")
@@ -2354,9 +2362,10 @@ def main():
                 else:
                     dl_dir = Path(tempfile.mkdtemp(prefix="jwvideo-mux-dl-"))
                     atexit.register(shutil.rmtree, dl_dir, ignore_errors=True)
+                    temp_dl_dirs.append(dl_dir)
                 color_print(f"\n>> Downloading missing language(s) {', '.join(missing_local)} for {params} ({res})...", "header")
                 for lang in missing_local:
-                    got, got_url = download_missing_language(params, lang, res, lang in explicit_vid, dl_dir)
+                    got, got_url = download_missing_language(params, lang, res, lang in explicit_vid, dl_dir, want_sub=lang in sub_langs)
                     if got:
                         local_files.setdefault(lang, {}).update(got)
                         for path in got.values():
@@ -2892,18 +2901,35 @@ def main():
     elif args.cleanup:
         color_print("\n>> Cleaning up source files actually used above (never anything merely discovered)...", "header")
         skipped_unused = []
+        candidates = []
         for lang, media in local_files.items():
             for mtype, path in media.items():
                 if mtype == "embedded_subs":
                     continue
                 if str(path) not in used_source_paths:
                     skipped_unused.append(path.name)
-                    continue
-                if path.exists():
-                    try:
-                        path.unlink()
-                    except Exception as e:
-                        color_print(f"  Failed to delete {path.name}: {e}", "red")
+                elif path.exists() and not any(Path(d) in Path(path).parents for d in temp_dl_dirs):
+                    candidates.append(path)  # (temp-dir downloads vanish at exit anyway)
+        candidates = list(dict.fromkeys(candidates))
+        # Files this run downloaded are its own litter. In local-file mode everything else is the
+        # operator's own input: only trash those once confirmed (-f skips the question).
+        own_files = [p for p in candidates if is_local_file and str(p) not in downloaded_paths]
+        if own_files and not args.force:
+            if sys.stdin.isatty():
+                print("  These are your own input files:")
+                for p in own_files:
+                    print(f"    {p}")
+                if input("  Move them to the Trash too? [y/N] ").strip().lower() not in ("y", "yes"):
+                    candidates = [p for p in candidates if p not in own_files]
+                    color_print("  Kept your own input files.", "cyan")
+            else:
+                candidates = [p for p in candidates if p not in own_files]
+                color_print(f"  Kept {len(own_files)} of your own input file(s); pass -f/--force to trash them too.", "cyan")
+        for path in candidates:
+            try:
+                _jwkit_common._move_to_trash(path)
+            except Exception as e:
+                color_print(f"  Failed to trash {path.name}: {e}", "red")
         if skipped_unused:
             color_print(
                 f"  Left {len(skipped_unused)} file(s) untouched (resolved but never used in any output): "
