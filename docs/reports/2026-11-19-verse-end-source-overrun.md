@@ -2,61 +2,65 @@
 
 Date: 2026-11-19
 Scope: `slverse` end-of-verse window, `ffrife` RIFE output. Measured on the cached FSL 19_119 segment.
-Status: study and design only. No code changed. Delivered files untouched.
+Status: label-based end detection implemented in `slverse` (`verse_end=label`, the default). Uncommitted at the time of writing. Delivered files untouched.
 
 ## Answer: was it 3 frames, or did RIFE add one?
 
-Neither. The overrun is about 10 source frames (0.333 s), it is in the source, and RIFE added nothing.
+Neither. The verse-97 marker runs about 9 frames (0.299 s) into verse 98 in the source. RIFE adds none of that: its output time base matches the trimmed source.
 
-- Index marker for verse 97: start 00:02:49.779, duration 11.978 s, so the window ends at segment time 11.978 s (about frame 359 at 30000/1001).
-- Visible label change in the source (single-frame timestamp grabs, label crop `240:50:85:45`):
-  - 11.60 s: 97, 11.64 s: 97, 11.67 s: 98, 11.70 s: 98, 11.73 s: 98, 11.77 s: 98.
-  - The switch is at source frame 349 (about 11.645 s). Frames 349–358 show verse 98 and sit inside the 97 window.
-  - Overrun = 11.978 − 11.645 ≈ 0.333 s ≈ 10 frames.
-- RIFE output (60/1, 719 frames, uncut): 11.60, 11.63, 11.65 s read 97; 11.67, 11.69, 11.72 s read 98.
-  - The output switch is at about 11.66 s, within one output frame (1/60 s) of the source switch.
-  - The output duration matches the source window: 719 frames / 60 ≈ 11.98 s. RIFE 2× preserved the time base and reproduced the source's 98 content.
+- Segment timing: the verse-97 window is absolute [169.779, 181.757], so local [0, 11.978] at 30000/1001 fps.
+- Measured label reads (single-frame timestamp seeks, label crop `240:50:85:45`):
+  - Verse 97 reads 97 up to local 11.6458 s (segment frame 349).
+  - Verse 98 reads 98 from local 11.6792 s (segment frame 350).
+- Overrun: 11.978 − 11.679 = 0.299 s, which is 9 frames at 29.97 fps.
 
-So the 0.333 s the user trimmed is exactly the source's marker overrun. The fix belongs in how we pick the end of the window, not in RIFE.
+Earlier figures in this report (about 10 frames, a switch at frame 349 near 11.645 s, and RIFE doubling the overrun) were wrong. They came from multi-frame `select`+`tile` extraction, which gave wrong label reads, and from timestamp grabs read as frame boundaries. The per-frame measurement above replaces them.
 
-## Why the earlier numbers were wrong
+## Both sides of the boundary are mistimed
 
-Earlier summaries cited a 9-frame overrun, "RIFE doubled it", and "frame 349 = 97". None of those held. Multi-frame `select` + `tile` extraction produced wrong label reads, and frame-index grabs disagreed with timestamp grabs. Timestamp seeks (`-ss` before `-i`, single frame, `-frames:v 1`) on the cached segment are the reliable method for this check.
+The true boundary is absolute 181.458 s (169.779 + 11.679). Verse 97's marker ends 0.299 s late, at 181.757. Verse 98's marker starts at 181.758, which is also 0.299 s late, so the first 9 frames of verse 98 are not in its own clip. The windows do not overlap in marker time. Both markers sit on the same wrong boundary.
 
-## Design options
+Caveat: the 98 start comes from the label read and the index, not from a separate measurement of verse 98's own clip.
+
+## Delivered file
+
+`Psalms_119_97_FSL_cut_rife.mp4` (701 frames, 11.683 s, 60/1) was cut by 0.333 s, about 10 source frames. That is one frame more than the 9-frame overrun, so it ends about one source frame before verse 98 begins. Not re-verified frame by frame here, and not replaced. Regenerating it needs the user's approval.
+
+## Design
+
+Label-based end detection, with the marker as an upper bound:
+
+1. Compute the marker end as before. It is never extended.
+2. Scan the `verse_end_search` seconds (default 1.5) before the marker end, decoding only the verse-number label crop. Frame 0 of the scan is the baseline for the current verse.
+3. The first frame whose label differs from the baseline by more than 12 mean absolute difference is the boundary. End the window there with output-side `-t`, which is exact (609a490 and 6b8d1fa).
+4. If no change is found, or the tail is unstable, keep the marker end and log it as unconfirmed.
+5. Each decision is recorded in `~/.config/jwkit/slverse/verse_end_ledger.json`, keyed per verse window with the source checksum, the settings, the boundary, and the frames cut. A changed checksum sets `source_changed`.
+6. Trimming happens before RIFE, so RIFE processes fewer frames. The scan costs about 45 small-crop frames per verse, far less than RIFE.
+
+Option comparison (why this design):
 
 | Option | Detection | Cost | Quality | Verdict |
 |---|---|---|---|---|
-| A. Marker only (today) | none | free | Fails when the marker overruns (this case) | Keep as the upper bound only |
-| B. Fixed trim (user's manual 0.333 s) | none | free | Fits one case; wrong for others | Reject as a rule |
-| C. Label change scan (last digit) in the last ~1.5 s before marker end | decode a small crop of ~45 frames, compare last-digit ink to the window's baseline | small: decode of a crop, no RIFE re-run to detect | Exact to one source frame | Recommended primary |
-| D. Visible-boundary detection by signer/clothing | colour or motion | more code | Not needed; the label is the reliable cue | Reject |
+| A. Marker only (old) | none | free | fails when the marker overruns | kept as the upper bound only |
+| B. Fixed trim (manual 0.333 s) | none | free | fits one case only | rejected as a rule |
+| C. Label-change scan before marker end | small crop decode | low | exact to one source frame | implemented |
+| D. Signer or clothing detection | colour or motion | more code | not needed; the label is reliable | rejected |
 
-Recommended design (option C with marker as upper bound):
+## Config and flags
 
-1. Compute the marker end as today; it is an upper bound and is never extended.
-2. Scan the last ~1.5 s before the marker end, decoding a single crop of the verse label region. Take the window's first-frame ink as the baseline for the current verse.
-3. The first frame whose last-digit ink departs from the baseline (threshold from the 97 → 98 ink step, about 233 → 282) is the verse boundary. End the window there, using output-side `-t` (exact, per 609a490 / 6b8d1fa).
-4. If no change is found, fall back to the marker end and log that the boundary was not confirmed.
-5. Log each adjustment (verse, marker end, label boundary, frames removed) so overruns can be counted across the library.
-6. RIFE stays as is; its output time base already matches the trimmed source.
+Config keys in `~/.config/jwkit/slverse/config.toml`, each with a one-run flag on `extract`:
 
-Cost: the scan decodes about 45 frames of a small crop per verse. That is far cheaper than RIFE, which dominates the run. Quality: exact to one source frame in this case, and it cannot extend past the marker.
+- `verse_end` = `label` (default) or `off`. Flag: `--verse-end {label,off}`. `marker` was considered and dropped as redundant with `off`.
+- `verse_end_search` = `1.5` seconds. Flag: `--verse-end-search`.
+- `verse_label_crop` = `85,45,240,50`. Flag: `--verse-label-crop`.
 
-## Proposed config and flags (not implemented)
-
-Per AGENTS.md (config-first): `verse_end` with values `label` (default, marker fallback), `marker`, `off`.
-- Config: `~/.config/jwkit/slverse/config.toml` key `verse_end`.
-- CLI: `--verse-end {label,marker,off}`.
-- Keep config, CLI help, docs and tests in sync. Tests use the cached FSL segment and skip when it is absent.
+`slverse --help` does not list these. They appear under `slverse extract --help`.
 
 ## Open questions
 
-- Is the overrun constant or per-verse? A survey of cached FSL, SPE and ASL segments with the same detector (dry run, no encoding) is still needed.
-- Frame-count discrepancy in the cached segment (ffprobe 1037 total frames; earlier partial reads 1028 and 1030). It does not change the 97 boundary, but it should be reconciled before the test asserts frame counts.
-- The pacing-dependent test `FfrifeLongRunTest.test_chunks_assemble_exact_target_and_resume` fails under CPU load and passes alone. Not addressed here.
-- SPE 119:97 may carry a similar overrun (SPE 98 marker start ≈ 11.491 s segment-relative). Not checked; not to be changed without the user's go-ahead.
-
-## Delivered files
-
-`Psalms_119_97_FSL_cut_rife.mp4` (701 frames, 11.683 s, 60/1) already has the 0.333 s trimmed. Not re-verified frame by frame here, and not replaced.
+- Is the overrun constant or per verse? A dry-run survey of cached FSL, SPE and ASL segments with the detector (no encoding) is still needed.
+- Frame-count discrepancy in the cached segment (ffprobe 1037 total frames; earlier partial reads 1028 and 1030). It does not change the 97 boundary but should be reconciled before a test asserts frame counts.
+- Verse-98 head: the fix needs a pre-roll fetch margin in `resolve_cached_source` and `download_segment`, plus remaps of `verse_reference_windows`, `overlay_fade_outs` and `add_verse_chapters`. Not started; needs approval.
+- A hand or occlusion across the label could read as a label change. The stability check and the ledger reduce this risk; they do not remove it.
+- SPE 119:97 may carry a similar overrun. Not checked and not changed.
+- `FfrifeLongRunTest.test_chunks_assemble_exact_target_and_resume` is timing-sensitive and fails under CPU load. Not addressed here.
