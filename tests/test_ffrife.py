@@ -73,6 +73,13 @@ class FfrifeConfigTest(unittest.TestCase):
         with patch.object(self.ffrife.subprocess, "run", return_value=result):
             self.assertAlmostEqual(self.ffrife.probe_source_fps("variable.mp4"), 30000 / 1001)
 
+    def test_probe_source_fps_prefers_average_over_inflated_timebase(self) -> None:
+        # A stream-copied cut can report r_frame_rate=120 while frames arrive at ~30/s;
+        # trusting it shrank the output to a quarter of its duration (fast-forward).
+        result = MagicMock(stdout='{"streams": [{"r_frame_rate": "120/1", "avg_frame_rate": "2485000/82983"}]}')
+        with patch.object(self.ffrife.subprocess, "run", return_value=result):
+            self.assertAlmostEqual(self.ffrife.probe_source_fps("cut.mp4"), 2485000 / 82983)
+
     def test_run_encoder_overrides_parse(self) -> None:
         args = self.ffrife.build_parser().parse_args([
             "run", "input.mp4", "-o", "output.mp4", "--encoder", "nvenc",

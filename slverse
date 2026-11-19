@@ -1731,7 +1731,7 @@ def probe_video_fps(source):
     except (json.JSONDecodeError, AttributeError):
         streams = []
     for stream in streams:
-        for key in ("r_frame_rate", "avg_frame_rate"):
+        for key in ("avg_frame_rate", "r_frame_rate"):
             try:
                 fps = float(Fraction(stream.get(key)))
             except (TypeError, ValueError, ZeroDivisionError):

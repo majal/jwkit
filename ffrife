@@ -1155,7 +1155,10 @@ def retimed_duration(duration, speed):
 
 def probe_source_fps(source):
     """ffprobe's r_frame_rate comes back as an 'N/D' fraction (e.g.
-    '30000/1001'), not a plain float. Used by interpolate() to size RIFE's
+    '30000/1001'), not a plain float. avg_frame_rate is tried first: r_frame_rate
+    is the stream's finest timebase guess and reads 120 for a stream-copied cut
+    whose frames actually arrive at ~30/s, which made a 4x-too-short (fast-forward)
+    output. Used by interpolate() to size RIFE's
     -n target frame count so the requested `fps` is hit exactly regardless
     of the source's real frame rate, instead of relying on RIFE's own
     implicit 2x-doubling default."""
@@ -1167,7 +1170,7 @@ def probe_source_fps(source):
     except (json.JSONDecodeError, AttributeError):
         streams = []
     for stream in streams:
-        for key in ("r_frame_rate", "avg_frame_rate"):
+        for key in ("avg_frame_rate", "r_frame_rate"):
             value = stream.get(key)
             try:
                 fps = float(Fraction(value))
