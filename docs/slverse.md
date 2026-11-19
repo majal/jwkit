@@ -91,6 +91,9 @@ Nearly every behavior is a config key, not a fixed default meant for one setup. 
 | `smooth_slow_motion` | `true` | Synthesize extra frames in `--slow` sections even when whole-clip interpolation (`-i`) is off. Override with `--smooth-slow-motion` or `--no-smooth-slow-motion`. |
 | `trim_end_transition` | `true` | Cut the trailing fade-out/copyright-endscreen off a chapter's/paragraph's last verse. `--keep-end-transition` overrides for one run. |
 | `trim_mid_transitions` | `false` | Also cut paragraph transitions in the *middle* of a multi-verse range (a jump cut, straight to the next paragraph's first kept frame). Off by default — a range spanning multiple paragraphs is normally meant to play through as one continuous scene. `--trim-mid-transitions` overrides for one run. |
+| `verse_end` | `label` | Where a verse's last frame is cut. `label` scans the burned-in verse-number label in the `verse_end_search` seconds before the marker end and ends the clip where the label changes to the next verse; JW's marker end is only an upper bound (for example, FSL Psalm 119:97 runs about 9 frames into verse 98). `off` uses the marker end as-is. Override once with `--verse-end label\|off`. Each decision is recorded in the ledger below. |
+| `verse_end_search` | `1.5` | Seconds before the marker end scanned for the label change (`verse_end=label` only). Override with `--verse-end-search`. |
+| `verse_label_crop` | `85,45,240,50` | `x,y,w,h` crop, in source-video pixels, of the burned-in verse-number label used by the scan. Override with `--verse-label-crop`. |
 | `min_transition_duration` | `0.5` | Seconds below which a marker's `endTransitionDuration` is treated as routine per-verse padding rather than a real fade — JW tags nearly every verse with a small nonzero value (empirically 0.000–0.300s in a real index) distinct from an actual paragraph/chapter fade (empirically 1.0s+). Below this floor, `trim_end_transition`/`trim_mid_transitions` don't cut it and the verse-reference overlay doesn't try to fade through it either — a fade shorter than a single video frame otherwise reads as a one-frame flash where the reference (and the small source-SL label, since it fades on the same schedule) both disappear. |
 | `sign_lang_ref_language` | `ASL=en,FSL=en,BVL=es,SPE=es,INI=id` | Which spoken language each sign language's burned-in caption is actually written in — used to skip the reference-swap when source and target already match. Add an entry for any other language you use; an unlisted one always gets the full overlay. |
 | `show_source_lang_label` | `true` | The small "which SL this came from" label under the reference — independent of `overlay_source_label_alpha`, which only controls its opacity. |
@@ -106,6 +109,10 @@ Nearly every behavior is a config key, not a fixed default meant for one setup. 
 | `download_max_attempts` / `download_retry_backoff` | `3` / `2` | Retry behavior for chapter/font downloads. |
 
 Config lives in `~/.config/jwkit/slverse/config.toml`. Use `config list|get|set|path|edit|reset|diff|check`; unknown keys and invalid values are rejected by `config set`, while `config check` also catches bad hand edits, malformed mpv quoting, and missing configured executables.
+
+### Verse-end ledger
+
+Each label-based verse-end decision made on a cached segment (`verse_end=label`, local source only) is recorded to `~/.config/jwkit/slverse/verse_end_ledger.json`, one entry per verse window keyed by language, book, chapter, and window times. An entry records the source `url` and `checksum`, the settings used, the marker end, the label boundary, and the frames cut. Each window keeps its latest decision: a re-run replaces the entry. If the checksum differs from the one it replaces, the entry is flagged `source_changed` with `previous_checksum`, so a re-cut after a source update is visible (only one step of history is kept). The ledger is an audit record only; it never decides a cut, and a write failure never fails an extraction. Delete the file to reset it.
 
 ## Common Usage Examples
 

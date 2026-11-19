@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -28,6 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import unicodedata
+from fractions import Fraction
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -152,6 +154,9 @@ DEFAULT_CONFIG = {
     "mpv_options": "",  # Extra mpv arguments for every launch, shell-split without invoking a shell (e.g. --screen=1 --speed=1.15)
     "font_weight_main": "600",  # Google Fonts weight for the main drawtext label (book/chapter/verse) - see FONT_FAMILIES
     "font_weight_estimator": "400",  # Google Fonts weight used only to size the delogo box, not to draw anything
+    "verse_end": "label",  # where a verse's last frame is cut: 'label' scans the verse-number label in the last verse_end_search seconds before the marker end and cuts where the label changes to the next verse (the marker is only ever an upper bound - JW's marker can run into the next verse by ~9 frames); 'off' uses the marker end as-is
+    "verse_end_search": "1.5",  # seconds before the marker end scanned for the verse-number label change (verse_end=label only)
+    "verse_label_crop": "85,45,240,50",  # x,y,w,h crop of the burned-in verse-number label in source-video pixels, used by the verse_end scan
     "download_max_attempts": "3",  # retry attempts for a chapter/font download before giving up
     "download_retry_backoff": "2",  # seconds, doubled (backoff ** attempt) between download retries
 }
@@ -172,6 +177,7 @@ CONFIG_CHOICES = {
     "font_family": ("noto-sans-display", "inter", "google-sans-flex"),
     "extract_mode": ("cache", "onthefly", "segment"),
     "preview_source": ("cache", "remote", "segment"),
+    "verse_end": ("label", "off"),
 }
 BOOLEAN_CONFIG_KEYS = {
     "interpolate", "smooth_slow_motion", "auto_sync", "auto_sync_background", "trim_end_transition",
@@ -196,8 +202,12 @@ def validate_config_value(key, value):
             return f"{key} must be at least 1"
         if key == "caption_detection_samples" and int(value) > 9:
             return f"{key} must be at most 9"
-        if key in ("interpolation_target_fps", "auto_sync_interval_hours", "download_retry_backoff", "min_transition_duration") and float(value) < 0:
+        if key in ("interpolation_target_fps", "auto_sync_interval_hours", "download_retry_backoff", "min_transition_duration", "verse_end_search") and float(value) < 0:
             return f"{key} must be non-negative"
+        if key == "verse_label_crop":
+            parts = [int(p) for p in str(value).split(",")]
+            if len(parts) != 4 or any(p < 0 for p in parts) or parts[2] < 1 or parts[3] < 1:
+                return f"{key} must be x,y,w,h with non-negative integers and w,h >= 1 (got {value!r})"
     except ValueError:
         return f"{key} has an invalid numeric value {value!r}"
     return None
@@ -254,6 +264,9 @@ CONFIG_HELP = {
     "trim_end_transition": "Exclude JW's trailing fade-out/copyright-endscreen transition from extracted verses",
     "trim_mid_transitions": "Also cut mid-range paragraph transitions inside a multi-verse range (off by default - continuous play)",
     "min_transition_duration": "Seconds below which endTransitionDuration is routine per-verse padding, not a real fade to animate/trim (default 0.5)",
+    "verse_end": "Where a verse's last frame is cut: label (scan the verse-number label; the marker end is an upper bound) or off (marker end as-is)",
+    "verse_end_search": "Seconds before the marker end scanned for the verse-label change (verse_end=label; default 1.5)",
+    "verse_label_crop": "x,y,w,h crop of the burned-in verse-number label in source pixels (default 85,45,240,50)",
     "sign_lang_ref_language": "SL-code=spoken-language table (e.g. ASL=en,BVL=es) - skips the reference swap when source/target already share one",
     "show_source_lang_label": "Show the small 'which SL this came from' label",
     "mpv_show_osc": "Show mpv's on-screen controller on mouse movement, for mpv windows slverse opens",
@@ -1678,6 +1691,198 @@ def _caption_box_from_rgb(raw, crop, expected_x, expected_y):
         return None
     return left + x0, top + y0, x1 - x0 + 1, y1 - y0 + 1
 
+VERSE_END_MAD_THRESHOLD = 12.0  # mean abs gray difference (0-255) that counts as "the label changed"; measured: same verse ~0, verse switch ~30
+
+
+def probe_video_fps(source):
+    """Frame rate of the first video stream as a float. ffprobe reports an
+    'N/D' fraction (30000/1001), so parse it exactly rather than as a float."""
+    cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries",
+           "stream=r_frame_rate,avg_frame_rate", "-of", "json", str(source)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except (json.JSONDecodeError, AttributeError):
+        streams = []
+    for stream in streams:
+        for key in ("r_frame_rate", "avg_frame_rate"):
+            try:
+                fps = float(Fraction(stream.get(key)))
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            if fps > 0 and fps != float("inf"):
+                return fps
+    raise ValueError(f"No usable video frame rate in {source}")
+
+
+def _mean_abs_diff(a, b):
+    return sum(abs(x - y) for x, y in zip(a, b)) / max(1, len(a))
+
+
+def detect_verse_end(source, *, verse_start, marker_end, local_offset, config):
+    """Find where the verse-number label switches to the next verse, inside the
+    last `verse_end_search` seconds before the marker end.
+
+    JW's markers can run into the next verse by ~9 frames on some segments
+    (FSL 19_119 verse 97: label switches at local 11.679s, 9 frames before the
+    marker end at 11.978s).
+    The marker stays the upper bound: this only ever returns a time at or
+    before `marker_end`. Times are absolute (the marker timeline); `local_offset`
+    is added to them to get seconds inside `source`.
+
+    Returns a dict. `boundary` is None unless the label change was confirmed;
+    callers keep the marker in that case and log `reason`. Never raises: any
+    decode problem is an unconfirmed result, so a run is never failed by this.
+    """
+    result = {"boundary": None, "marker_end": marker_end, "reason": "", "fps": None, "frames_scanned": 0}
+    if str(source).lower().startswith(("http://", "https://")):
+        result["reason"] = "remote source (label scan needs a local file)"
+        return result
+    try:
+        search = float(config.get("verse_end_search", DEFAULT_CONFIG["verse_end_search"]))
+        left, top, width, height = (int(p) for p in str(config.get("verse_label_crop", DEFAULT_CONFIG["verse_label_crop"])).split(","))
+        fps = probe_video_fps(source)
+        result["fps"] = fps
+        scan_start = max(verse_start, marker_end - search)
+        # Frames strictly before the marker end belong to this verse's window.
+        frame_count = math.ceil((marker_end - scan_start) * fps - 1e-6)
+        if frame_count < 3:
+            result["reason"] = "too few frames before the marker end to scan"
+            return result
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-ss", f"{scan_start + local_offset:.3f}", "-i", str(source),
+               "-frames:v", str(frame_count), "-vf", f"crop={width}:{height}:{left}:{top},format=gray", "-f", "rawvideo", "pipe:1"]
+        raw = subprocess.run(cmd, check=True, capture_output=True, timeout=60).stdout
+        frame_size = width * height
+        frames = [raw[i:i + frame_size] for i in range(0, len(raw) - frame_size + 1, frame_size)]
+        result["frames_scanned"] = len(frames)
+        if len(frames) < 3:
+            result["reason"] = "could not decode enough label frames"
+            return result
+        # The first scanned frame is the baseline: it is inside this verse's window,
+        # so its label is the one we are looking for the end of.
+        baseline = frames[0]
+        departed = [_mean_abs_diff(frame, baseline) > VERSE_END_MAD_THRESHOLD for frame in frames]
+        if not any(departed):
+            result["reason"] = "no label change before the marker end (marker kept)"
+            return result
+        first = departed.index(True)
+        tail = frames[first:]
+        stable = sum(1 for frame in tail if _mean_abs_diff(frame, tail[0]) <= VERSE_END_MAD_THRESHOLD)
+        if len(tail) < 2 or stable * 2 <= len(tail) or sum(departed[first:]) * 2 <= len(tail):
+            result["reason"] = "label change not stable through the marker end (marker kept)"
+            return result
+        result["boundary"] = scan_start + first / fps
+        result["reason"] = f"label changed {(marker_end - result['boundary']) * fps:.1f} frames before the marker end"
+        return result
+    except Exception as exc:  # decode/probe problems: keep the marker, never fail the run
+        result["reason"] = f"label scan failed ({type(exc).__name__}); marker kept"
+        return result
+
+
+VERSE_END_LEDGER_FILE = CONFIG_DIR / "verse_end_ledger.json"
+
+
+def load_verse_end_ledger():
+    """The verse-end decision ledger; a missing or unreadable file is an empty ledger."""
+    try:
+        with open(VERSE_END_LEDGER_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def record_verse_end_decision(lang, book_num, chapter, start, end, checksum, url, config, result):
+    """Keep one ledger entry per verse window: the source checksum and settings
+    the label scan ran on, and what it decided. A later run that finds a
+    different checksum for the same window sets source_changed, so an old cut
+    can be checked against the source it was made on. Written atomically (tmp
+    file, then os.replace). Callers decide whether a failure matters; this
+    raises on I/O errors."""
+    key = f"{lang}:{book_num}_{chapter}:{round(start * 1000)}-{round(end * 1000)}"
+    ledger = load_verse_end_ledger()
+    previous = ledger.get(key) if isinstance(ledger.get(key), dict) else {}
+    boundary = result.get("boundary")
+    fps = result.get("fps")
+    entry = {
+        "url": url,
+        "checksum": checksum,
+        "source_changed": bool(previous.get("checksum") and checksum and previous["checksum"] != checksum),
+        "settings": {key_: config.get(key_) for key_ in ("verse_end", "verse_end_search", "verse_label_crop")},
+        "marker_end": round(end, 4),
+        "boundary": None if boundary is None else round(boundary, 4),
+        "frames_cut": round((end - boundary) * fps) if boundary is not None and fps else 0,
+        "fps": fps,
+        "reason": result.get("reason"),
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if entry["source_changed"]:
+        entry["previous_checksum"] = previous["checksum"]
+    ledger[key] = entry
+    VERSE_END_LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = VERSE_END_LEDGER_FILE.with_name(VERSE_END_LEDGER_FILE.name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(ledger, f, indent=1, sort_keys=True)
+    os.replace(tmp, VERSE_END_LEDGER_FILE)
+    return entry
+
+
+class VerseEndProbe:
+    """The end_probe handed to resolve_verse_window. It runs the label scan on
+    the locally cached source (fetching just the window if it isn't cached yet,
+    which the extract would do anyway) and remembers every decision in
+    `outcomes`, so extract_one_lang can note the cut in the clip's edit
+    description. Only ever shortens a window; a failed or unconfirmed scan keeps
+    the marker end."""
+
+    def __init__(self, lang, book_num, chapter, config, state, *, fetch_whole=False, quiet=False):
+        self.lang, self.book_num, self.chapter = lang, book_num, chapter
+        self.config, self.state, self.quiet = config, state, quiet
+        # Match the extract's own fetch, so the scan's download is the one the
+        # extract reuses (whole chapter in cache mode, just the window otherwise).
+        self.fetch_whole = fetch_whole
+        self.outcomes = []
+
+    def __call__(self, start, end, url, checksum):
+        source, cached, local_start, _local_end = resolve_cached_source(
+            url, self.lang, self.book_num, self.chapter, checksum, start, end, self.config, self.state,
+            fetch_whole=self.fetch_whole,
+        )
+        if cached is None:
+            result = {"boundary": None, "marker_end": end, "reason": "source not cached locally; marker kept", "fps": None, "frames_scanned": 0}
+        else:
+            with cache_in_use(cached):
+                result = detect_verse_end(source, verse_start=start, marker_end=end, local_offset=local_start - start, config=self.config)
+            try:
+                record_verse_end_decision(self.lang, self.book_num, self.chapter, start, end, checksum, url, self.config, result)
+            except Exception:
+                # The ledger is an audit trail; a failed write must not fail the run.
+                pass
+        self.outcomes.append(result)
+        if not self.quiet:
+            print(f"[{self.lang}] Verse end: {result['reason']}")
+        return result["boundary"]
+
+    def applied(self):
+        """The confirmed cut, if any: (frames removed, fps), else None."""
+        for result in self.outcomes:
+            if result["boundary"] is not None and result["fps"]:
+                return round((result["marker_end"] - result["boundary"]) * result["fps"]), result["fps"]
+        return None
+
+
+def resolve_extract_mode(args, config):
+    """Which source path an extract uses: onthefly (remote stream), cache (whole
+    chapter), or segment (window only). Flags win over extract_mode config."""
+    if getattr(args, "onthefly", False):
+        return "onthefly"
+    if getattr(args, "cache", False):
+        return "cache"
+    if getattr(args, "segment", False):
+        return "segment"
+    return config.get("extract_mode", DEFAULT_CONFIG["extract_mode"])
+
+
 def detect_caption_box(source, start_time, end_time, config, samples=None):
     """Measure the static source caption from several cheap cropped frames.
 
@@ -2808,7 +3013,7 @@ def clamp_trim_window(natural_start, natural_end, trim_start, trim_end, lang="",
         print(f"{prefix}--trim-start/--trim-end exceeded this verse's {natural_duration:.3f}s window; using {start - natural_start:.3f}s..{end - natural_start:.3f}s.")
     return start, end
 
-def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_transition=False, trim_mid_transitions=None, trim_start=0.0, trim_end=0.0, clip_window=None):
+def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_transition=False, trim_mid_transitions=None, trim_start=0.0, trim_end=0.0, clip_window=None, end_probe=None):
     """Return (start, end, url, checksum, valid_verses, source_labels,
     kept_segments) for a verse range, using the saved per-language index
     when we have it and falling back to a live API call (which also
@@ -2826,7 +3031,13 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
     reading it.
 
     trim_start/trim_end remove non-negative seconds from the computed verse
-    range after the configured transition trim and before kept_segments."""
+    range after the configured transition trim and before kept_segments.
+
+    end_probe(start, end, url, checksum) -> boundary | None (see VerseEndProbe) may move
+    the visible end earlier, to where the verse-number label actually changes.
+    It runs before clip_window/trim_start/trim_end, so those trims stay
+    relative to the visible end. It can only shorten the window, never extend
+    it past the marker end."""
     key = f"{book_num}_{chapter}"
     index = load_index(lang)
     entry = index.get(key)
@@ -2863,6 +3074,11 @@ def resolve_verse_window(lang, book_num, chapter, verses, config, keep_end_trans
         end_transition = chapters_meta[valid_verses[-1]].get("end_transition", 0)
         if end_transition >= min_transition and end - end_transition > start:
             end -= end_transition
+
+    if end_probe is not None and end > start:
+        boundary = end_probe(start, end, entry["url"], entry.get("checksum"))
+        if boundary is not None and start < boundary < end:
+            end = boundary
 
     if clip_window:
         window_start, window_end = clip_window
@@ -3042,6 +3258,17 @@ def effective_interpolation_engine(config):
 def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, state, require_full_range=False):
     trim_start = getattr(args, "trim_start", None)
     trim_end = getattr(args, "trim_end", None)
+    # The label scan reads the local cache, so it only runs when this extract
+    # reads locally (not onthefly, not a remote preview).
+    if args.write:
+        extract_mode = resolve_extract_mode(args, config)
+        local_source, fetch_whole = extract_mode != "onthefly", extract_mode == "cache"
+    else:
+        preview_source = config.get("preview_source", DEFAULT_CONFIG["preview_source"]).strip().lower()
+        local_source, fetch_whole = preview_source != "remote", preview_source == "cache"
+    end_probe = None
+    if local_source and str(config.get("verse_end", DEFAULT_CONFIG["verse_end"])).strip().lower() == "label":
+        end_probe = VerseEndProbe(lang, book_num, chapter, config, state, fetch_whole=fetch_whole, quiet=getattr(args, "quiet", False))
     window = resolve_verse_window(
         lang, book_num, chapter, verses, config,
         keep_end_transition=getattr(args, "keep_end_transition", False),
@@ -3049,6 +3276,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
         trim_start=trim_start or 0.0,
         trim_end=trim_end or 0.0,
         clip_window=getattr(args, "clip_window", None),
+        end_probe=end_probe,
     )
     if not window:
         return lang, None, f"Verses {verses} not found for {lang} (video may not exist for this chapter in this language yet)."
@@ -3068,6 +3296,9 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     if getattr(args, "output", None):
         Path(out_filename).parent.mkdir(parents=True, exist_ok=True)
     edit_bits = describe_cut_edit(args)
+    if end_probe is not None and end_probe.applied():
+        frames_cut, _fps = end_probe.applied()
+        edit_bits.append(f"ends at verse label change (-{frames_cut} frames)")
 
     if not args.write:
         # Default: preview only, nothing written to disk deliberately - the
@@ -3135,14 +3366,7 @@ def extract_one_lang(lang, book_name, book_num, chapter, verses, args, config, s
     output_verse_windows = remap_verse_windows(verse_windows, chapter_timeline)
     output_fade_outs = remap_fade_outs(fade_outs, chapter_timeline)
 
-    if args.onthefly:
-        extract_mode = "onthefly"
-    elif args.cache:
-        extract_mode = "cache"
-    elif args.segment:
-        extract_mode = "segment"
-    else:
-        extract_mode = config.get("extract_mode", DEFAULT_CONFIG["extract_mode"])
+    extract_mode = resolve_extract_mode(args, config)
 
     if mode and len(kept_segments) > 1:
         print(f"[{lang}] --slow/--fast doesn't support trim_mid_transitions yet - mid-range transitions will play through untouched.")
@@ -3207,6 +3431,7 @@ PROVENANCE_SETTING_KEYS = (
     "show_source_lang_label", "overlay_x", "overlay_y", "overlay_fontsize", "overlay_alpha",
     "overlay_source_label_alpha", "font_family", "font_weight_main", "font_weight_estimator",
     "api_language", "trim_end_transition", "trim_mid_transitions", "min_transition_duration",
+    "verse_end", "verse_end_search", "verse_label_crop",
 )
 
 
@@ -3238,6 +3463,9 @@ def extract_rebuild_argv(lang, book_name, chapter, verses_str, output_name, args
             argv += [flag, *[str(t) for t in getattr(args, key)]]
     if getattr(args, "speed", None):
         argv += ["--speed", _fmt_seconds(args.speed)]
+    # The verse-end scan decides where a clip stops, so a rebuild has to keep
+    # the same choice even when it came from a one-run flag.
+    argv += ["--verse-end", str(config.get("verse_end", DEFAULT_CONFIG["verse_end"]))]
     engine = effective_interpolation_engine(config)
     argv += ["--interpolate", "--interpolation-engine", engine] if engine else ["--no-interpolate"]
     return argv
