@@ -62,6 +62,16 @@ class SlverseDetectVerseEndTest(unittest.TestCase):
         self.assertAlmostEqual(result["boundary"], 8.5 + (pts[19] + pts[20]) / 2)
         self.assertEqual(result["frames_cut"], 25)
 
+    def test_change_on_the_last_frame_only_is_not_confirmed(self) -> None:
+        result, _ = self._run([50] * 44 + [200])
+        self.assertIsNone(result["boundary"])
+        self.assertIn("only one frame", result["reason"])
+
+    def test_change_on_the_last_two_frames_is_confirmed(self) -> None:
+        result, _ = self._run([50] * 43 + [200] * 2)
+        self.assertIsNotNone(result["boundary"])
+        self.assertEqual(result["frames_cut"], 2)
+
     def test_no_label_change_keeps_marker(self) -> None:
         result, _ = self._run([50] * 45)
         self.assertIsNone(result["boundary"])
@@ -78,7 +88,7 @@ class SlverseDetectVerseEndTest(unittest.TestCase):
         values = [50] * 20 + [200] * 10 + [50] * 15
         result, _ = self._run(values)
         self.assertIsNone(result["boundary"])
-        self.assertIn("not stable", result["reason"])
+        self.assertIn("not clean", result["reason"])
 
     def test_decode_failure_keeps_marker_and_never_raises(self) -> None:
         with mock.patch.object(self.slverse.subprocess, "run", side_effect=OSError("ffmpeg missing")):
@@ -102,6 +112,104 @@ class SlverseDetectVerseEndTest(unittest.TestCase):
         cmd = run.call_args[0][0]
         self.assertEqual(cmd[cmd.index("-ss") + 1], "9.000")
         self.assertEqual(cmd[cmd.index("-frames:v") + 1], "30")
+        self.assertIsNone(result["boundary"])
+
+
+def _stderr_for(pts):
+    return "".join(f"[Parsed_showinfo_2 @ 0x1] n:{i:3d} pts:{i} pts_time:{t:.6f}\n" for i, t in enumerate(pts)).encode()
+
+
+class SlverseLabelStepTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def _frames(self, values):
+        return [bytes([v]) * FRAME_SIZE for v in values]
+
+    def test_small_one_digit_change_is_a_step(self) -> None:
+        # 96 to 97 differs by about 6 grey levels on FSL 19_119, below the old
+        # absolute threshold of 12.
+        index, step = self.slverse._label_step(self._frames([100] * 10 + [106] * 10))
+        self.assertEqual(index, 10)
+        self.assertAlmostEqual(step, 6.0)
+
+    def test_flat_label_has_no_step(self) -> None:
+        index, reason = self.slverse._label_step(self._frames([100] * 20))
+        self.assertIsNone(index)
+        self.assertEqual(reason, "no label change")
+
+    def test_compression_noise_is_not_a_step(self) -> None:
+        index, _ = self.slverse._label_step(self._frames([100, 101, 100, 102, 101, 100, 101, 100]))
+        self.assertIsNone(index)
+
+    def test_occlusion_and_fade_are_not_clean(self) -> None:
+        self.assertIsNone(self.slverse._label_step(self._frames([50] * 8 + [200] * 3 + [50] * 8))[0])
+        self.assertIsNone(self.slverse._label_step(self._frames([50] * 8 + [100, 150] + [200] * 8))[0])
+
+
+class SlverseDetectVerseStartTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def setUp(self) -> None:
+        self.config = dict(self.slverse.DEFAULT_CONFIG)
+        fps = mock.patch.object(self.slverse, "probe_video_fps", return_value=30.0)
+        fps.start()
+        self.addCleanup(fps.stop)
+
+    def _run(self, values, *, verse_start=10.0, scan_start=8.5):
+        pts = [i / 30.0 for i in range(len(values))]  # relative to scan_start
+        proc = argparse.Namespace(stdout=_frames_raw(values), stderr=_stderr_for(pts))
+        with mock.patch.object(self.slverse.subprocess, "run", return_value=proc):
+            return self.slverse.detect_verse_start(
+                "source.mp4", verse_start=verse_start, scan_start=scan_start, local_offset=0.0, config=self.config,
+            )
+
+    def test_change_early_in_the_preroll_extends_back_to_it(self) -> None:
+        # Frame 45 is the marker start (8.5 + 45/30 = 10.0); the label turned at frame 3.
+        result = self._run([50] * 3 + [200] * 47)
+        self.assertAlmostEqual(result["boundary"], 8.5 + 2.5 / 30.0, delta=1e-4)
+        self.assertEqual(result["frames_added"], 42)
+
+    def test_extends_to_midway_between_frames(self) -> None:
+        result = self._run([50] * 40 + [200] * 10)  # label turns 5 frames before the marker start
+        self.assertAlmostEqual(result["boundary"], 8.5 + 39.5 / 30.0, delta=1e-4)
+        self.assertEqual(result["frames_added"], 5)
+        self.assertLess(result["boundary"], 10.0)
+
+    def test_no_change_in_preroll_keeps_marker_start(self) -> None:
+        result = self._run([200] * 50)
+        self.assertIsNone(result["boundary"])
+        self.assertIn("already current", result["reason"])
+
+    def test_change_exactly_at_marker_start_keeps_it(self) -> None:
+        result = self._run([50] * 45 + [200] * 5)
+        self.assertIsNone(result["boundary"])
+        self.assertIn("already current", result["reason"])
+
+    def test_without_timestamps_the_marker_start_is_kept(self) -> None:
+        proc = argparse.Namespace(stdout=_frames_raw([50] * 40 + [200] * 10), stderr=b"")
+        with mock.patch.object(self.slverse.subprocess, "run", return_value=proc):
+            result = self.slverse.detect_verse_start(
+                "source.mp4", verse_start=10.0, scan_start=8.5, local_offset=0.0, config=self.config,
+            )
+        self.assertIsNone(result["boundary"])
+
+    def test_no_source_before_the_marker_start(self) -> None:
+        with mock.patch.object(self.slverse.subprocess, "run") as run:
+            result = self.slverse.detect_verse_start(
+                "source.mp4", verse_start=0.0, scan_start=0.0, local_offset=0.0, config=self.config,
+            )
+        self.assertIsNone(result["boundary"])
+        run.assert_not_called()
+
+    def test_decode_failure_never_raises(self) -> None:
+        with mock.patch.object(self.slverse.subprocess, "run", side_effect=OSError("ffmpeg missing")):
+            result = self.slverse.detect_verse_start(
+                "source.mp4", verse_start=10.0, scan_start=8.5, local_offset=0.0, config=self.config,
+            )
         self.assertIsNone(result["boundary"])
 
 
@@ -136,6 +244,29 @@ class SlverseVerseEndWindowTest(unittest.TestCase):
     def test_unconfirmed_probe_keeps_marker_end(self) -> None:
         start, end, *_ = self.slverse.resolve_verse_window("ASL", 19, 16, [11], self.config, end_probe=lambda *a: None)
         self.assertAlmostEqual(end, 149.415 + 33.800)
+
+    def test_head_probe_moves_the_start_earlier_and_keeps_the_end(self) -> None:
+        head = mock.Mock(return_value=148.9)
+        start, end, *_ = self.slverse.resolve_verse_window("ASL", 19, 16, [11], self.config, head_probe=head)
+        self.assertAlmostEqual(start, 148.9)
+        self.assertAlmostEqual(end, 149.415 + 33.800)
+        head.assert_called_once_with(149.415, 149.415 + 33.800, "http://example/vid.mp4", "abc123")
+
+    def test_head_probe_never_moves_the_start_later(self) -> None:
+        start, *_ = self.slverse.resolve_verse_window("ASL", 19, 16, [11], self.config, head_probe=lambda *a: 150.0)
+        self.assertAlmostEqual(start, 149.415)
+
+    def test_head_probe_is_skipped_when_the_caller_trims_the_start(self) -> None:
+        head = mock.Mock(return_value=148.9)
+        start, *_ = self.slverse.resolve_verse_window("ASL", 19, 16, [11], self.config, trim_start=0.5, head_probe=head)
+        head.assert_not_called()
+        self.assertAlmostEqual(start, 149.415 + 0.5)
+
+    def test_head_and_tail_probes_both_see_the_marker_times(self) -> None:
+        tail = mock.Mock(return_value=180.0)
+        start, end, *_ = self.slverse.resolve_verse_window("ASL", 19, 16, [11], self.config, end_probe=tail, head_probe=lambda *a: 149.0)
+        self.assertAlmostEqual((start, end), (149.0, 180.0))
+        tail.assert_called_once_with(149.415, 149.415 + 33.800, "http://example/vid.mp4", "abc123")
 
     def test_no_probe_keeps_marker_end(self) -> None:
         start, end, *_ = self.slverse.resolve_verse_window("ASL", 19, 16, [11], self.config)
@@ -286,6 +417,53 @@ class SlverseVerseEndLedgerTest(unittest.TestCase):
             "FSL", 19, 119, 181.758, 193.770, "abc", "http://example/fsl.mp4", self.config, self.confirmed,
         )
         self.assertFalse(entry["source_changed"])
+
+    def test_head_decision_is_recorded_with_the_window(self) -> None:
+        head = {"boundary": 181.4407, "frames_added": 10, "reason": "label current 10 frames before the marker start"}
+        entry = self.slverse.record_verse_end_decision(
+            "FSL", 19, 119, 181.758, 193.77, "abc", "http://example/fsl.mp4", self.config, self.confirmed, head=head,
+        )
+        self.assertEqual(entry["head_boundary"], 181.4407)
+        self.assertEqual(entry["head_frames_added"], 10)
+        self.assertEqual(entry["marker_start"], 181.758)
+        self.assertEqual(entry["algo"], self.slverse.VERSE_END_ALGO)
+
+    def test_reuse_needs_same_checksum_settings_and_algorithm(self) -> None:
+        self._record("abc")
+        reuse = lambda checksum="abc", config=None: self.slverse.reusable_verse_end_decision(
+            "FSL", 19, 119, 169.779, 181.757, checksum, config or self.config)
+        self.assertIsNotNone(reuse())
+        self.assertIsNone(reuse(checksum="def"))
+        self.assertIsNone(reuse(config=dict(self.config, verse_end_search="2.0")))
+        data = self._ledger()
+        data["FSL:19_119:169779-181757"]["algo"] = self.slverse.VERSE_END_ALGO - 1
+        self.ledger_path.write_text(json.dumps(data))
+        self.assertIsNone(reuse())
+
+    def test_unconfirmed_scans_are_never_reused(self) -> None:
+        self._record("abc", {"boundary": None, "reason": "no label change", "fps": 29.97, "frames_scanned": 45})
+        self.assertIsNone(self.slverse.reusable_verse_end_decision("FSL", 19, 119, 169.779, 181.757, "abc", self.config))
+
+    def test_probe_reuses_a_recorded_decision_without_scanning(self) -> None:
+        self._record("abc")
+        probe = self.slverse.VerseEndProbe("FSL", 19, 119, self.config, {}, quiet=True)
+        with mock.patch.object(self.slverse, "resolve_cached_source") as fetch, \
+                mock.patch.object(self.slverse, "detect_verse_end") as scan:
+            boundary = probe(169.779, 181.757, "http://example/fsl.mp4", "abc")
+        self.assertAlmostEqual(boundary, 181.4582)
+        fetch.assert_not_called()
+        scan.assert_not_called()
+        self.assertEqual(probe.applied(), (9, 29.97002997))
+
+    def test_probe_rescans_when_the_source_checksum_changed(self) -> None:
+        self._record("abc")
+        probe = self.slverse.VerseEndProbe("FSL", 19, 119, self.config, {}, quiet=True)
+        with mock.patch.object(self.slverse, "resolve_cached_source", return_value=("src.mp4", "cached", 0.0, 0.0)), \
+                mock.patch.object(self.slverse, "cache_in_use"), \
+                mock.patch.object(self.slverse, "detect_verse_end", return_value=dict(self.confirmed, marker_end=181.757)) as scan:
+            probe(169.779, 181.757, "http://example/fsl.mp4", "def")
+        scan.assert_called_once()
+        self.assertTrue(self._ledger()["FSL:19_119:169779-181757"]["source_changed"])
 
     def test_corrupt_ledger_is_replaced_not_fatal(self) -> None:
         self.ledger_path.write_text("{not json")
