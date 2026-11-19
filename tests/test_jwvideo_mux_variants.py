@@ -1497,15 +1497,17 @@ class LocalFileModeMismatchedVariantTest(unittest.TestCase):
             self._make_clip(other, size="424x240")
 
             # Without an override, this pair is genuinely ambiguous (see
-            # test_resolve_language_video_candidates_reports_genuine_ambiguity) and HV is dropped.
+            # test_resolve_language_video_candidates_reports_genuine_ambiguity). HV was asked for
+            # explicitly, so the run must refuse rather than write an output silently lacking it.
             ambiguous_result = subprocess.run(
-                [sys.executable, self.JWVIDEOMUX, str(base), "-v", "FSL", "-a", "HV", "--force"],
+                [sys.executable, self.JWVIDEOMUX, str(base), "-v", "FSL", "-a", "HV", "--force",
+                 "--no-download-missing"],
                 cwd=root, capture_output=True, text=True, timeout=60,
             )
-            self.assertEqual(ambiguous_result.returncode, 0, ambiguous_result.stderr)
+            self.assertNotEqual(ambiguous_result.returncode, 0)
             self.assertIn("[HV] No matching local files found.", ambiguous_result.stdout)
-            for mkv in root.glob("*.mkv"):
-                mkv.unlink()
+            self.assertIn("requested language(s) with no usable file: HV", ambiguous_result.stdout)
+            self.assertEqual(list(root.glob("*.mkv")), [])
 
             result = subprocess.run(
                 [sys.executable, self.JWVIDEOMUX, str(base), "-v", "FSL", "-a", f"HV={wanted}", "--force"],

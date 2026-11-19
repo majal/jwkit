@@ -6,6 +6,7 @@ into a single MKV/MP4 container or separate single-stream files.
 """
 
 import argparse
+import atexit
 import collections
 import json
 import os
@@ -62,9 +63,12 @@ DEFAULT_CONFIG = {
     "dedupe_visually_same": False, "adaptive_mpv_library": False,
     "launchers_in_video_folder": False, "normalize_mismatched_aspect": False,
     "ffmpeg_binary": "", "ffprobe_binary": "",
+    "download_missing": True, "keep_downloads": False,
 }
 CONFIG_HELP = {key: key.replace("_", " ") for key in DEFAULT_CONFIG}
 CONFIG_HELP.update({
+    "download_missing": "Local-file mode: download an explicitly requested -v/-a language that has no local file",
+    "keep_downloads": "Keep files auto-downloaded for missing languages (next to the input) instead of removing them after the run",
     "ffmpeg_binary": "Override ffmpeg executable detection",
     "ffprobe_binary": "Override ffprobe executable detection",
 })
@@ -366,22 +370,63 @@ def get_media_links(params: dict, lang: str, res: str) -> dict:
             
     return result
 
-def download_file(url: str, dest: Path):
+def download_file(url: str, dest: Path) -> bool:
+    """Download url to dest via a .part file so an interrupted run can't leave a truncated
+    file that a later run mistakes for a finished one. True when dest is present and complete."""
     if dest.exists():
         color_print(f"  Already exists: {dest.name}", "green")
-        return
+        return True
     color_print(f"  Downloading: {dest.name}...", "cyan")
+    part = dest.with_name(dest.name + ".part")
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response, open(dest, 'wb') as out_file:
+        with urllib.request.urlopen(req) as response, open(part, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
+        part.replace(dest)
+        return True
     except Exception as e:
         color_print(f"  Failed to download {url}: {e}", "red")
-        if dest.exists():
-            dest.unlink()
+        part.unlink(missing_ok=True)
+        return False
 
 def get_filename_from_url(url: str) -> str:
     return url.split('/')[-1].split('?')[0]
+
+def infer_media_params_from_filename(name: str, base_lang: str) -> dict | None:
+    """jw.org file names look like pub_LANG_[issue_]track_rNNNP[...].mp4 (mwbv_FSL_202311_02_r720P,
+    sjjm_E_03_r720P). Recover the GETPUBMEDIALINKS pub/issue/track so a missing language can be
+    fetched for the same item. None when the name doesn't follow that convention."""
+    tokens = Path(name).stem.split('_')
+    if len(tokens) < 3 or tokens[1].upper() != base_lang.upper() or not re.fullmatch(r'[A-Za-z]+', tokens[0]):
+        return None
+    numbers = []
+    for token in tokens[2:]:
+        if not token.isdigit():
+            break
+        numbers.append(token)
+    if len(numbers) == 1:
+        return {"pub": tokens[0], "track": str(int(numbers[0]))}
+    if len(numbers) == 2 and len(numbers[0]) >= 6:
+        return {"pub": tokens[0], "issue": numbers[0], "track": str(int(numbers[1]))}
+    return None
+
+
+def download_missing_language(params: dict, lang: str, res: str, want_video: bool, dest_dir: Path) -> dict:
+    """Fetch what a local-file run is missing for `lang`. Returns the local_files entry
+    ({'video': path} or {'audio': path}, source url), ({}, None) when jw.org has nothing or the download failed."""
+    links = get_media_links(params, lang, res)
+    if want_video:
+        url, kind = links.get('mp4'), 'video'
+    else:
+        url, kind = links.get('mp3'), 'audio'
+        if not url:
+            url, kind = links.get('mp4_low') or links.get('mp4'), 'audio'
+    if not url:
+        color_print(f"  [{lang}] jw.org has no {'video' if want_video else 'audio'} for this item.", "yellow")
+        return {}, None
+    dest = dest_dir / get_filename_from_url(url)
+    return ({kind: dest}, url) if download_file(url, dest) else ({}, None)
+
 
 
 def command_output(cmd: list[str]) -> str:
@@ -2081,7 +2126,7 @@ def main():
     parser.add_argument("-r", "--res", "--resolution", dest="res", help="Target resolution")
     parser.add_argument("-c", "--container", choices=["mkv", "mp4"], help="Export container format")
     parser.add_argument("-S", "--single-streams", action=argparse.BooleanOptionalAction, default=None, help="Produce separate single-stream videos")
-    parser.add_argument("-C", "--cleanup", action=argparse.BooleanOptionalAction, default=None, help="Trash downloaded source files after muxing")
+    parser.add_argument("-C", "--cleanup", action=argparse.BooleanOptionalAction, default=None, help="Delete the source files that went into the output after a successful mux")
     parser.add_argument("-o", "--output-dir", help="Directory to save output files")
     parser.add_argument("-f", "--force", action="store_true", help="Force overwrite if output file exists without asking (equivalent to --on-exists overwrite for this run)")
     parser.add_argument("--on-exists", choices=["ask", "overwrite", "rename", "trash", "fail"], help="Override on_output_exists for this run")
@@ -2098,6 +2143,8 @@ def main():
     parser.add_argument("--variant-min-seconds", type=_jwkit_common.parse_time_seconds, help="Minimum sustained localized-difference duration")
     parser.add_argument("--scan-small-regions", action=argparse.BooleanOptionalAction, default=None, help="Compare horizontal frame bands too")
     parser.add_argument("--region-count", type=int, help="Horizontal bands used by --scan-small-regions")
+    parser.add_argument("--download-missing", action=argparse.BooleanOptionalAction, default=None, help="Local-file mode: download an explicitly requested -v/-a language that has no local file, matched to the input's jw.org item (default: config download_missing, on)")
+    parser.add_argument("--keep-downloads", action=argparse.BooleanOptionalAction, default=None, help="Keep files downloaded by --download-missing next to the input instead of removing them after the run")
     parser.add_argument("--ffmpeg-binary", help="ffmpeg executable to use (default: auto-detect, preferring ffmpeg-full)")
     parser.add_argument("--ffprobe-binary", help="ffprobe executable to use (default: auto-detect, preferring ffprobe-full)")
     parser.add_argument("--manual-overrides", type=Path, help="TOML file (ground-truth.toml schema: talks -> videos -> differences, with an optional fallback_ok flag per difference) of human-confirmed evidence for local-file-mode SCE-layout input; always wins over automatic detection for the languages/windows it covers. Matched by exact talk-folder-name + anchor-filename, so reuse one file across a whole library.")
@@ -2111,6 +2158,7 @@ def main():
     color_group.add_argument("--no-color", dest="color", action="store_false", help="Disable colored output for this run")
 
     args = parser.parse_args()
+    cli_video, cli_audio = args.video, args.audio  # before config fills in defaults: only these are "explicit requests"
     config = load_config()
     for key in DEFAULT_CONFIG:
         if getattr(args, key, None) is None:
@@ -2170,11 +2218,21 @@ def main():
 
     all_langs = list(dict.fromkeys(vid_langs + aud_langs + sub_langs))
 
+    def _explicit_langs(raw):
+        if not raw or raw.upper() == "NONE":
+            return []
+        return [code for code in parse_lang_tokens(raw)[0] if code]
+    # Only languages typed on the command line count as explicit requests; config defaults
+    # (e.g. audio = E,TG,CV,HV,SA) stay best-effort.
+    explicit_vid = _explicit_langs(cli_video)
+    explicit_aud = _explicit_langs(cli_audio)
+
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     local_files = {}
     source_urls = {}  # downloaded path -> jw.org URL, for the provenance record
+    downloaded_paths = set()  # files this run auto-downloaded in local-file mode
 
     if is_local_file:
         color_print("\n>> Local file mode detected. Skipping API downloads...", "header")
@@ -2272,6 +2330,39 @@ def main():
                 color_print(f"  [{lang}] Found local: {', '.join(local_files[lang].keys())}", "green")
             else:
                 color_print(f"  [{lang}] No matching local files found.", "yellow")
+
+        # An explicitly requested language with no local file: fetch the same jw.org item.
+        missing_local = [
+            lang for lang in dict.fromkeys(explicit_vid + explicit_aud)
+            if lang != base_lang and not (
+                'video' in local_files.get(lang, {}) if lang in explicit_vid
+                else ({'video', 'audio'} & set(local_files.get(lang, {})))
+            )
+        ]
+        if missing_local and args.download_missing:
+            params = infer_media_params_from_filename(base_vid_path.name, base_lang)
+            if params is None:
+                color_print(
+                    f"  Can't tell which jw.org item {base_vid_path.name} is (expected pub_LANG_[issue_]track_rNNNP...), "
+                    f"so {', '.join(missing_local)} can't be downloaded; pin a file with CODE=path instead.", "yellow",
+                )
+            else:
+                res_match = _RESOLUTION_TOKEN_RE.search(base_vid_path.name)
+                res = res_match.group(0).lower() if res_match else args.res
+                if args.keep_downloads:
+                    dl_dir = base_vid_path.parent
+                else:
+                    dl_dir = Path(tempfile.mkdtemp(prefix="jwvideo-mux-dl-"))
+                    atexit.register(shutil.rmtree, dl_dir, ignore_errors=True)
+                color_print(f"\n>> Downloading missing language(s) {', '.join(missing_local)} for {params} ({res})...", "header")
+                for lang in missing_local:
+                    got, got_url = download_missing_language(params, lang, res, lang in explicit_vid, dl_dir)
+                    if got:
+                        local_files.setdefault(lang, {}).update(got)
+                        for path in got.values():
+                            source_urls[str(path)] = got_url
+                        downloaded_paths.update(str(path) for path in got.values())
+                        color_print(f"  [{lang}] Downloaded: {', '.join(got.keys())}", "green")
 
         # A local MP4 may carry captions as a subtitle stream without a matching
         # .vtt/.srt sidecar. When no explicit or adjacent sidecar won above,
@@ -2570,6 +2661,18 @@ def main():
             if lang not in langs_loaded:
                 langs_loaded.append(lang)
 
+    unavailable = [
+        lang for lang in dict.fromkeys(explicit_vid + explicit_aud) if lang not in langs_loaded
+    ]
+    if unavailable:
+        color_print(
+            f"Error: requested language(s) with no usable file: {', '.join(unavailable)}. "
+            "Refusing to write an output that silently lacks them"
+            + ("; pass --download-missing, or pin a file with CODE=path." if is_local_file and not args.download_missing else "."),
+            "red",
+        )
+        sys.exit(1)
+
     if not langs_loaded:
         color_print("No media to mux. Exiting.", "red")
         sys.exit(1)
@@ -2608,6 +2711,20 @@ def main():
     else:
         out_name = f"merged_{'-'.join(langs_loaded)}_output.{args.container}"
     out_path = out_dir / out_name
+
+    # Never let the output-exists policy touch a file that is also an input: it would be
+    # trashed/overwritten before ffmpeg ever reads it. Validate inputs before touching anything.
+    missing_inputs = [path for path in input_paths if not Path(path).exists()]
+    if missing_inputs:
+        color_print(f"Error: input file(s) not found: {', '.join(missing_inputs)}", "red")
+        sys.exit(1)
+    if out_path.exists() and any(out_path.samefile(path) for path in input_paths):
+        color_print(
+            f"Error: the output {out_path.name} would replace one of its own inputs (nothing new was added to it, "
+            "or the container/name is unchanged). Nothing was touched; change -c/-o or add another language.",
+            "red",
+        )
+        sys.exit(1)
 
     if args.force:
         jwkit_config = {"on_output_exists": "overwrite"}
@@ -2676,7 +2793,8 @@ def main():
             vid_langs, aud_langs, sub_langs, langs_loaded, art_attached=bool(art_extra_args),
         )
     else:
-        color_print("✗ Merged video creation failed.", "red")
+        color_print("✗ Merged video creation failed; leaving every source file in place.", "red")
+        sys.exit(1)
 
     # Every path actually handed to ffmpeg as an -i input, across the merge above and the
     # single-stream loop below. This -- not "everything local-file discovery happened to resolve" --
@@ -2686,6 +2804,7 @@ def main():
     used_source_paths = set(input_paths)
 
     # 2. Mux single streams
+    single_failed = False
     if args.single_streams and vid_langs:
         base_vid_lang = vid_langs[0]
         base_vid = local_files.get(base_vid_lang, {}).get('video')
@@ -2756,15 +2875,21 @@ def main():
 
                 cmd_single += maps + ["-avoid_negative_ts", "disabled", "-c:v", "copy", "-c:a", "copy", str(out_single)]
                 single_run = subprocess.run(cmd_single)
-                color_print(f"  ✓ Single-stream created: {out_single.name}", "green")
+                if single_run.returncode != 0:
+                    color_print(f"  ✗ Single-stream failed: {out_single.name}", "red")
+                    single_failed = True
+                else:
+                    color_print(f"  ✓ Single-stream created: {out_single.name}", "green")
                 if single_run.returncode == 0:
                     record_mux_provenance(
                         out_single, args, single_inputs, single_roles,
                         source_urls, local_files, is_local_file, base_vid_path, vid_langs, aud_langs, sub_langs, [lang], single_stream_language=lang,
                     )
 
-    # Cleanup
-    if args.cleanup:
+    # Cleanup (only after every requested output was written)
+    if args.cleanup and single_failed:
+        color_print("\n>> Skipping cleanup: a single-stream output failed, so the sources are still needed.", "yellow")
+    elif args.cleanup:
         color_print("\n>> Cleaning up source files actually used above (never anything merely discovered)...", "header")
         skipped_unused = []
         for lang, media in local_files.items():
@@ -2785,6 +2910,8 @@ def main():
                 f"{', '.join(sorted(set(skipped_unused)))}", "cyan",
             )
         color_print("  Cleanup complete.", "green")
+    if single_failed:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
