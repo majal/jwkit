@@ -1256,23 +1256,36 @@ def _extract_cover_art(source, cover, work_dir):
     return cover_path
 
 def source_window_args(start=None, end=None):
-    """Input-side ffmpeg arguments for an exact source window.
+    """Input-side seek for an exact source window: ``-ss`` before ``-i``.
 
-    ``-to`` after an input ``-ss`` is easy to misread and, with copied
-    streams carrying source timestamps/chapters, has produced containers
-    whose duration outlived their video. Express the endpoint as a duration
-    instead. The caller is still responsible for rebasing copied timestamps
-    or decoding audio when sample-exact duration matters.
-    """
-    args = []
-    if start is not None:
-        args += ["-ss", str(start)]
-    if end is not None:
-        duration = end - (start or 0.0)
-        if duration <= 0:
-            raise ValueError("--end must be greater than --start")
-        args += ["-t", str(duration)]
-    return args
+    The end is not an input option. An input ``-t``/``-to`` on the source
+    over-reads past roughly 11 seconds (a 0-11.978s window decoded 707 frames
+    instead of 359, running on to 23.59s), so the duration goes after the
+    last ``-i`` via :func:`source_window_end_args`. Use
+    :func:`source_window_input` to build the whole group in one go."""
+    return ["-ss", str(start)] if start is not None else []
+
+
+def source_window_end_args(start=None, end=None):
+    """Output-side duration that ends an exact source window at ``end``.
+
+    Must follow the last ``-i`` so ffmpeg applies it to the decoded output.
+    Returns [] when there is no end."""
+    if end is None:
+        return []
+    duration = end - (start or 0.0)
+    if duration <= 0:
+        raise ValueError("--end must be greater than --start")
+    return ["-t", str(duration)]
+
+
+def source_window_input(source, start=None, end=None):
+    """``-ss``, ``-i source`` and the output-side end for an exact window.
+
+    Callers that add more inputs after the source must instead use
+    :func:`source_window_args` before ``-i`` and :func:`source_window_end_args`
+    after their last input."""
+    return source_window_args(start, end) + ["-i", str(source)] + source_window_end_args(start, end)
 
 
 def _ffmetadata_escape(value):
@@ -1381,6 +1394,8 @@ def prepare_clipped_stream_extras(source, extras, start, end, work_dir, *, want_
     cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y"] + source_window_args(start, end) + ["-i", str(source)]
     for subtitle in clipped_subtitles:
         cmd += ["-i", str(subtitle)]
+    # After the last input: the window end is an output option for everything above.
+    cmd += source_window_end_args(start, end)
     audio_maps = []
     if want_extra_audio:
         filters = []
@@ -2527,7 +2542,7 @@ def resolve_cadence(source, config, start, end, vf, source_fps):
     if not config_bool(config, "cadence_detection", True):
         return None
     print("Checking for a repeat cadence...")
-    steps = measure_frame_steps(source_window_args(start, end) + ["-i", str(source)], vf)
+    steps = measure_frame_steps(source_window_input(source, start, end), vf)
     found = find_cadence(steps)
     if not found:
         return None
@@ -3084,7 +3099,7 @@ def _render_rife_chunks(rife_path, in_frames, out_frames, target_count, model_pa
         print(f"Cut handling: {held_total} interpolated frame(s) held at scene boundaries.")
     return [segments_dir / seg["file"] for seg in segments]
 
-def _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration):
+def _extract_all_source_frames(in_frames, extract_marker, source_input_args, vf, duration):
     """Decode the whole source window to PNGs in one sequential pass, reusing
     a complete extraction left behind by an interrupted run. Returns the
     frame count actually on disk."""
@@ -3102,7 +3117,7 @@ def _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf,
         print("Extracted-frame resume data is incomplete; rebuilding it.")
     shutil.rmtree(in_frames, ignore_errors=True)
     in_frames.mkdir(parents=True)
-    extract_cmd = trim_args + ["-i", str(source)]
+    extract_cmd = list(source_input_args)
     if vf:
         extract_cmd += ["-vf", vf]
     extract_cmd += [f"{in_frames}/%08d.png"]
@@ -3182,10 +3197,9 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     # inspect either checkpoint.
     in_frames.mkdir(parents=True, exist_ok=True)
     out_frames.mkdir(parents=True, exist_ok=True)
-    trim_args = source_window_args(start, end)
     duration = (end - start) if (start is not None and end is not None) else None
     extract_marker = frames_root / "extract-complete.json"
-    source_input_args = trim_args + ["-i", str(source)]
+    source_input_args = source_window_input(source, start, end)
     speed_factor = speed if speed and speed != 1 else 1.0
 
     # Library callers historically pass only the settings they own - keep
@@ -3194,7 +3208,7 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
     # need chunk boundaries to encode and free at): one run_rife() call and
     # one flat out_frames directory, as always.
     if "chunk_frames" not in config:
-        input_frame_count = _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration)
+        input_frame_count = _extract_all_source_frames(in_frames, extract_marker, source_input_args, vf, duration)
         if input_frame_count == 0:
             print("No frames extracted - nothing to interpolate.")
             return None
@@ -3286,7 +3300,7 @@ def render_rife_frames(source, frames_root, config, start=None, end=None, vf=Non
             provider = WindowedFrameProvider(source, count, source_fps, window_start=start or 0.0, vf=vf,
                                              frame_step=frame_step, step_fps=step_fps)
             return provider, cuts, transition_count, count, duplicates
-        count = _extract_all_source_frames(source, in_frames, extract_marker, trim_args, vf, duration)
+        count = _extract_all_source_frames(in_frames, extract_marker, source_input_args, vf, duration)
         if count == 0:
             return None, None, 0, 0, []
         # Cuts must be known before any chunk runs: chunk seams snap onto
@@ -3407,7 +3421,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         fps = float(fps)
     configure_pacing(config)
     duration = (end - start) if (start is not None and end is not None) else None
-    trim_args = source_window_args(start, end)
+    windowed = start is not None or end is not None
     speed_vf = f"setpts=PTS/{speed:.6g}" if speed and speed != 1 else None
     speed_af = atempo_chain(speed)
 
@@ -3457,12 +3471,12 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         carryover_dir = Path(tempfile.mkdtemp(prefix="ffrife-extras-")) if extras else None
         try:
             primary_target = (carryover_dir / f"encoded{Path(output_file).suffix}") if carryover_dir else output_file
-            cmd = trim_args + ["-i", str(source)]
+            cmd = source_window_input(source, start, end)
             if vf_chain:
                 cmd += ["-vf", ",".join(vf_chain)]
             if speed_af:
                 cmd += ["-af", f"asetpts=PTS-STARTPTS,{speed_af}"]
-            elif trim_args:
+            elif windowed:
                 cmd += ["-af", "asetpts=PTS-STARTPTS"]
             else:
                 cmd += ["-c:a", "copy"]
@@ -3488,7 +3502,7 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
                 # frame 0 is a new one; audio and extras follow the same start.
                 # A quarter frame early keeps a float rounding from dropping it.
                 start = (start or 0.0) + (cadence["phase"] - 0.25) / real
-                trim_args = source_window_args(start, end)
+                windowed = True
                 duration = (end - start) if end is not None else None
     options = {"start": start, "end": end, "vf": vf, "fps": fps, "speed": speed, "cadence": cadence,
                "model": config.get("rife_model"), "threads": config.get("rife_threads"),
@@ -3526,14 +3540,14 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
         # copying into .mka keeps them, copying into .aac loses them), and
         # those ride back onto the final merge below for free since ffmpeg
         # copies a mapped stream's own tags along with it by default.
-        exact_audio = bool(trim_args) or bool(speed_af)
+        exact_audio = windowed or bool(speed_af)
         audio_path = temp_dir_path / ("audio.m4a" if exact_audio else "audio.mka")
         # Explicit -map (the first audio stream by index) rather than
         # ffmpeg's own default "best" stream auto-selection (highest
         # channel count) - deterministic, and what makes extra_audio_indices
         # above an accurate list of everything ELSE the source has, for
         # carry_over_source_extras to pick up separately.
-        audio_cmd = [FFMPEG_BIN, "-y"] + trim_args + ["-i", str(source), "-map", "0:a:0?", "-map_chapters", "-1"]
+        audio_cmd = [FFMPEG_BIN, "-y"] + source_window_input(source, start, end) + ["-map", "0:a:0?", "-map_chapters", "-1"]
         if exact_audio:
             audio_filters = ["asetpts=PTS-STARTPTS"]
             if duration is not None:
@@ -3939,7 +3953,7 @@ def cmd_benchmark(args, config):
                 trimmed = str(Path(tmp_dir) / "bench_sample.mp4")
                 offset = max(0.0, (duration - 8) / 2)
                 subprocess.run(
-                    [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-ss", str(offset), "-t", "8", "-i", sample,
+                    [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-ss", str(offset), "-i", sample, "-t", "8",
                      "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-an", trimmed],
                     check=True, timeout=60,
                 )

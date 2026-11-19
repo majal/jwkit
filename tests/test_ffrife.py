@@ -4,6 +4,8 @@ import argparse
 import io
 import math
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -315,12 +317,25 @@ class FfrifeTrimmedExtrasTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.ffrife = load_script_module("ffrife")
 
-    def test_source_window_uses_duration_not_absolute_to(self) -> None:
-        args = self.ffrife.source_window_args(179.446, 206.606)
-        self.assertEqual(args[:2], ["-ss", "179.446"])
-        self.assertEqual(args[2], "-t")
-        self.assertAlmostEqual(float(args[3]), 27.16)
-        self.assertNotIn("-to", args)
+    def test_source_window_seeks_on_input_and_ends_on_output(self) -> None:
+        # Input-side -t/-to over-reads the source, so the end must be an
+        # output-side -t placed after the last -i.
+        self.assertEqual(self.ffrife.source_window_args(179.446, 206.606), ["-ss", "179.446"])
+        end = self.ffrife.source_window_end_args(179.446, 206.606)
+        self.assertEqual(end[0], "-t")
+        self.assertAlmostEqual(float(end[1]), 27.16)
+        cmd = self.ffrife.source_window_input("src.mp4", 179.446, 206.606)
+        self.assertEqual(cmd[:2], ["-ss", "179.446"])
+        self.assertEqual(cmd[cmd.index("-i") + 1], "src.mp4")
+        self.assertEqual(cmd[-2], "-t")
+        self.assertNotIn("-to", cmd)
+
+    def test_source_window_end_without_start_and_bad_range(self) -> None:
+        self.assertEqual(self.ffrife.source_window_args(None, 5), [])
+        self.assertEqual(self.ffrife.source_window_end_args(None, 5), ["-t", "5.0"])
+        self.assertEqual(self.ffrife.source_window_end_args(None, None), [])
+        with self.assertRaises(ValueError):
+            self.ffrife.source_window_end_args(10, 10)
 
     def test_chapters_are_clipped_rebased_and_outside_rows_dropped(self) -> None:
         probe = MagicMock(stdout='''{"chapters":[
@@ -409,6 +424,7 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         extract = ffmpeg_calls[0]
         self.assertIn("-t", extract)
         self.assertAlmostEqual(float(extract[extract.index("-t") + 1]), 27.16)
+        self.assertGreater(extract.index("-t"), extract.index("-i"))
         self.assertNotIn("-to", extract)
         audio = next(c for c in subprocess_calls if str(c[-1]).endswith("audio.m4a"))
         self.assertIn("atrim=duration=27.16,asetpts=PTS-STARTPTS", audio)
@@ -2433,3 +2449,36 @@ class FfrifeProvenanceTest(unittest.TestCase):
         self.assertEqual(match("00 Opening song - sjj_FSL_161_r720P.mp4")["track"], "161")
         self.assertEqual(match("S-319-27v_FSL_01_r720P.mp4")["pub"], "S-319-27v")
         self.assertIsNone(match("home movie.mp4"))
+
+
+SLVERSE_FSL_SEGMENT = (
+    Path.home() / ".cache" / "slverse" / "FSL" / "19_119"
+    / "seg-b40c2ef4d9ba244828d7b03e67bb47d9-169779-204013-v3.mp4"
+)
+
+
+@unittest.skipUnless(SLVERSE_FSL_SEGMENT.exists() and shutil.which("ffmpeg"),
+                     "needs the cached FSL Psalm 119:97 segment and ffmpeg")
+class FfrifeRealSegmentWindowTest(unittest.TestCase):
+    """Regression for the 119:97 bug: an input-side end over-read the window
+    (0-11.978s came out as 23.59s). Runs real ffmpeg on the cached segment."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffrife = load_script_module("ffrife")
+
+    def _frame_count(self, cmd_before_output: list[str]) -> int:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"] + cmd_before_output
+        cmd += ["-map", "0:v:0", "-f", "framemd5", "-"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return sum(1 for line in result.stdout.splitlines() if line and not line.startswith("#"))
+
+    def test_zero_to_11_978_window_is_exact(self) -> None:
+        cmd = self.ffrife.source_window_input(str(SLVERSE_FSL_SEGMENT), 0, 11.978)
+        self.assertEqual(self._frame_count(cmd), 359)
+
+    def test_mid_segment_window_is_exact(self) -> None:
+        # Verse 97 is 0-11.71s of the source; a window starting mid-segment
+        # must stay on its own duration as well.
+        cmd = self.ffrife.source_window_input(str(SLVERSE_FSL_SEGMENT), 11.71, 23.72)
+        self.assertEqual(self._frame_count(cmd), 360)
