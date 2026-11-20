@@ -477,6 +477,33 @@ class FfrifeSpeedRetimingTest(unittest.TestCase):
         self.assertNotIn("-vf", calls[0])
         self.assertEqual(calls[-1][calls[-1].index("-vf") + 1], "drawtext=text='label'")
 
+    def test_output_filter_is_part_of_the_job_signature(self) -> None:
+        # Two runs that differ only in output_vf must not share a work dir,
+        # or resume would reuse frames encoded with the other filter.
+        config = {"rife_binary_path": "/fake/rife", "resume": "true"}
+        seen = []
+
+        class Stop(Exception):
+            pass
+
+        def capture(source, output_file, options):
+            seen.append(dict(options))
+            raise Stop
+
+        with patch.object(self.ffrife, "command_exists", return_value=True), \
+             patch.object(self.ffrife, "probe_source_fps", return_value=30.0), \
+             patch.object(self.ffrife, "_job_signature", capture):
+            for output_vf in ("drawtext=text='a'", "drawtext=text='b'"):
+                with self.assertRaises(Stop):
+                    self.ffrife.interpolate("in.mp4", "out.mp4", config, output_vf=output_vf)
+            with self.assertRaises(Stop):
+                self.ffrife.interpolate("in.mp4", "out.mp4", config)
+
+        self.assertEqual(seen[0]["output_vf"], "drawtext=text='a'")
+        self.assertEqual(seen[1]["output_vf"], "drawtext=text='b'")
+        # No output filter: the key is absent, so existing work dirs keep their signature.
+        self.assertNotIn("output_vf", seen[2])
+
     def test_rife_path_generates_retimed_frames_before_the_merge(self) -> None:
         # RIFE installed/configured -> the PNG-extract-then-RIFE-then-merge
         # path. RIFE should generate the retimed count directly, without a

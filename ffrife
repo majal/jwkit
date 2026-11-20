@@ -3513,6 +3513,10 @@ def interpolate(source, output_file, config, start=None, end=None, vf=None, fps=
                "chunk_frames": config.get("chunk_frames"), "long_run_frames": config.get("long_run_frames"),
                "batch": bool(config.get("_batch_mode")), "rife_tta": config.get("rife_tta"),
                "render_layout": RENDER_LAYOUT_VERSION}
+    # An output filter changes every encoded frame, so it must be part of the
+    # signature. Added only when set, so jobs without one keep their old key.
+    if output_vf:
+        options["output_vf"] = output_vf
     # Every detection setting changes which frames get held, so any of them
     # changing must start fresh work rather than reuse held chunks.
     options.update({key: config.get(key) for key in DEFAULT_CONFIG
