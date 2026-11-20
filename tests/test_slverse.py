@@ -2448,8 +2448,35 @@ class SlverseFfrifeIntegrationTest(unittest.TestCase):
         self.assertEqual(kwargs["start"], 10.0)
         self.assertEqual(kwargs["end"], 20.0)
         self.assertEqual(kwargs["output_vf"], "drawtext=text='stub'")
-        self.assertNotIn("vf", kwargs)
+        self.assertIsNone(kwargs.get("vf"))  # no delogo in this overlay, so nothing runs pre-RIFE
         self.assertEqual(kwargs["fps"], 50.0)
+
+    def test_rife_delogo_runs_before_interpolation_and_drawtext_after(self) -> None:
+        calls = []
+        fake_ffrife = argparse.Namespace(
+            interpolate=lambda *a, **k: calls.append((a, k)),
+            load_config=lambda: {},
+        )
+        self.slverse.load_ffrife = lambda: fake_ffrife
+        overlay = "delogo=x=98:y=55:w=218:h=28,drawtext=text='x':enable='between(t,0,1)'"
+        self.slverse.build_overlay_filter = lambda *a, **k: overlay
+        config = {"interpolate": "true", "interpolation_engine": "rife", "default_target_lang": "FSL", "interpolation_target_fps": "50"}
+
+        self.slverse.extract_verse("http://example/vid.mp4", "out.mp4", 10.0, 20.0, "Psalm", 16, [("11", 0.0, 1.0)], "ASL", config, remote=True)
+
+        self.assertEqual(len(calls), 1)
+        kwargs = calls[0][1]
+        self.assertEqual(kwargs["vf"], "delogo=x=98:y=55:w=218:h=28")
+        self.assertEqual(kwargs["output_vf"], "drawtext=text='x':enable='between(t,0,1)'")
+
+    def test_delogo_helpers_split_overlay_without_dangling_separators(self) -> None:
+        overlay = "delogo=x=1:y=2:w=3:h=4,drawtext=text='a,b':enable='between(t,0,1)'"
+        self.assertEqual(self.slverse.delogo_only(overlay), "delogo=x=1:y=2:w=3:h=4")
+        self.assertEqual(self.slverse.without_delogo(overlay), "drawtext=text='a,b':enable='between(t,0,1)'")
+        self.assertIsNone(self.slverse.delogo_only(None))
+        self.assertIsNone(self.slverse.without_delogo(None))
+        self.assertIsNone(self.slverse.delogo_only("drawtext=text='x'"))
+        self.assertIsNone(self.slverse.without_delogo("delogo=x=1:y=2:w=3:h=4"))
 
     def test_rife_mid_transition_cuts_use_lossless_section_pipeline(self) -> None:
         calls = []

@@ -2194,6 +2194,13 @@ def without_delogo(overlay):
     """Keep drawtext filters after an inpainting backend removed the caption."""
     return ",".join(part for part in (overlay or "").split(",") if not part.startswith("delogo=")) or None
 
+def delogo_only(overlay):
+    """Just the delogo part of the overlay. delogo has no clock, so it can run
+    on the source frames before RIFE: RIFE then never synthesises frames from
+    the source caption, and nothing is left to smear past the box. The
+    time-based drawtext/fade filters stay in output_vf (after RIFE)."""
+    return ",".join(part for part in (overlay or "").split(",") if part.startswith("delogo=")) or None
+
 def detect_delogo_occlusion(source, box, start_time, end_time, samples=5):
     """Cheap foreground test for the flat-background SL caption region.
 
@@ -2350,11 +2357,11 @@ def extract_verse(source, output_file, start_time, end_time, book_name, chapter,
             absolute_sections = [(start_time + seg_start, start_time + seg_end, None, True) for seg_start, seg_end in segments]
             encode_rife_frame_sections(
                 source, output_file, absolute_sections, target_fps, config,
-                overlay=overlay, metadata_args=metadata_args, ffrife=ffrife,
-                ffrife_config=ffrife_config_for(config),
+                overlay=without_delogo(overlay), metadata_args=metadata_args, ffrife=ffrife,
+                ffrife_config=ffrife_config_for(config), pre_vf=delogo_only(overlay),
             )
             return
-        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, output_vf=overlay, fps=target_fps, metadata_args=metadata_args)
+        ffrife.interpolate(source, output_file, ffrife_config_for(config), start=start_time, end=end_time, vf=delogo_only(overlay), output_vf=without_delogo(overlay), fps=target_fps, metadata_args=metadata_args)
         return
 
     target_fps = float(config.get("interpolation_target_fps", DEFAULT_CONFIG["interpolation_target_fps"]))
@@ -2543,13 +2550,17 @@ def build_sectioned_filter_complex(boundaries, speed, mode, base_label, audio=Fa
     return fc, "[out]"
 
 
-def encode_rife_frame_sections(source, output_file, sections, target_fps, config, overlay=None, metadata_args=None, ffrife=None, ffrife_config=None, source_fps=None):
+def encode_rife_frame_sections(source, output_file, sections, target_fps, config, overlay=None, metadata_args=None, ffrife=None, ffrife_config=None, source_fps=None, pre_vf=None):
     """Prepare section frame sequences losslessly, then encode once.
 
     ``sections`` contains ``(start, end, speed, use_rife)`` tuples. A speed
     of ``None`` keeps normal duration. Untouched sections stay as direct source
     inputs; RIFE sections synthesize their final retimed PNG sequence. Overlay,
     concat, metadata, and compression all happen in the sole final encode.
+
+    ``pre_vf`` (delogo only) runs on the source frames before RIFE, and on the
+    untouched source sections, so RIFE never synthesises frames from the source
+    caption. ``overlay`` must then hold only the post-RIFE drawtext/fade part.
     """
     ffrife = ffrife or load_ffrife()
     ffrife_config = ffrife_config or ffrife_config_for(config)
@@ -2561,7 +2572,7 @@ def encode_rife_frame_sections(source, output_file, sections, target_fps, config
             if use_rife:
                 rendered = ffrife.render_rife_frames(
                     source, section_root, ffrife_config, start=seg_start, end=seg_end,
-                    fps=target_fps, speed=speed, source_fps=source_fps,
+                    vf=pre_vf, fps=target_fps, speed=speed, source_fps=source_fps,
                 )
                 if not rendered:
                     raise RuntimeError("RIFE stopped before producing frames")
@@ -2582,7 +2593,8 @@ def encode_rife_frame_sections(source, output_file, sections, target_fps, config
                 # Seek on the input, cut the length with trim after the
                 # rebase: an input-side -t over-reads the source.
                 inputs += ["-ss", str(seg_start), "-i", str(value)]
-                normalize = (f"fps={target_fps:g},settb=AVTB,setpts=PTS-STARTPTS,"
+                pre = f"{pre_vf}," if pre_vf else ""
+                normalize = (f"{pre}fps={target_fps:g},settb=AVTB,setpts=PTS-STARTPTS,"
                              f"trim=duration={seg_end - seg_start:.6f}")
             filters += f"[{i}:v]{normalize}[p{i}];"
             labels.append(f"[p{i}]")
@@ -2665,8 +2677,9 @@ def extract_verse_sections(source, output_file, start_time, end_time, book_name,
             retimed = (i + 1) % 2 == 0
             sections.append((seg_start, seg_end, speed if retimed else None, retimed or whole_clip_interpolation))
         encode_rife_frame_sections(
-            source, output_file, sections, target_fps, config, overlay=overlay,
+            source, output_file, sections, target_fps, config, overlay=without_delogo(overlay),
             metadata_args=metadata_args, ffrife=ffrife, ffrife_config=ffrife_config, source_fps=source_fps,
+            pre_vf=delogo_only(overlay),
         )
         return
 
