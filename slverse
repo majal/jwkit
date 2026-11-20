@@ -3993,6 +3993,25 @@ def group_contiguous_preview_rows(results):
     return groups
 
 
+def resolve_find_reference(parser, args):
+    """Accept both 'find BOOK CHAPTER VERSE' and 'find BOOK CHAPTER:VERSE'
+    (the form Bible references use, and what 'ffv find' passes through).
+    Leaves args.chapter as an int and args.verse as the verse spec, or exits
+    through parser.error on a malformed reference."""
+    chapter, verse = str(args.chapter), args.verse
+    if ":" in chapter:
+        if verse is not None:
+            parser.error(f"give the verse either as CHAPTER:VERSE or as a separate argument, not both (got {chapter!r} {verse!r})")
+        chapter, verse = chapter.split(":", 1)
+    if not verse:
+        parser.error("missing verse: use 'find BOOK CHAPTER VERSE' or 'find BOOK CHAPTER:VERSE'")
+    if not chapter.isdigit():
+        parser.error(f"invalid chapter: {chapter!r} (expected a number, or CHAPTER:VERSE such as 13:1)")
+    args.chapter = int(chapter)
+    args.verse = verse
+    return args
+
+
 def cmd_find(args, config):
     """Default output is a compact checkmark table grouped by language -
     easiest to scan at a glance, and the format non-technical users actually
@@ -4350,8 +4369,8 @@ def build_parser():
 
     p_find = subparsers.add_parser("find", help="Search already-synced languages for who has a given verse")
     p_find.add_argument("book", help="Book name or number")
-    p_find.add_argument("chapter", type=int)
-    p_find.add_argument("verse", help="Single verse, a range (25-27), or a comma list (1,3,5)")
+    p_find.add_argument("chapter", metavar="CHAPTER[:VERSE]", help="Chapter number, or CHAPTER:VERSE (e.g. 13:1) to give the verse inline")
+    p_find.add_argument("verse", nargs="?", help="Single verse, a range (25-27), or a comma list (1,3,5); omit when the chapter is given as CHAPTER:VERSE")
     p_find.add_argument("-p", "--play", action="store_true", help="Stream-preview each match with mpv (default: on - this flag is kept only for older scripts/muscle memory)")
     p_find.add_argument("-l", "--list-only", action="store_true", help="List matches only, don't open previews")
     add_find_parallel_argument(p_find)
@@ -4467,6 +4486,7 @@ def main():
         if status:
             raise SystemExit(status)
     elif args.command == "find":
+        resolve_find_reference(parser, args)
         maybe_auto_sync(args, config)
         cmd_find(args, config)
     elif args.command == "cache":

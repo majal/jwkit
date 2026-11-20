@@ -2536,6 +2536,50 @@ class SlversePreviewGroupingTest(unittest.TestCase):
             self.assertEqual(config["preview_max_parallel"], expected)
 
 
+class SlverseFindReferenceTest(unittest.TestCase):
+    """'slverse find' takes either 'BOOK CHAPTER VERSE' or 'BOOK CHAPTER:VERSE'
+    (the latter is what 'ffv find php 2:7' passes through). Both must resolve
+    to the same chapter (int) and verse spec, and malformed input must exit
+    through the parser before any network call."""
+
+    def setUp(self) -> None:
+        self.slverse = load_script_module("slverse")
+        self.parser = self.slverse.build_parser()
+
+    def resolve(self, argv):
+        args = self.parser.parse_args(["find", *argv])
+        return self.slverse.resolve_find_reference(self.parser, args)
+
+    def test_three_argument_form_still_works(self) -> None:
+        args = self.resolve(["1 Peter", "2", "7"])
+        self.assertEqual((args.book, args.chapter, args.verse), ("1 Peter", 2, "7"))
+
+    def test_chapter_colon_verse_form(self) -> None:
+        args = self.resolve(["php", "2:7"])
+        self.assertEqual((args.book, args.chapter, args.verse), ("php", 2, "7"))
+
+    def test_colon_form_accepts_a_range_and_a_list(self) -> None:
+        self.assertEqual(self.resolve(["Revelation", "13:25-27"]).verse, "25-27")
+        self.assertEqual(self.resolve(["Revelation", "13:1,3,5"]).verse, "1,3,5")
+
+    def test_both_forms_at_once_is_an_error(self) -> None:
+        with self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr", new=io.StringIO()):
+            self.resolve(["php", "2:7", "3"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_missing_verse_is_an_error(self) -> None:
+        for argv in (["php", "7"], ["php", "2:"]):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr", new=io.StringIO()):
+                self.resolve(argv)
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_non_numeric_chapter_is_an_error(self) -> None:
+        for argv in (["php", "x", "3"], ["php", ":7"]):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr", new=io.StringIO()):
+                self.resolve(argv)
+            self.assertEqual(cm.exception.code, 2)
+
+
 class SlverseFindPlayCacheTest(unittest.TestCase):
     """'ffv all <ref> -p' -> 'slverse find ... --play'. Regression coverage
     for two related gaps: (1) find --play used to ignore preview_source

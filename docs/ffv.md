@@ -40,6 +40,7 @@ In particular, `ffv ... -e TIME` passes `-e` through as `slverse extract --trim-
 - `ffv <lang> ...` delegates to `slverse extract <lang> ...`. `<lang>` also accepts a comma list (e.g. `ffv BVL,FSL ...`) to encode several sign languages from one command - each one runs through `-f`/`--write` in parallel (`extract_workers` in config controls how many at once).
 - `ffv any ...` tries `slverse`'s configured `languages` in order and stops at the first available verse.
 - `ffv all ...` delegates to `slverse find`, which lists matches **and previews each one** by default; pass `-l`/`--list-only` to just list. `-p`/`--play` still works but is a no-op now that preview is the default.
+- `ffv find ...` passes straight through to `slverse find`, which accepts both `find <book> <chapter>:<verse>` and `find <book> <chapter> <verse>`. `ffv all` is the form that splits a `Book C:V` reference for you; `ffv find` and `ffv all -l` otherwise do the same thing.
 - `ffv config ...` delegates to `slverse config ...`, including `path`, `edit`, `reset`, `diff`, and `check`.
 - Configuration belongs to `slverse`, so the launcher cannot drift into a second set of defaults.
 

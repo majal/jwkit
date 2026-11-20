@@ -16,7 +16,7 @@
 - Resolves book names case-insensitively and without requiring diacritics. Set `api_language` to a priority list such as `VT,E` to accept Vietnamese names first and fall back to English.
 - Refreshes your language index automatically, about once a day, whenever you run `extract`/`find`/`bulk` — no need to remember to run `sync` yourself. Skips silently if there's no internet, and never runs more than once a day even if the previous attempt failed or got interrupted.
 - Maintains a local cache of downloaded full-chapter videos, capped by size with oldest-used chapters evicted first, so it can't quietly fill your disk.
-- `slverse find <book> <chapter> <verse>` searches every language you've already synced for who has a given verse and, by default, also opens a preview of each match - pass `--list-only`/`-l` to just list without previewing. `<verse>` also accepts a range (`25-27`) or comma list (`1,3,5`). Default output is a compact ✅/❌ table grouped by language; `--verbose` shows full details, and `--json` gives scripts a machine-readable array. Previewing opens one paused window per language and contiguous requested run, not one per verse: `ffv all Matthew 13:16,17`, for example, opens four two-verse windows when four languages have both verses. A missing or unrequested verse always breaks a run, so a combined preview never spans it silently. Segment downloads run in parallel and each window opens as soon as its own segment is ready; `preview_max_parallel`/`--preview-max-parallel`/`-j` controls the bound (default 4). `--play`/`-p` still works but is a no-op now that previewing is the default.
+- `slverse find <book> <chapter>:<verse>` (or the older `slverse find <book> <chapter> <verse>`) searches every language you've already synced for who has a given verse and, by default, also opens a preview of each match - pass `--list-only`/`-l` to just list without previewing. `<verse>` also accepts a range (`25-27`) or comma list (`1,3,5`). Default output is a compact ✅/❌ table grouped by language; `--verbose` shows full details, and `--json` gives scripts a machine-readable array. Previewing opens one paused window per language and contiguous requested run, not one per verse: `ffv all Matthew 13:16,17`, for example, opens four two-verse windows when four languages have both verses. A missing or unrequested verse always breaks a run, so a combined preview never spans it silently. Segment downloads run in parallel and each window opens as soon as its own segment is ready; `preview_max_parallel`/`--preview-max-parallel`/`-j` controls the bound (default 4). `--play`/`-p` still works but is a no-op now that previewing is the default.
 - `slverse bulk <lang>` precomputes whole chapters ahead of time (optionally interpolated to 60fps), for when you'd rather batch-process a language than extract on demand.
 - Auto-detects a drawtext-capable `ffmpeg` build (looks for a `-full` variant before falling back to the stock formula), so overlays work without hand-picking a binary.
 - Trims the trailing fade-out/copyright-endscreen off a chapter's or paragraph's last verse automatically (`trim_end_transition`, default on), using JW's own `endTransitionDuration` marker field rather than guessing from the video.
@@ -185,7 +185,8 @@ Sync metadata (and verse timestamps) for your whole language list:
 See who has already-synced coverage of a verse:
 
 ```bash
-./slverse find Revelation 13 1
+./slverse find Revelation 13:1
+./slverse find Revelation 13 1   # same thing, three-argument form
 ```
 
 Check cache usage and clear it:
