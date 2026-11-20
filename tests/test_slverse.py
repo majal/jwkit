@@ -1351,6 +1351,72 @@ class SlverseOverlayFilterTest(unittest.TestCase):
         self.assertNotIn("t-", result)
 
 
+class SlverseChapterOpenFadeTest(unittest.TestCase):
+    # fade_in_chapter_open: when a window opens on the chapter intro
+    # (head_extended), the verse reference and SL label ramp in over it.
+    # build_overlay_filter receives the resolved head_fade seconds; the
+    # ramp is anchored at the first window's start and applies to that
+    # window only.
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.slverse = load_script_module("slverse")
+
+    def setUp(self) -> None:
+        self.slverse.resolve_font_paths = lambda config: (None, None)
+        self.slverse.measure_text_size = lambda text, font_path, fontsize: (100, 30)
+
+    def config(self, **overrides):
+        cfg = dict(self.slverse.DEFAULT_CONFIG)
+        cfg.update(overrides)
+        return cfg
+
+    def test_default_is_off(self) -> None:
+        self.assertEqual(self.slverse.DEFAULT_CONFIG["fade_in_chapter_open"], "false")
+        self.assertIn("fade_in_chapter_open", self.slverse.BOOLEAN_CONFIG_KEYS)
+
+    def test_no_ramp_without_head_fade(self) -> None:
+        result = self.slverse.build_overlay_filter(
+            "ASL", "Psalm", 16, [("11", 2.0, 3.0)], self.config(default_target_lang="FSL"), show_box=False,
+        )
+        self.assertNotIn("/1.500)", result)
+        self.assertNotIn("(t-2.000)", result)
+
+    def test_head_fade_ramps_first_window_and_label(self) -> None:
+        # Verse reference and SL label both ramp from 0 at the first
+        # window's start over head_fade seconds: two ramp terms, both
+        # anchored at 2.0. Target BVL (es), not FSL: ASL and FSL share the en
+        # reference language, which skips the verse reference entirely.
+        result = self.slverse.build_overlay_filter(
+            "ASL", "Psalm", 16, [("11", 2.0, 3.0), ("12", 3.0, 4.0)], self.config(default_target_lang="BVL"), show_box=False,
+            head_fade=1.5,
+        )
+        self.assertEqual(result.count("min(1\\,(t-2.000)/1.500)"), 2)
+
+    def test_ramp_is_anchored_at_first_window_only(self) -> None:
+        # The second verse is not on the chapter intro, so it must not get
+        # a ramp anchored at its own start.
+        result = self.slverse.build_overlay_filter(
+            "ASL", "Psalm", 16, [("11", 2.0, 3.0), ("12", 3.0, 4.0)], self.config(default_target_lang="BVL"), show_box=False,
+            head_fade=1.5,
+        )
+        self.assertNotIn("(t-3.000)", result)
+
+    def test_ramp_length_is_used_verbatim(self) -> None:
+        result = self.slverse.build_overlay_filter(
+            "ASL", "Psalm", 16, [("11", 2.0, 3.0)], self.config(default_target_lang="BVL"), show_box=False,
+            head_fade=0.8,
+        )
+        self.assertIn("min(1\\,(t-2.000)/0.800)", result)
+
+    def test_flag_is_generated_and_defaults_off(self) -> None:
+        import argparse
+        parser = argparse.ArgumentParser()
+        self.slverse.add_generic_config_overrides(parser)
+        self.assertIsNone(parser.parse_args([]).fade_in_chapter_open)
+        self.assertIs(parser.parse_args(["--fade-in-chapter-open"]).fade_in_chapter_open, True)
+        self.assertIs(parser.parse_args(["--no-fade-in-chapter-open"]).fade_in_chapter_open, False)
+
+
 class SlverseOverlayFadeOutsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
